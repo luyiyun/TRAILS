@@ -52,7 +52,11 @@ def test_simulate_and_train_cli(tmp_path: Path) -> None:
             "train",
             "--data",
             str(data_path),
+            "--val-data",
+            str(data_path),
             "--epochs",
+            "1",
+            "--warmup-epochs",
             "1",
             "--batch-size",
             "4",
@@ -69,4 +73,6 @@ def test_simulate_and_train_cli(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
     )
-    assert '"loss"' in train.stdout
+    assert '"history"' in train.stdout
+    assert '"test"' in train.stdout
+    assert '"val_ari"' in train.stdout

@@ -17,6 +17,7 @@ class TrailsModelOutput:
     latent_log_variance: Tensor
     latent: Tensor
     cluster_logits: Tensor
+    cluster_probabilities: Tensor
     weibull_shape: Tensor
     weibull_scale: Tensor
 
@@ -111,7 +112,14 @@ class TrailsSurvVaderModel(nn.Module):
         self.reconstruction_head = nn.Linear(
             model_config.decoder_hidden_dim, data_config.n_features
         )
-        self.cluster_head = nn.Linear(model_config.latent_dim, model_config.n_clusters)
+        # VaDE 聚类先验：c ~ Cat(pi), z | c ~ Normal(mu_c, var_c)。
+        self.mixture_logits = nn.Parameter(torch.zeros(model_config.n_clusters))
+        self.mixture_means = nn.Parameter(
+            torch.randn(model_config.n_clusters, model_config.latent_dim) * 0.01
+        )
+        self.mixture_log_variances = nn.Parameter(
+            torch.zeros(model_config.n_clusters, model_config.latent_dim)
+        )
         self.survival_head = nn.Linear(model_config.latent_dim, model_config.n_clusters * 2)
 
     def set_feature_means(self, feature_means: Tensor) -> None:
@@ -125,6 +133,37 @@ class TrailsSurvVaderModel(nn.Module):
     @property
     def feature_means(self) -> Tensor:
         return cast(Tensor, self._buffers["_feature_means"])
+
+    def set_mixture_parameters(
+        self,
+        prior_probabilities: Tensor,
+        means: Tensor,
+        variances: Tensor,
+    ) -> None:
+        expected_prior_shape = (self.model_config.n_clusters,)
+        expected_component_shape = (self.model_config.n_clusters, self.model_config.latent_dim)
+        if prior_probabilities.shape != expected_prior_shape:
+            raise ValueError(
+                "prior_probabilities must have shape "
+                f"{expected_prior_shape}, got {tuple(prior_probabilities.shape)}."
+            )
+        if means.shape != expected_component_shape:
+            raise ValueError(
+                f"means must have shape {expected_component_shape}, got {tuple(means.shape)}."
+            )
+        if variances.shape != expected_component_shape:
+            raise ValueError(
+                "variances must have shape "
+                f"{expected_component_shape}, got {tuple(variances.shape)}."
+            )
+        with torch.no_grad():
+            self.mixture_logits.copy_(
+                torch.log(prior_probabilities.to(self.mixture_logits.device).clamp_min(1e-6))
+            )
+            self.mixture_means.copy_(means.to(self.mixture_means.device))
+            self.mixture_log_variances.copy_(
+                torch.log(variances.to(self.mixture_log_variances.device).clamp_min(1e-6))
+            )
 
     def forward(
         self,
@@ -144,18 +183,19 @@ class TrailsSurvVaderModel(nn.Module):
         latent_log_variance = self.latent_log_variance(hidden).clamp(min=-8.0, max=8.0)
         latent = self._sample_latent(latent_mean, latent_log_variance)
         reconstruction = self._decode(latent, x.shape[1], x)
-        cluster_logits = self.cluster_head(latent)
+        cluster_logits = self._cluster_logits(latent)
+        cluster_probabilities = torch.softmax(cluster_logits, dim=-1)
         survival_raw = self.survival_head(latent).reshape(-1, self.model_config.n_clusters, 2)
-        weibull_shape = F.softplus(survival_raw[..., 0]) + 1e-3
-        weibull_scale = F.softplus(survival_raw[..., 1]) + 1e-3
+        weibull_params = F.softplus(survival_raw) + 1e-3
         return TrailsModelOutput(
             reconstruction=reconstruction,
             latent_mean=latent_mean,
             latent_log_variance=latent_log_variance,
             latent=latent,
             cluster_logits=cluster_logits,
-            weibull_shape=weibull_shape,
-            weibull_scale=weibull_scale,
+            cluster_probabilities=cluster_probabilities,
+            weibull_shape=weibull_params[..., 0],
+            weibull_scale=weibull_params[..., 1],
         )
 
     def _decode(self, latent: Tensor, max_length: int, reference: Tensor) -> Tensor:
@@ -174,3 +214,18 @@ class TrailsSurvVaderModel(nn.Module):
             return mean
         noise = torch.randn_like(mean)
         return mean + noise * torch.exp(0.5 * log_variance)
+
+    def _cluster_logits(self, latent: Tensor) -> Tensor:
+        log_prior = torch.log_softmax(self.mixture_logits, dim=-1)
+        return log_prior.unsqueeze(0) + self._component_log_prob(latent)
+
+    def _component_log_prob(self, latent: Tensor) -> Tensor:
+        centered = latent.unsqueeze(1) - self.mixture_means.unsqueeze(0)
+        log_variance = self.mixture_log_variances.unsqueeze(0).clamp(min=-12.0, max=12.0)
+        variance = torch.exp(log_variance)
+        log_density = -0.5 * (
+            torch.log(torch.tensor(2.0 * torch.pi, device=latent.device, dtype=latent.dtype))
+            + log_variance
+            + centered.pow(2) / variance
+        )
+        return log_density.sum(dim=-1)

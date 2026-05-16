@@ -29,8 +29,11 @@ class TrainerConfig(BaseModel):
     reconstruction_weight: float = Field(default=1.0, ge=0.0)
     survival_weight: float = Field(default=0.2, ge=0.0)
     cluster_weight: float = Field(default=0.05, ge=0.0)
+    warmup_epochs: int = Field(default=1, ge=0)
+    gmm_init_iters: int = Field(default=20, ge=0)
     gradient_clip_norm: float | None = Field(default=5.0, gt=0.0)
     device: str = "cpu"
+    seed: int = 2026
 
 
 class TrailsConfig(BaseModel):

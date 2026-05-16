@@ -50,7 +50,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     train = subparsers.add_parser("train", help="Train the phase-one GRU-D Surv-VaDER model.")
     train.add_argument("--data", type=Path, required=True, help="Input .pt dataset path.")
+    train.add_argument(
+        "--val-data",
+        type=Path,
+        default=None,
+        help="Optional validation .pt dataset path for per-epoch metrics.",
+    )
     train.add_argument("--epochs", type=int, default=5, help="Number of training epochs.")
+    train.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=1,
+        help="Pretrain epochs before deterministic VaDE mixture initialization.",
+    )
     train.add_argument("--batch-size", type=int, default=16, help="Mini-batch size.")
     train.add_argument("--learning-rate", type=float, default=1e-3, help="Optimizer learning rate.")
     train.add_argument("--clusters", type=int, default=3, help="Number of latent subtypes.")
@@ -127,6 +139,9 @@ def _run_simulate(args: argparse.Namespace) -> int:
 
 def _run_train(args: argparse.Namespace) -> int:
     dataset = ClinicalTimeSeriesDataset.load(args.data)
+    validation_dataset = (
+        None if args.val_data is None else ClinicalTimeSeriesDataset.load(args.val_data)
+    )
     config = TrailsConfig(
         data=DataConfig(n_features=dataset.n_features),
         model=ModelConfig(
@@ -139,18 +154,26 @@ def _run_train(args: argparse.Namespace) -> int:
         ),
         trainer=TrainerConfig(
             max_epochs=args.epochs,
+            warmup_epochs=args.warmup_epochs,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
         ),
         seed=args.seed,
     )
-    estimator = TrailsEstimator(config).fit(dataset)
+    estimator = TrailsEstimator(config).fit(dataset, validation_data=validation_dataset)
     metrics = estimator.test(dataset)
 
     if args.save is not None:
         estimator.save(args.save)
 
-    print(json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {"history": estimator.history, "test": metrics},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 

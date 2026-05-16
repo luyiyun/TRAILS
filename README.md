@@ -5,14 +5,15 @@ Subtypes** 的缩写。项目目标是构建面向非同步多变量医学纵向
 
 ## 当前范围
 
-当前版本是阶段一基础版：变长访问序列上的 GRU-D Surv-VaDER 原型。
+当前版本是阶段一基础版：变长访问序列上的 GRU-D Surv-VaDER/VaDE 原型。
 
 - 模拟器采用 VaDeSC-EHR 风格的数据生成主线：cluster-specific latent profile -> 随机非线性轨迹生成 -> pseudo attention -> 观测序列 -> Weibull 生存结局。
 - 输入是非同步采样的多变量医学检查序列，包括血液检查、肝肾功能、炎症指标、肿瘤标志物和肿瘤负荷等连续变量。
 - 数据保留 `mask` 和 `delta_time`，用于表达变量级缺失和距离上次观测的时间间隔。
 - 编码器使用 GRU-D，显式建模缺失模式和时间间隔。
 - 解码器使用 GRU，从患者级 latent representation 重构纵向轨迹。
-- 生存模块使用 cluster-specific Weibull mixture survival head。
+- 聚类模块使用 VaDE 风格的可学习 Gaussian mixture latent prior。
+- 生存模块使用 cluster-specific Weibull mixture survival head，混合权重来自 VaDE posterior。
 
 本阶段不实现 mTAN、mixed-type likelihood、competing risks 或 recurrent events。
 
@@ -26,7 +27,7 @@ Subtypes** 的缩写。项目目标是构建面向非同步多变量医学纵向
 - `delta_time`: 每个变量距离上次观测的时间间隔。
 - `survival_time`: 随访或事件时间。
 - `event`: 事件指示。
-- `cluster_label`: 模拟数据中的真实潜在亚型。
+- `cluster_label`: 模拟数据中的真实潜在亚型；真实数据可不提供该字段。
 
 Dataset 的 `metadata` 会保留 `latent_z`、`cluster_means`、`cluster_covariances`、`survival_coefficients` 和生成参数，方便后续仿真实验评估聚类恢复、风险区分和敏感性分析。
 
@@ -44,6 +45,12 @@ uv run main.py simulate --out data/simulated/demo.pt --patients 128 --clusters 3
 uv run main.py train --data data/simulated/demo.pt --epochs 1 --batch-size 16
 ```
 
+训练时加入验证集并监控模拟数据的聚类恢复效果：
+
+```bash
+uv run main.py train --data data/simulated/demo.pt --val-data data/simulated/demo.pt --epochs 1 --warmup-epochs 1 --batch-size 16
+```
+
 目前所有命令行都集中在根目录 `main.py`。`trails` 主包只包含核心方法代码；`trails_simulate` 和 `trails_case` 只能作为下游包引用 `trails`。
 
 ## Roadmap
@@ -53,7 +60,7 @@ uv run main.py train --data data/simulated/demo.pt --epochs 1 --batch-size 16
 - 完成 VaDeSC-EHR 风格的连续型多变量非同步采样模拟器。
 - 使用 GRU-D encoder 处理 `x/mask/delta_time`。
 - 使用 GRU decoder 重构纵向轨迹。
-- 加入 Gaussian mixture latent clustering 和 Weibull survival head。
+- 加入 VaDE Gaussian mixture latent prior、warmup 后 deterministic k-means 初始化，以及 Weibull survival head。
 - 比较是否加入 survival loss 对聚类风险区分度的影响。
 
 阶段二：mTAN-Surv-VaDER 主模型

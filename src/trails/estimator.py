@@ -9,7 +9,7 @@ from torch import Tensor
 from .config import TrailsConfig
 from .data import ClinicalTimeSeriesDataset, infer_data_config
 from .model import TrailsSurvVaderModel
-from .trainer import TrailsTrainer
+from .trainer import HistoryEntry, TrailsTrainer
 
 
 class TrailsEstimator:
@@ -17,18 +17,29 @@ class TrailsEstimator:
         self.config = config or TrailsConfig()
         torch.manual_seed(self.config.seed)
         self.model = TrailsSurvVaderModel(self.config.data, self.config.model)
-        self.trainer = TrailsTrainer(self.model, self.config.trainer)
-        self.history: list[dict[str, float]] = []
+        trainer_config = self.config.trainer.model_copy(update={"seed": self.config.seed})
+        self.trainer = TrailsTrainer(self.model, trainer_config)
+        self.history: list[HistoryEntry] = []
 
-    def fit(self, data: ClinicalTimeSeriesDataset) -> TrailsEstimator:
+    def fit(
+        self,
+        data: ClinicalTimeSeriesDataset,
+        validation_data: ClinicalTimeSeriesDataset | None = None,
+    ) -> TrailsEstimator:
         self._validate_data_config(data)
+        if validation_data is not None:
+            self._validate_data_config(validation_data)
         self.model.set_feature_means(data.feature_means)
-        self.history = self.trainer.fit(data)
+        self.history = self.trainer.fit(data, validation_data=validation_data)
         return self
 
     def predict(self, data: ClinicalTimeSeriesDataset) -> Tensor:
         self._validate_data_config(data)
         return self.trainer.predict(data)
+
+    def predict_proba(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        self._validate_data_config(data)
+        return self.trainer.predict_proba(data)
 
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
         self._validate_data_config(data)

@@ -1,7 +1,8 @@
+import pytest
 import torch
 
 from trails.config import DataConfig, ModelConfig
-from trails.data import clinical_collate_fn
+from trails.data import ClinicalTimeSeriesDataset, clinical_collate_fn, make_clinical_sample
 from trails.model import TrailsSurvVaderModel
 from trails_simulate import generate_clinical_time_series_dataset
 
@@ -26,9 +27,67 @@ def test_clinical_dataset_and_collate_shapes() -> None:
     assert batch["x"].shape[0] == 2
     assert batch["x"].shape[-1] == dataset.n_features
     assert batch["sequence_lengths"].shape == (2,)
+    assert dataset.has_cluster_labels
+    assert batch["cluster_label"].shape == (2,)
     assert {"latent_z", "cluster_means", "survival_coefficients", "generation_params"} <= set(
         dataset.metadata
     )
+
+
+def test_unlabeled_dataset_collates_without_cluster_labels() -> None:
+    labeled = generate_clinical_time_series_dataset(
+        n_patients=4,
+        n_clusters=2,
+        min_visits=3,
+        max_visits=4,
+        hidden_size=12,
+        latent_dim=4,
+        attention_layers=2,
+        seed=19,
+    )
+    samples = [
+        make_clinical_sample(
+            times=sample.times,
+            x=sample.x,
+            mask=sample.mask,
+            delta_time=sample.delta_time,
+            survival_time=sample.survival_time,
+            event=sample.event,
+        )
+        for sample in labeled
+    ]
+    unlabeled = ClinicalTimeSeriesDataset(samples, feature_names=labeled.feature_names)
+    batch = clinical_collate_fn([unlabeled[0], unlabeled[1]])
+
+    assert not unlabeled.has_cluster_labels
+    assert "cluster_label" not in batch
+
+
+def test_dataset_rejects_mixed_cluster_label_availability() -> None:
+    labeled = generate_clinical_time_series_dataset(
+        n_patients=4,
+        n_clusters=2,
+        min_visits=3,
+        max_visits=4,
+        hidden_size=12,
+        latent_dim=4,
+        attention_layers=2,
+        seed=23,
+    )
+    unlabeled_sample = make_clinical_sample(
+        times=labeled[1].times,
+        x=labeled[1].x,
+        mask=labeled[1].mask,
+        delta_time=labeled[1].delta_time,
+        survival_time=labeled[1].survival_time,
+        event=labeled[1].event,
+    )
+
+    with pytest.raises(ValueError, match="cannot mix labeled and unlabeled"):
+        ClinicalTimeSeriesDataset(
+            [labeled[0], unlabeled_sample],
+            feature_names=labeled.feature_names,
+        )
 
 
 def test_simulation_has_asynchronous_masks_and_valid_delta_time() -> None:
@@ -103,5 +162,13 @@ def test_grud_model_forward_shapes() -> None:
 
     assert output.reconstruction.shape == batch["x"].shape
     assert output.cluster_logits.shape == (4, 2)
+    assert output.cluster_probabilities.shape == (4, 2)
+    assert torch.allclose(
+        output.cluster_probabilities.sum(dim=-1),
+        torch.ones(4),
+        atol=1e-5,
+    )
     assert output.weibull_shape.shape == (4, 2)
     assert torch.all(output.weibull_scale > 0)
+    assert model.mixture_means.shape == (2, 4)
+    assert model.mixture_log_variances.shape == (2, 4)

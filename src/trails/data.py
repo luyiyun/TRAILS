@@ -21,7 +21,7 @@ class ClinicalSample:
     delta_time: Tensor
     survival_time: Tensor
     event: Tensor
-    cluster_label: Tensor
+    cluster_label: Tensor | None
 
     def __post_init__(self) -> None:
         validate_clinical_sample(self)
@@ -43,6 +43,12 @@ class ClinicalTimeSeriesDataset(Dataset[ClinicalSample]):
         for sample in samples:
             if int(sample.x.shape[-1]) != len(feature_names):
                 raise ValueError("All samples must share the same feature dimension.")
+        self.has_cluster_labels: bool = samples[0].cluster_label is not None
+        for sample in samples:
+            if (sample.cluster_label is not None) != self.has_cluster_labels:
+                raise ValueError(
+                    "ClinicalTimeSeriesDataset cannot mix labeled and unlabeled samples."
+                )
         self.samples = samples
         self.feature_names = feature_names
         self.description = description
@@ -59,7 +65,7 @@ class ClinicalTimeSeriesDataset(Dataset[ClinicalSample]):
     def n_features(self) -> int:
         return len(self.feature_names)
 
-    def save(self, path: str | Path):
+    def save(self, path: str | Path) -> None:
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -92,7 +98,7 @@ class ClinicalTimeSeriesDataset(Dataset[ClinicalSample]):
                 delta_time=sample["delta_time"],
                 survival_time=sample["survival_time"],
                 event=sample["event"],
-                cluster_label=sample["cluster_label"],
+                cluster_label=sample.get("cluster_label"),
             )
             for sample in payload["samples"]
         ]
@@ -112,7 +118,7 @@ def make_clinical_sample(
     delta_time: Tensor,
     survival_time: float | Tensor,
     event: float | Tensor,
-    cluster_label: int | Tensor,
+    cluster_label: int | Tensor | None = None,
 ) -> ClinicalSample:
     return ClinicalSample(
         times=times.float(),
@@ -121,7 +127,9 @@ def make_clinical_sample(
         delta_time=delta_time.float(),
         survival_time=torch.as_tensor(survival_time, dtype=torch.float32),
         event=torch.as_tensor(event, dtype=torch.float32),
-        cluster_label=torch.as_tensor(cluster_label, dtype=torch.long),
+        cluster_label=(
+            None if cluster_label is None else torch.as_tensor(cluster_label, dtype=torch.long)
+        ),
     )
 
 
@@ -144,6 +152,8 @@ def validate_clinical_sample(sample: ClinicalSample) -> None:
         raise ValueError("survival_time must be positive.")
     if float(sample.event) < 0 or float(sample.event) > 1:
         raise ValueError("event must be in [0, 1].")
+    if sample.cluster_label is not None and sample.cluster_label.ndim > 0:
+        raise ValueError("cluster_label must be a scalar tensor when provided.")
 
 
 def compute_feature_means(samples: list[ClinicalSample]) -> Tensor:
@@ -177,7 +187,12 @@ def clinical_collate_fn(samples: list[ClinicalSample]) -> Batch:
         delta_time[row, :length] = sample.delta_time
         sequence_lengths[row] = length
 
-    return {
+    has_cluster_labels = samples[0].cluster_label is not None
+    for sample in samples:
+        if (sample.cluster_label is not None) != has_cluster_labels:
+            raise ValueError("clinical_collate_fn cannot mix labeled and unlabeled samples.")
+
+    batch = {
         "times": times,
         "x": x,
         "mask": mask,
@@ -185,8 +200,13 @@ def clinical_collate_fn(samples: list[ClinicalSample]) -> Batch:
         "sequence_lengths": sequence_lengths,
         "survival_time": torch.stack([sample.survival_time for sample in samples]).float(),
         "event": torch.stack([sample.event for sample in samples]).float(),
-        "cluster_label": torch.stack([sample.cluster_label for sample in samples]).long(),
     }
+    if has_cluster_labels:
+        cluster_labels = [
+            sample.cluster_label for sample in samples if sample.cluster_label is not None
+        ]
+        batch["cluster_label"] = torch.stack(cluster_labels).long()
+    return batch
 
 
 def infer_data_config(dataset: ClinicalTimeSeriesDataset) -> DataConfig:

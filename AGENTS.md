@@ -6,9 +6,10 @@ TRAILS studies deep survival trajectory clustering for asynchronous multivariate
 medical longitudinal data. The method targets patient subtypes that differ in
 both clinical trajectories and time-to-event risk.
 
-The current scope is phase one: a GRU-D Surv-VaDER prototype for variable-length
-clinical visit sequences with `x`, `mask`, and `delta_time`. mTAN, mixed-type
-likelihoods, competing risks, and recurrent events are later roadmap items.
+The current scope is phase one: a GRU-D Surv-VaDER/VaDE prototype for
+variable-length clinical visit sequences with `x`, `mask`, and `delta_time`.
+mTAN, mixed-type likelihoods, competing risks, and recurrent events are later
+roadmap items.
 
 ## Layout
 
@@ -40,6 +41,7 @@ clean reusable method library.
 
 - Simulate: `uv run main.py simulate --out data/simulated/demo.pt --patients 128 --clusters 3 --seed 2026`
 - Train: `uv run main.py train --data data/simulated/demo.pt --epochs 1 --batch-size 16`
+- Train with validation metrics: `uv run main.py train --data data/simulated/demo.pt --val-data data/simulated/demo.pt --epochs 1 --warmup-epochs 1 --batch-size 16`
 - Format: `uv run ruff format`
 - Lint: `uv run ruff check --fix`
 - Type check: `UV_CACHE_DIR=/tmp/uv-cache uv run pyright`
@@ -67,11 +69,16 @@ clean reusable method library.
   continuous asynchronous clinical measurements.
 - Simulation outputs a `ClinicalTimeSeriesDataset` saved via `torch.save`.
 - Each patient sample contains `times`, `x`, `mask`, `delta_time`,
-  `survival_time`, `event`, and `cluster_label`.
+  `survival_time`, `event`, and optional `cluster_label`.
 - Dataset metadata preserves latent profiles, cluster parameters, survival
   coefficients, and generation parameters for simulation-study evaluation.
 - The phase-one model uses GRU-D as encoder and GRU as decoder.
-- The survival head remains a cluster-specific Weibull mixture.
+- Clustering uses a VaDE-style learnable Gaussian mixture latent prior,
+  initialized by deterministic k-means after warmup.
+- The survival head remains a cluster-specific Weibull mixture whose mixture
+  weights are the VaDE posterior cluster probabilities.
+- Validation and test metrics include ARI/NMI only when true cluster labels are
+  available.
 
 ## Verification
 

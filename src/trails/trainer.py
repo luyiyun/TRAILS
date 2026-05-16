@@ -9,20 +9,48 @@ from tqdm import tqdm
 from .config import TrainerConfig
 from .data import Batch, ClinicalTimeSeriesDataset, make_data_loader
 from .metrics import (
-    cluster_balance_loss,
+    ClusterMetricAccumulator,
     concordance_index,
     masked_mse,
+    vade_kl_loss,
     weibull_mixture_negative_log_likelihood,
 )
 from .model import TrailsModelOutput, TrailsSurvVaderModel
 
+HistoryEntry = dict[str, float | str]
+
 
 @dataclass(frozen=True)
 class LossBreakdown:
-    total: Tensor
-    reconstruction: Tensor
-    survival: Tensor
-    cluster: Tensor
+    loss: Tensor
+    reconstruction_loss: Tensor
+    survival_loss: Tensor
+    vade_kl_loss: Tensor
+
+    def items(self) -> tuple[tuple[str, Tensor], ...]:
+        return (
+            ("loss", self.loss),
+            ("reconstruction_loss", self.reconstruction_loss),
+            ("survival_loss", self.survival_loss),
+            ("vade_kl_loss", self.vade_kl_loss),
+        )
+
+
+class LossAccumulator:
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.total: dict[str, float] = {}
+        self.count: int = 0
+
+    def update(self, batch_size: int, batch_loss: LossBreakdown) -> None:
+        self.count += batch_size
+        for k, v in batch_loss.items():
+            self.total[k] = self.total.get(k, 0.0) + v.item() * batch_size
+
+    def compute(self) -> dict[str, float]:
+        return {name: value / max(1, self.count) for name, value in self.total.items()}
 
 
 class TrailsTrainer:
@@ -31,38 +59,86 @@ class TrailsTrainer:
         self.config = config
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
 
-    def fit(self, data: ClinicalTimeSeriesDataset) -> list[dict[str, float]]:
+        self.metrics = ClusterMetricAccumulator()
+        self.losses = LossAccumulator()
+        self.metrics.to(config.device)
+
+    def fit(
+        self,
+        data: ClinicalTimeSeriesDataset,
+        validation_data: ClinicalTimeSeriesDataset | None = None,
+    ) -> list[HistoryEntry]:
         loader = make_data_loader(data, self.config, shuffle=True)
-        history: list[dict[str, float]] = []
-        for _epoch in tqdm(range(self.config.max_epochs), desc="Epoch"):
-            history.append(self._train_epoch(loader))
+        if validation_data is not None:
+            valid_loader = make_data_loader(validation_data, self.config, shuffle=False)
+        else:
+            valid_loader = None
+
+        history: list[HistoryEntry] = []
+        for epoch in tqdm(range(self.config.warmup_epochs), desc="Warmup"):
+            metrics = self._train_epoch(loader, include_vade_kl=False)
+            entry: HistoryEntry = {**metrics, "epoch": float(epoch + 1), "stage": "warmup"}
+
+            if valid_loader is not None:
+                validation_metrics = self._evaluate(
+                    valid_loader, include_vade_kl=False, cal_cluster_metrics=False
+                )
+                entry.update({f"val_{name}": value for name, value in validation_metrics.items()})
+
+            history.append(entry)
+
+        self.initialize_mixture_from_data(data)
+
+        for epoch in tqdm(range(self.config.max_epochs), desc="Epoch"):
+            metrics = self._train_epoch(loader, include_vade_kl=True)
+            entry = {**metrics, "epoch": float(epoch + 1), "stage": "vade"}
+
+            if valid_loader is not None:
+                validation_metrics = self._evaluate(
+                    valid_loader,
+                    include_vade_kl=True,
+                    cal_cluster_metrics=(validation_data is not None)
+                    and validation_data.has_cluster_labels,
+                )
+                entry.update({f"val_{name}": value for name, value in validation_metrics.items()})
+
+            history.append(entry)
         return history
 
     def predict(self, data: ClinicalTimeSeriesDataset) -> Tensor:
         outputs, _batch = self._collect_outputs(data)
-        return torch.argmax(outputs.cluster_logits, dim=-1).cpu()
+        return torch.argmax(outputs.cluster_probabilities, dim=-1).cpu()
+
+    def predict_proba(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        outputs, _batch = self._collect_outputs(data)
+        return outputs.cluster_probabilities.cpu()
 
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
-        outputs, batch = self._collect_outputs(data)
-        loss = self._compute_loss(outputs, batch)
-        risk_score = self._risk_score(outputs)
-        c_index = concordance_index(
-            risk_score.cpu(),
-            batch["survival_time"].cpu(),
-            batch["event"].cpu(),
+        loader = make_data_loader(data, self.config, shuffle=False)
+        return self._evaluate(
+            loader, include_vade_kl=True, cal_cluster_metrics=data.has_cluster_labels
         )
-        return {
-            "cluster_loss": float(loss.cluster.detach().cpu()),
-            "c_index": c_index,
-            "loss": float(loss.total.detach().cpu()),
-            "reconstruction_loss": float(loss.reconstruction.detach().cpu()),
-            "survival_loss": float(loss.survival.detach().cpu()),
-        }
 
-    def _train_epoch(self, loader: torch.utils.data.DataLoader[Batch]) -> dict[str, float]:
+    def initialize_mixture_from_data(self, data: ClinicalTimeSeriesDataset) -> None:
+        latent_means = self._collect_latent_means(data)
+        # warmup 后用训练集 latent_mean 初始化 MoG，避免 VaDE 早期责任度塌缩。
+        prior_probabilities, means, variances = fit_kmeans_mixture(
+            latent_means,
+            n_clusters=self.model.model_config.n_clusters,
+            n_iters=self.config.gmm_init_iters,
+            seed=self.config.seed,
+        )
+        self.model.set_mixture_parameters(prior_probabilities, means, variances)
+
+    def _train_epoch(
+        self,
+        loader: torch.utils.data.DataLoader[Batch],
+        *,
+        include_vade_kl: bool,
+    ) -> dict[str, float]:
+        self.losses.reset()
+
         self.model.train()
-        total_loss = 0.0
-        total_batches = 0
         for batch in tqdm(loader, desc="Batch", leave=False):
             device_batch = self._move_batch(batch)
             output = self.model(
@@ -71,20 +147,26 @@ class TrailsTrainer:
                 device_batch["delta_time"],
                 device_batch["sequence_lengths"],
             )
-            loss = self._compute_loss(output, device_batch)
+            loss = self._compute_loss(output, device_batch, include_vade_kl=include_vade_kl)
             self.optimizer.zero_grad()
-            loss.total.backward()
+            loss.loss.backward()
             if self.config.gradient_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.config.gradient_clip_norm,
                 )
             self.optimizer.step()
-            total_loss += float(loss.total.detach().cpu())
-            total_batches += 1
-        return {"loss": total_loss / max(total_batches, 1)}
+            self.losses.update(device_batch["x"].size(0), loss)
 
-    def _compute_loss(self, output: TrailsModelOutput, batch: Batch) -> LossBreakdown:
+        return self.losses.compute()
+
+    def _compute_loss(
+        self,
+        output: TrailsModelOutput,
+        batch: Batch,
+        *,
+        include_vade_kl: bool,
+    ) -> LossBreakdown:
         reconstruction = masked_mse(output.reconstruction, batch["x"], batch["mask"])
         survival = weibull_mixture_negative_log_likelihood(
             output.cluster_logits,
@@ -93,18 +175,81 @@ class TrailsTrainer:
             batch["survival_time"],
             batch["event"],
         )
-        cluster = cluster_balance_loss(output.cluster_logits)
+        if include_vade_kl:
+            vade_kl = vade_kl_loss(
+                output.latent,
+                output.latent_mean,
+                output.latent_log_variance,
+                output.cluster_logits,
+                self.model.mixture_logits,
+                self.model.mixture_means,
+                self.model.mixture_log_variances,
+            )
+        else:
+            vade_kl = reconstruction.new_zeros(())
         total = (
             self.config.reconstruction_weight * reconstruction
             + self.config.survival_weight * survival
-            + self.config.cluster_weight * cluster
+            + self.config.cluster_weight * vade_kl
         )
         return LossBreakdown(
-            total=total,
-            reconstruction=reconstruction,
-            survival=survival,
-            cluster=cluster,
+            loss=total,
+            reconstruction_loss=reconstruction,
+            survival_loss=survival,
+            vade_kl_loss=vade_kl,
         )
+
+    def _evaluate(
+        self,
+        loader: torch.utils.data.DataLoader[Batch],
+        *,
+        include_vade_kl: bool,
+        cal_cluster_metrics: bool = False,
+    ) -> dict[str, float]:
+        self.losses.reset()
+        if cal_cluster_metrics:
+            self.metrics.reset()
+
+        risk_scores: list[Tensor] = []
+        survival_times: list[Tensor] = []
+        events: list[Tensor] = []
+
+        self.model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                device_batch = self._move_batch(batch)
+                output = self.model(
+                    device_batch["x"],
+                    device_batch["mask"],
+                    device_batch["delta_time"],
+                    device_batch["sequence_lengths"],
+                )
+                loss = self._compute_loss(
+                    output,
+                    device_batch,
+                    include_vade_kl=include_vade_kl,
+                )
+                self.losses.update(device_batch["x"].size(0), loss)
+
+                risk_scores.append(self._risk_score(output).cpu())
+                survival_times.append(device_batch["survival_time"].cpu())
+                events.append(device_batch["event"].cpu())
+
+                if cal_cluster_metrics:
+                    self.metrics.update(
+                        torch.argmax(output.cluster_probabilities, dim=-1),
+                        device_batch["cluster_label"],
+                    )
+
+        scores = self.losses.compute()
+        scores["c_index"] = concordance_index(
+            torch.cat(risk_scores),
+            torch.cat(survival_times),
+            torch.cat(events),
+        )
+        if cal_cluster_metrics:
+            scores.update(self.metrics.compute())
+        return scores
 
     def _collect_outputs(self, data: ClinicalTimeSeriesDataset) -> tuple[TrailsModelOutput, Batch]:
         loader = make_data_loader(data, self.config, shuffle=False)
@@ -129,14 +274,29 @@ class TrailsTrainer:
         return {name: value.to(self.config.device) for name, value in batch.items()}
 
     def _risk_score(self, output: TrailsModelOutput) -> Tensor:
-        cluster_probabilities = torch.softmax(output.cluster_logits, dim=-1)
-        expected_scale = torch.sum(cluster_probabilities * output.weibull_scale, dim=-1)
+        expected_scale = torch.sum(output.cluster_probabilities * output.weibull_scale, dim=-1)
         return -expected_scale
+
+    def _collect_latent_means(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        loader = make_data_loader(data, self.config, shuffle=False)
+        latent_means: list[Tensor] = []
+        self.model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                device_batch = self._move_batch(batch)
+                output = self.model(
+                    device_batch["x"],
+                    device_batch["mask"],
+                    device_batch["delta_time"],
+                    device_batch["sequence_lengths"],
+                )
+                latent_means.append(output.latent_mean.detach().cpu())
+        return torch.cat(latent_means, dim=0)
 
 
 def concatenate_batches(batches: list[Batch]) -> Batch:
     max_length = max(int(batch["times"].shape[1]) for batch in batches)
-    return {
+    batch = {
         "times": torch.cat([pad_time_axis(batch["times"], max_length) for batch in batches], dim=0),
         "x": torch.cat([pad_time_axis(batch["x"], max_length) for batch in batches], dim=0),
         "mask": torch.cat([pad_time_axis(batch["mask"], max_length) for batch in batches], dim=0),
@@ -147,8 +307,10 @@ def concatenate_batches(batches: list[Batch]) -> Batch:
         "sequence_lengths": torch.cat([batch["sequence_lengths"] for batch in batches], dim=0),
         "survival_time": torch.cat([batch["survival_time"] for batch in batches], dim=0),
         "event": torch.cat([batch["event"] for batch in batches], dim=0),
-        "cluster_label": torch.cat([batch["cluster_label"] for batch in batches], dim=0),
     }
+    if "cluster_label" in batches[0]:
+        batch["cluster_label"] = torch.cat([batch["cluster_label"] for batch in batches], dim=0)
+    return batch
 
 
 def concatenate_outputs(outputs: list[TrailsModelOutput]) -> TrailsModelOutput:
@@ -162,6 +324,10 @@ def concatenate_outputs(outputs: list[TrailsModelOutput]) -> TrailsModelOutput:
         latent_log_variance=torch.cat([output.latent_log_variance for output in outputs], dim=0),
         latent=torch.cat([output.latent for output in outputs], dim=0),
         cluster_logits=torch.cat([output.cluster_logits for output in outputs], dim=0),
+        cluster_probabilities=torch.cat(
+            [output.cluster_probabilities for output in outputs],
+            dim=0,
+        ),
         weibull_shape=torch.cat([output.weibull_shape for output in outputs], dim=0),
         weibull_scale=torch.cat([output.weibull_scale for output in outputs], dim=0),
     )
@@ -176,3 +342,44 @@ def pad_time_axis(tensor: Tensor, target_length: int) -> Tensor:
     padded = tensor.new_zeros(padded_shape)
     padded[:, :current_length] = tensor
     return padded
+
+
+def fit_kmeans_mixture(
+    latents: Tensor,
+    *,
+    n_clusters: int,
+    n_iters: int,
+    seed: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    if int(latents.shape[0]) < n_clusters:
+        raise ValueError("At least one latent embedding per cluster is required.")
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    latents = latents.float().cpu()
+    permutation = torch.randperm(int(latents.shape[0]), generator=generator)
+    centers = latents[permutation[:n_clusters]].clone()
+
+    for _iteration in range(n_iters):
+        distances = torch.cdist(latents, centers)
+        assignments = torch.argmin(distances, dim=1)
+        closest_distance = torch.min(distances, dim=1).values
+        for cluster in range(n_clusters):
+            cluster_mask = assignments == cluster
+            if bool(cluster_mask.any()):
+                centers[cluster] = latents[cluster_mask].mean(dim=0)
+            else:
+                centers[cluster] = latents[torch.argmax(closest_distance)]
+
+    distances = torch.cdist(latents, centers)
+    assignments = torch.argmin(distances, dim=1)
+    counts = torch.bincount(assignments, minlength=n_clusters).float().clamp_min(1.0)
+    prior_probabilities = counts / counts.sum()
+    global_variance = latents.var(dim=0, unbiased=False).clamp_min(1e-4)
+    variances = torch.zeros(n_clusters, int(latents.shape[1]), dtype=latents.dtype)
+    for cluster in range(n_clusters):
+        cluster_mask = assignments == cluster
+        if bool(cluster_mask.any()):
+            variances[cluster] = latents[cluster_mask].var(dim=0, unbiased=False).clamp_min(1e-4)
+        else:
+            variances[cluster] = global_variance
+    return prior_probabilities, centers, variances
