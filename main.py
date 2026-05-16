@@ -3,8 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
+from trails.artifacts import (
+    ARTIFACT_TOKENS,
+    create_timestamped_run_dir,
+    plot_history,
+    resolve_artifact_names,
+    save_history_csv,
+    save_json,
+)
 from trails.config import DataConfig, ModelConfig, TrailsConfig, TrainerConfig
 from trails.data import ClinicalTimeSeriesDataset
 from trails.estimator import TrailsEstimator
@@ -56,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional validation .pt dataset path for per-epoch metrics.",
     )
+    train.add_argument(
+        "--test-data",
+        type=Path,
+        default=None,
+        help="Optional held-out .pt dataset path for final test metrics.",
+    )
     train.add_argument("--epochs", type=int, default=5, help="Number of training epochs.")
     train.add_argument(
         "--warmup-epochs",
@@ -77,6 +93,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--seed", type=int, default=2026, help="Random seed.")
     train.add_argument("--save", type=Path, default=None, help="Optional model checkpoint path.")
+    train.add_argument(
+        "--save-dir",
+        type=Path,
+        default=Path("runs"),
+        help="Directory where timestamped training run artifacts are saved.",
+    )
+    train.add_argument(
+        "--save-artifacts",
+        nargs="+",
+        choices=ARTIFACT_TOKENS,
+        default=["all"],
+        metavar="ARTIFACT",
+        help=("Artifacts to save: config history test model plot, or all/none. Defaults to all."),
+    )
 
     return parser
 
@@ -88,6 +118,10 @@ def run(argv: Sequence[str] | None = None) -> int:
     if args.command == "simulate":
         return _run_simulate(args)
     if args.command == "train":
+        try:
+            args.save_artifacts = resolve_artifact_names(args.save_artifacts)
+        except ValueError as error:
+            parser.error(str(error))
         return _run_train(args)
 
     parser.error(f"Unsupported command: {args.command}")
@@ -142,6 +176,9 @@ def _run_train(args: argparse.Namespace) -> int:
     validation_dataset = (
         None if args.val_data is None else ClinicalTimeSeriesDataset.load(args.val_data)
     )
+    test_dataset = (
+        dataset if args.test_data is None else ClinicalTimeSeriesDataset.load(args.test_data)
+    )
     config = TrailsConfig(
         data=DataConfig(n_features=dataset.n_features),
         model=ModelConfig(
@@ -161,20 +198,93 @@ def _run_train(args: argparse.Namespace) -> int:
         seed=args.seed,
     )
     estimator = TrailsEstimator(config).fit(dataset, validation_data=validation_dataset)
-    metrics = estimator.test(dataset)
+    metrics = estimator.test(test_dataset)
+    run_dir = _save_training_artifacts(args, config, estimator, metrics)
 
     if args.save is not None:
         estimator.save(args.save)
 
+    output = {
+        "history": estimator.history,
+        "run_dir": None if run_dir is None else str(run_dir),
+        "test": metrics,
+    }
     print(
         json.dumps(
-            {"history": estimator.history, "test": metrics},
+            output,
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
         )
     )
     return 0
+
+
+def _save_training_artifacts(
+    args: argparse.Namespace,
+    config: TrailsConfig,
+    estimator: TrailsEstimator,
+    metrics: dict[str, float],
+) -> Path | None:
+    artifacts: frozenset[str] = args.save_artifacts
+    if not artifacts:
+        return None
+
+    created_at = datetime.now().astimezone()
+    run_dir = create_timestamped_run_dir(args.save_dir, created_at)
+
+    if "config" in artifacts:
+        save_json(
+            run_dir / "config.json",
+            _training_run_config(args, config, artifacts, created_at, run_dir),
+        )
+    if "history" in artifacts:
+        save_json(run_dir / "history.json", estimator.history)
+        save_history_csv(run_dir / "history.csv", estimator.history)
+    if "test" in artifacts:
+        save_json(run_dir / "test_metrics.json", metrics)
+    if "model" in artifacts:
+        estimator.save(run_dir / "model.pt")
+    if "plot" in artifacts:
+        plot_history(run_dir / "history.png", estimator.history)
+
+    return run_dir
+
+
+def _training_run_config(
+    args: argparse.Namespace,
+    config: TrailsConfig,
+    artifacts: frozenset[str],
+    created_at: datetime,
+    run_dir: Path,
+) -> dict[str, Any]:
+    return {
+        "artifacts": sorted(artifacts),
+        "config": config.model_dump(mode="json"),
+        "created_at": created_at.isoformat(timespec="seconds"),
+        "paths": {
+            "data": str(args.data),
+            "run_dir": str(run_dir),
+            "save": None if args.save is None else str(args.save),
+            "save_dir": str(args.save_dir),
+            "test_data": None if args.test_data is None else str(args.test_data),
+            "test_data_used": str(args.data if args.test_data is None else args.test_data),
+            "val_data": None if args.val_data is None else str(args.val_data),
+        },
+        "train_args": {
+            "batch_size": args.batch_size,
+            "clusters": args.clusters,
+            "decoder_hidden_dim": args.decoder_hidden_dim,
+            "dropout": args.dropout,
+            "encoder_hidden_dim": args.encoder_hidden_dim,
+            "epochs": args.epochs,
+            "latent_dim": args.latent_dim,
+            "learning_rate": args.learning_rate,
+            "n_layers": args.n_layers,
+            "seed": args.seed,
+            "warmup_epochs": args.warmup_epochs,
+        },
+    }
 
 
 if __name__ == "__main__":

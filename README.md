@@ -45,6 +45,17 @@ uv run main.py simulate --out data/simulated/demo.pt --patients 128 --clusters 3
 uv run main.py train --data data/simulated/demo.pt --epochs 1 --batch-size 16
 ```
 
+训练命令默认会把本次实验保存到 `runs/<YYYYmmdd-HHMMSS>/`，包括
+`config.json`、`history.json`、`history.csv`、`test_metrics.json`、`model.pt`
+和 `history.png`。可以用空格列表控制保存内容：
+
+```bash
+uv run main.py train --data data/simulated/demo.pt --save-artifacts config history test plot
+```
+
+如需独立测试集，可以传入 `--test-data`；如不想保存本次运行，可传入
+`--save-artifacts none`。
+
 训练时加入验证集并监控模拟数据的聚类恢复效果：
 
 ```bash

@@ -9,6 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-data
+.DS_Store
 
+data
+runs
 

@@ -77,7 +77,12 @@ class TrailsTrainer:
         history: list[HistoryEntry] = []
         for epoch in tqdm(range(self.config.warmup_epochs), desc="Warmup"):
             metrics = self._train_epoch(loader, include_vade_kl=False)
-            entry: HistoryEntry = {**metrics, "epoch": float(epoch + 1), "stage": "warmup"}
+            entry: HistoryEntry = {
+                **metrics,
+                "epoch": float(epoch + 1),
+                "global_epoch": float(len(history) + 1),
+                "stage": "warmup",
+            }
 
             if valid_loader is not None:
                 validation_metrics = self._evaluate(
@@ -91,7 +96,12 @@ class TrailsTrainer:
 
         for epoch in tqdm(range(self.config.max_epochs), desc="Epoch"):
             metrics = self._train_epoch(loader, include_vade_kl=True)
-            entry = {**metrics, "epoch": float(epoch + 1), "stage": "vade"}
+            entry = {
+                **metrics,
+                "epoch": float(epoch + 1),
+                "global_epoch": float(len(history) + 1),
+                "stage": "vade",
+            }
 
             if valid_loader is not None:
                 validation_metrics = self._evaluate(
