@@ -6,15 +6,15 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from .config import EstimatorConfig
+from .config import TrailsConfig
 from .data import ClinicalTimeSeriesDataset, infer_data_config
 from .model import TrailsSurvVaderModel
 from .trainer import TrailsTrainer
 
 
 class TrailsEstimator:
-    def __init__(self, config: EstimatorConfig | None = None) -> None:
-        self.config = config or EstimatorConfig()
+    def __init__(self, config: TrailsConfig | None = None) -> None:
+        self.config = config or TrailsConfig()
         torch.manual_seed(self.config.seed)
         self.model = TrailsSurvVaderModel(self.config.data, self.config.model)
         self.trainer = TrailsTrainer(self.model, self.config.trainer)
@@ -47,7 +47,7 @@ class TrailsEstimator:
     @classmethod
     def load(cls, path: str | Path) -> TrailsEstimator:
         checkpoint: dict[str, Any] = torch.load(Path(path), map_location="cpu", weights_only=False)
-        estimator = cls(EstimatorConfig.model_validate(checkpoint["config"]))
+        estimator = cls(TrailsConfig.model_validate(checkpoint["config"]))
         estimator.model.load_state_dict(checkpoint["model_state"])
         estimator.history = list(checkpoint.get("history", []))
         return estimator

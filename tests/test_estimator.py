@@ -2,13 +2,13 @@ from pathlib import Path
 
 import torch
 
-from trails.config import DataConfig, EstimatorConfig, ModelConfig, TrainerConfig
+from trails.config import DataConfig, ModelConfig, TrailsConfig, TrainerConfig
 from trails.estimator import TrailsEstimator
 from trails_simulate import generate_clinical_time_series_dataset
 
 
-def tiny_config(n_features: int) -> EstimatorConfig:
-    return EstimatorConfig(
+def tiny_config(n_features: int) -> TrailsConfig:
+    return TrailsConfig(
         data=DataConfig(n_features=n_features),
         model=ModelConfig(
             n_clusters=2,

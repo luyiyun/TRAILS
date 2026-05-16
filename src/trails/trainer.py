@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor
+from tqdm import tqdm
 
 from .config import TrainerConfig
 from .data import Batch, ClinicalTimeSeriesDataset, make_data_loader
@@ -33,7 +34,7 @@ class TrailsTrainer:
     def fit(self, data: ClinicalTimeSeriesDataset) -> list[dict[str, float]]:
         loader = make_data_loader(data, self.config, shuffle=True)
         history: list[dict[str, float]] = []
-        for _epoch in range(self.config.max_epochs):
+        for _epoch in tqdm(range(self.config.max_epochs), desc="Epoch"):
             history.append(self._train_epoch(loader))
         return history
 
@@ -62,7 +63,7 @@ class TrailsTrainer:
         self.model.train()
         total_loss = 0.0
         total_batches = 0
-        for batch in loader:
+        for batch in tqdm(loader, desc="Batch", leave=False):
             device_batch = self._move_batch(batch)
             output = self.model(
                 device_batch["x"],

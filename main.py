@@ -5,7 +5,7 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
-from trails.config import DataConfig, EstimatorConfig, ModelConfig, TrainerConfig
+from trails.config import DataConfig, ModelConfig, TrailsConfig, TrainerConfig
 from trails.data import ClinicalTimeSeriesDataset
 from trails.estimator import TrailsEstimator
 from trails_simulate import generate_clinical_time_series_dataset
@@ -127,7 +127,7 @@ def _run_simulate(args: argparse.Namespace) -> int:
 
 def _run_train(args: argparse.Namespace) -> int:
     dataset = ClinicalTimeSeriesDataset.load(args.data)
-    config = EstimatorConfig(
+    config = TrailsConfig(
         data=DataConfig(n_features=dataset.n_features),
         model=ModelConfig(
             encoder_hidden_dim=args.encoder_hidden_dim,

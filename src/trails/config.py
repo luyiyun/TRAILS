@@ -33,7 +33,7 @@ class TrainerConfig(BaseModel):
     device: str = "cpu"
 
 
-class EstimatorConfig(BaseModel):
+class TrailsConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     data: DataConfig = Field(default_factory=DataConfig)

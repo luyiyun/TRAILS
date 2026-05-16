@@ -1,4 +1,4 @@
-from .config import DataConfig, EstimatorConfig, ModelConfig, TrainerConfig
+from .config import DataConfig, ModelConfig, TrailsConfig, TrainerConfig
 from .data import (
     ClinicalSample,
     ClinicalTimeSeriesDataset,
@@ -10,7 +10,7 @@ __all__ = [
     "ClinicalSample",
     "ClinicalTimeSeriesDataset",
     "DataConfig",
-    "EstimatorConfig",
+    "TrailsConfig",
     "ModelConfig",
     "TrainerConfig",
     "TrailsEstimator",
