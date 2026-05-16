@@ -1,0 +1,39 @@
+[project]
+name = "trails"
+version = "0.1.0"
+description = "Deep survival trajectory clustering for irregular multivariate clinical longitudinal data"
+readme = "README.md"
+authors = [
+    { name = "rong", email = "rongzhiwei@tmu.edu.cn" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.13.4",
+    "torch>=2.12.0",
+    "torchmetrics>=1.9.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.12,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipdb>=0.13.13",
+    "pyright>=1.1.409",
+    "pytest>=9.0.3",
+    "ruff>=0.15.13",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+include = ["src", "tests", "main.py"]
+typeCheckingMode = "standard"
+reportPrivateImportUsage = false
