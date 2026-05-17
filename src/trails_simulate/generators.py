@@ -90,7 +90,6 @@ def _sample_survival_times(
     survival_intercepts: Tensor,
     weibull_shape: float,
     censoring_rate: float,
-    # followup_days: float,
     generator: torch.Generator,
 ) -> tuple[Tensor, Tensor]:
     n_patients = int(latent_z.shape[0])
@@ -101,7 +100,6 @@ def _sample_survival_times(
     coefficient = survival_coefficients[cluster_labels]
     intercept = survival_intercepts[cluster_labels]
     risk = (latent_z * coefficient).sum(dim=1) / latent_z.size(1) + intercept
-    # scale = (followup_days / 3.0) * torch.nn.functional.softplus(risk).clamp(0.05, 5.0)
     scale = torch.nn.functional.softplus(risk)
     event_draw = torch.rand(n_patients, generator=generator).clamp(1e-4, 1.0 - 1e-4)
     true_time = scale * (-torch.log(1.0 - event_draw)) ** (1.0 / weibull_shape)
@@ -121,7 +119,6 @@ def generate_clinical_time_series_dataset(
     n_clusters: int = 3,
     min_visits: int = 4,
     max_visits: int = 8,
-    followup_days: float = 365.0,
     latent_dim: int = 5,
     hidden_size: int = 100,
     attention_layers: int = 3,
@@ -187,7 +184,6 @@ def generate_clinical_time_series_dataset(
         survival_intercepts=survival_intercepts,
         weibull_shape=weibull_shape,
         censoring_rate=censoring_rate,
-        # followup_days=followup_days,
         generator=generator,
     )
 
@@ -261,7 +257,6 @@ def generate_clinical_time_series_dataset(
             "n_clusters": n_clusters,
             "min_visits": min_visits,
             "max_visits": max_visits,
-            "followup_days": followup_days,
             "latent_dim": latent_dim,
             "hidden_size": hidden_size,
             "attention_layers": attention_layers,

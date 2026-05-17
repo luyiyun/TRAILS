@@ -33,63 +33,67 @@ Dataset 的 `metadata` 会保留 `latent_z`、`cluster_means`、`cluster_covaria
 
 ## 命令
 
-推荐使用 Makefile 管理常用模拟实验命令：
+实验入口使用 Hydra 配置。默认命令是从模拟到训练的一体化重复实验：
 
 ```bash
-make simulate-realistic
-make train-realistic
-make train-swanlab RUN_NAME=debug-1 EPOCHS=5 WARMUP_EPOCHS=2
+uv run main.py scenario=quick
 ```
 
-所有参数都可以通过 make 变量覆盖，例如：
+常用场景放在 `configs/scenario/`：
 
 ```bash
-make simulate-realistic DATA_DIR=data/simulated/test-1 SEED=20260517
-make train-swanlab DATA_DIR=data/simulated/test-1 RUN_NAME=test-1-debug EPOCHS=5 WARMUP_EPOCHS=2 SWANLAB_MODE=disabled
+uv run main.py scenario=quick
+uv run main.py scenario=normal_swanlab trainer.max_epochs=5 swanlab.mode=disabled
+uv run main.py scenario=formal_5x
 ```
 
-生成模拟数据：
+所有参数都可以通过 Hydra 覆盖，例如：
 
 ```bash
-uv run main.py simulate --out data/simulated/demo.pt --patients 128 --clusters 3 --hidden-size 100 --latent-dim 5 --attention-layers 3 --seed 2026
+uv run main.py scenario=formal_5x experiment.repeats=10
+uv run main.py scenario=quick 'simulator.split_patients=[128,32,32]' trainer.max_epochs=10
 ```
 
-一次性生成训练、验证和测试数据：
+单独生成模拟数据：
 
 ```bash
-uv run main.py simulate --out data/simulated/realistic --split-patients 3000 1000 1000 --clusters 4 --min-visits 3 --max-visits 16 --followup-days 1095 --hidden-size 128 --latent-dim 8 --attention-layers 4 --attention-heads 4 --censoring-rate 0.45 --seed 2026
+uv run main.py command=simulate scenario=quick paths.data_root=data/simulated/quick
 ```
 
-训练基础模型：
+训练已有的 train/val/test split：
 
 ```bash
-uv run main.py train --data data/simulated/demo.pt --epochs 1 --batch-size 16
+uv run main.py command=train scenario=quick paths.data_root=data/simulated/quick
 ```
 
-训练命令默认会把本次实验保存到 `runs/<YYYYmmdd-HHMMSS>/`，包括
-`config.json`、`history.json`、`history.csv`、`test_metrics.json`、`model.pt`
-和 `history.png`。可以用空格列表控制保存内容：
+训练单个 `.pt` 数据集：
 
 ```bash
-uv run main.py train --data data/simulated/demo.pt --save-artifacts config history test plot
+uv run main.py command=train scenario=quick paths.data=data/simulated/demo.pt
 ```
 
-如需独立测试集，可以传入 `--test-data`；如不想保存本次运行，可传入
-`--save-artifacts none`。
+每次 Hydra run 默认保存到 `outputs/<scenario>/<timestamp>/`。`command=experiment`
+会在 run 目录下创建 `repeat_000/`、`repeat_001/` 等子目录；每个 repeat
+内部包含 `data/train.pt`、`data/val.pt`、`data/test.pt` 和训练 artifacts。
+run 根目录会额外保存 `experiment_summary.json`、`test_metrics.csv` 和
+`test_metrics_summary.json`。
 
-调试训练过程时可以开启 SwanLab 实时记录每个 epoch 的训练、验证和最终测试指标：
+可以用 `artifacts.names` 控制训练保存内容：
 
 ```bash
-uv run main.py train --data data/simulated/demo.pt --val-data data/simulated/demo.pt --epochs 5 --batch-size 16 --swanlab --swanlab-project TRAILS --swanlab-experiment debug-demo
+uv run main.py scenario=quick 'artifacts.names=[config,history,test,plot]'
+uv run main.py scenario=quick 'artifacts.names=[none]'
 ```
 
-训练时加入验证集并监控模拟数据的聚类恢复效果：
+SwanLab 由配置控制，重复实验会自动在实验名后追加 `-r000`、`-r001`：
 
 ```bash
-uv run main.py train --data data/simulated/demo.pt --val-data data/simulated/demo.pt --epochs 1 --warmup-epochs 1 --batch-size 16
+uv run main.py scenario=normal_swanlab swanlab.mode=disabled
+uv run main.py scenario=formal_5x swanlab.enabled=true swanlab.experiment=formal-debug
 ```
 
-目前所有命令行都集中在根目录 `main.py`。`trails` 主包只包含核心方法代码；`trails_simulate` 和 `trails_case` 只能作为下游包引用 `trails`。
+目前所有命令行都集中在根目录 `main.py`。`trails` 主包只包含核心方法代码；
+`trails_simulate` 和 `trails_case` 只能作为下游包引用 `trails`。
 
 ## Roadmap
 

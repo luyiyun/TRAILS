@@ -14,6 +14,7 @@ roadmap items.
 ## Layout
 
 - `main.py`: all CLI commands. Use `uv run main.py ...`.
+- `configs/`: Hydra experiment configuration and reusable scenarios.
 - `src/trails/`: reusable core code: data, model, trainer, estimator, metrics.
 - `src/trails_simulate/`: synthetic clinical data generation; imports `trails`.
 - `src/trails_case/`: future real-data/case-study utilities; imports `trails`.
@@ -39,11 +40,11 @@ clean reusable method library.
 
 ## Commands
 
-- Simulate: `uv run main.py simulate --out data/simulated/demo.pt --patients 128 --clusters 3 --seed 2026`
-- Simulate train/validation/test splits: `uv run main.py simulate --out data/simulated/demo --split-patients 128 32 32 --clusters 3 --seed 2026`
-- Train: `uv run main.py train --data data/simulated/demo.pt --epochs 1 --batch-size 16`
-- Train with validation metrics: `uv run main.py train --data data/simulated/demo.pt --val-data data/simulated/demo.pt --epochs 1 --warmup-epochs 1 --batch-size 16`
-- Train with SwanLab logging: add `--swanlab --swanlab-project TRAILS --swanlab-experiment debug-demo`
+- Quick end-to-end experiment: `uv run main.py scenario=quick`
+- Normal SwanLab tuning run: `uv run main.py scenario=normal_swanlab trainer.max_epochs=5 swanlab.mode=disabled`
+- Formal repeated experiment: `uv run main.py scenario=formal_5x`
+- Simulate only: `uv run main.py command=simulate scenario=quick paths.data_root=data/simulated/quick`
+- Train existing splits: `uv run main.py command=train scenario=quick paths.data_root=data/simulated/quick`
 - Format: `uv run ruff format`
 - Lint: `uv run ruff check --fix`
 - Type check: `UV_CACHE_DIR=/tmp/uv-cache uv run pyright`
@@ -52,6 +53,8 @@ clean reusable method library.
 ## Coding Rules
 
 - Use Python and uv.
+- Use Hydra YAML plus CLI overrides for experiment parameters; do not reintroduce
+  Makefile experiment wrappers.
 - All new Python code must have type annotations.
 - `pyright` uses `standard` mode.
 - Inside `src/trails`, prefer relative imports for project modules.
@@ -67,6 +70,15 @@ clean reusable method library.
 
 - Package name: `trails`.
 - CLI lives only in root `main.py`; no package console script is configured.
+- `main.py` is a Hydra app. Default `command=experiment` generates split
+  simulation data and trains once per repeat.
+- Common scenarios live under `configs/scenario/`: `quick`,
+  `normal_swanlab`, and `formal_5x`.
+- `experiment.repeats` means paired repeats: each repeat generates its own
+  train/validation/test splits and trains on those splits.
+- Repeat seeds use `experiment.seed + repeat_index * experiment.seed_stride`;
+  split seeds use repeat seed plus 0/1/2 for train/val/test.
+- Hydra outputs go under `outputs/` by default and are ignored by git.
 - Simulation uses a VaDeSC-EHR-style latent-cluster generator adapted to
   continuous asynchronous clinical measurements.
 - Simulation outputs a `ClinicalTimeSeriesDataset` saved via `torch.save`.

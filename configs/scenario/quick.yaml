@@ -1,0 +1,55 @@
+# @package _global_
+
+experiment:
+  name: quick
+  repeats: 1
+  seed: 20260517
+  seed_stride: 100
+
+simulator:
+  patients: 64
+  split_patients: [64, 24, 24]
+  n_clusters: 3
+  min_visits: 3
+  max_visits: 6
+  hidden_size: 32
+  latent_dim: 4
+  attention_layers: 2
+  attention_heads: 2
+  censoring_rate: 0.3
+  weibull_shape: 1.0
+  x_low: -10.0
+  x_high: 10.0
+  beta_low: -2.5
+  beta_high: 2.5
+
+model:
+  encoder_hidden_dim: 16
+  decoder_hidden_dim: 16
+  latent_dim: 4
+  n_clusters: 3
+  n_layers: 1
+  dropout: 0.0
+
+trainer:
+  max_epochs: 2
+  batch_size: 16
+  learning_rate: 1.0e-3
+  reconstruction_weight: 1.0
+  survival_weight: 0.2
+  cluster_weight: 0.05
+  warmup_epochs: 1
+  gmm_init_iters: 5
+  gradient_clip_norm: 5.0
+  device: cpu
+  seed: 20260517
+
+artifacts:
+  names: [config, history, test, plot]
+  save: null
+
+swanlab:
+  enabled: false
+  project: TRAILS
+  experiment: quick
+  mode: null

@@ -13,4 +13,5 @@ wheels/
 
 data
 runs
-
+outputs
+multirun
