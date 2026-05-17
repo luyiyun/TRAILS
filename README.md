@@ -39,6 +39,12 @@ Dataset 的 `metadata` 会保留 `latent_z`、`cluster_means`、`cluster_covaria
 uv run main.py simulate --out data/simulated/demo.pt --patients 128 --clusters 3 --hidden-size 100 --latent-dim 5 --attention-layers 3 --seed 2026
 ```
 
+一次性生成训练、验证和测试数据：
+
+```bash
+uv run main.py simulate --out data/simulated/realistic --split-patients 3000 1000 1000 --clusters 4 --min-visits 3 --max-visits 16 --followup-days 1095 --hidden-size 128 --latent-dim 8 --attention-layers 4 --attention-heads 4 --censoring-rate 0.45 --seed 2026
+```
+
 训练基础模型：
 
 ```bash
@@ -55,6 +61,12 @@ uv run main.py train --data data/simulated/demo.pt --save-artifacts config histo
 
 如需独立测试集，可以传入 `--test-data`；如不想保存本次运行，可传入
 `--save-artifacts none`。
+
+调试训练过程时可以开启 SwanLab 实时记录每个 epoch 的训练、验证和最终测试指标：
+
+```bash
+uv run main.py train --data data/simulated/demo.pt --val-data data/simulated/demo.pt --epochs 5 --batch-size 16 --swanlab --swanlab-project TRAILS --swanlab-experiment debug-demo
+```
 
 训练时加入验证集并监控模拟数据的聚类恢复效果：
 

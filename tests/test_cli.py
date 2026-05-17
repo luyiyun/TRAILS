@@ -76,6 +76,53 @@ def test_simulate_and_train_cli(tmp_path: Path) -> None:
     assert "loss" in test_metrics
 
 
+def test_simulate_cli_generates_train_val_test_splits(tmp_path: Path) -> None:
+    out_dir = tmp_path / "splits"
+    simulate = subprocess.run(
+        [
+            sys.executable,
+            "main.py",
+            "simulate",
+            "--out",
+            str(out_dir),
+            "--split-patients",
+            "8",
+            "6",
+            "4",
+            "--clusters",
+            "2",
+            "--min-visits",
+            "3",
+            "--max-visits",
+            "4",
+            "--hidden-size",
+            "12",
+            "--latent-dim",
+            "4",
+            "--attention-layers",
+            "2",
+            "--seed",
+            "101",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(simulate.stdout)
+
+    assert (out_dir / "train.pt").exists()
+    assert (out_dir / "val.pt").exists()
+    assert (out_dir / "test.pt").exists()
+    assert payload["out_dir"] == str(out_dir)
+    assert payload["split_patients"] == {"test": 4, "train": 8, "val": 6}
+    assert payload["splits"]["train"]["seed"] == 101
+    assert payload["splits"]["val"]["seed"] == 102
+    assert payload["splits"]["test"]["seed"] == 103
+    assert payload["splits"]["train"]["n_patients"] == 8
+    assert payload["splits"]["val"]["n_patients"] == 6
+    assert payload["splits"]["test"]["n_patients"] == 4
+
+
 def test_train_accepts_explicit_artifact_list(tmp_path: Path) -> None:
     data_path = simulate_dataset(tmp_path)
     run_dir = tmp_path / "explicit-runs"

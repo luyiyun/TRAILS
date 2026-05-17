@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -18,6 +19,7 @@ from .metrics import (
 from .model import TrailsModelOutput, TrailsSurvVaderModel
 
 HistoryEntry = dict[str, float | str]
+HistoryCallback = Callable[[HistoryEntry], None]
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,7 @@ class TrailsTrainer:
         self,
         data: ClinicalTimeSeriesDataset,
         validation_data: ClinicalTimeSeriesDataset | None = None,
+        history_callback: HistoryCallback | None = None,
     ) -> list[HistoryEntry]:
         loader = make_data_loader(data, self.config, shuffle=True)
         if validation_data is not None:
@@ -91,6 +94,8 @@ class TrailsTrainer:
                 entry.update({f"val_{name}": value for name, value in validation_metrics.items()})
 
             history.append(entry)
+            if history_callback is not None:
+                history_callback(entry)
 
         self.initialize_mixture_from_data(data)
 
@@ -113,6 +118,8 @@ class TrailsTrainer:
                 entry.update({f"val_{name}": value for name, value in validation_metrics.items()})
 
             history.append(entry)
+            if history_callback is not None:
+                history_callback(entry)
         return history
 
     def predict(self, data: ClinicalTimeSeriesDataset) -> Tensor:

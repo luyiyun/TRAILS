@@ -40,8 +40,10 @@ clean reusable method library.
 ## Commands
 
 - Simulate: `uv run main.py simulate --out data/simulated/demo.pt --patients 128 --clusters 3 --seed 2026`
+- Simulate train/validation/test splits: `uv run main.py simulate --out data/simulated/demo --split-patients 128 32 32 --clusters 3 --seed 2026`
 - Train: `uv run main.py train --data data/simulated/demo.pt --epochs 1 --batch-size 16`
 - Train with validation metrics: `uv run main.py train --data data/simulated/demo.pt --val-data data/simulated/demo.pt --epochs 1 --warmup-epochs 1 --batch-size 16`
+- Train with SwanLab logging: add `--swanlab --swanlab-project TRAILS --swanlab-experiment debug-demo`
 - Format: `uv run ruff format`
 - Lint: `uv run ruff check --fix`
 - Type check: `UV_CACHE_DIR=/tmp/uv-cache uv run pyright`

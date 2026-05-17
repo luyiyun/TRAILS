@@ -29,8 +29,24 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     simulate = subparsers.add_parser("simulate", help="Generate a synthetic clinical dataset.")
-    simulate.add_argument("--out", type=Path, required=True, help="Output .pt dataset path.")
+    simulate.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Output .pt dataset path, or output directory when --split-patients is set.",
+    )
     simulate.add_argument("--patients", type=int, default=128, help="Number of patients.")
+    simulate.add_argument(
+        "--split-patients",
+        nargs=3,
+        type=int,
+        metavar=("TRAIN", "VAL", "TEST"),
+        default=None,
+        help=(
+            "Generate train.pt, val.pt, and test.pt under --out with these patient counts. "
+            "Uses seed, seed+1, and seed+2."
+        ),
+    )
     simulate.add_argument("--clusters", type=int, default=3, help="Number of latent subtypes.")
     simulate.add_argument("--min-visits", type=int, default=4, help="Minimum visits per patient.")
     simulate.add_argument("--max-visits", type=int, default=8, help="Maximum visits per patient.")
@@ -107,6 +123,26 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ARTIFACT",
         help=("Artifacts to save: config history test model plot, or all/none. Defaults to all."),
     )
+    train.add_argument(
+        "--swanlab",
+        action="store_true",
+        help="Enable SwanLab live logging for per-epoch training and validation metrics.",
+    )
+    train.add_argument(
+        "--swanlab-project",
+        default="TRAILS",
+        help="SwanLab project name used when --swanlab is enabled.",
+    )
+    train.add_argument(
+        "--swanlab-experiment",
+        default=None,
+        help="Optional SwanLab experiment name. Defaults to a timestamped TRAILS run name.",
+    )
+    train.add_argument(
+        "--swanlab-mode",
+        default=None,
+        help="Optional SwanLab mode, such as cloud, local, or disabled.",
+    )
 
     return parser
 
@@ -116,6 +152,8 @@ def run(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "simulate":
+        if args.split_patients is not None and any(count <= 0 for count in args.split_patients):
+            parser.error("--split-patients values must be positive.")
         return _run_simulate(args)
     if args.command == "train":
         try:
@@ -133,8 +171,73 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 
 def _run_simulate(args: argparse.Namespace) -> int:
-    dataset = generate_clinical_time_series_dataset(
-        n_patients=args.patients,
+    if args.split_patients is not None:
+        return _run_simulate_splits(args)
+
+    dataset = _generate_simulated_dataset(args, n_patients=args.patients, seed=args.seed)
+    dataset.save(args.out)
+    print(
+        json.dumps(
+            _simulation_summary(
+                dataset,
+                clusters=args.clusters,
+                out=args.out,
+                seed=args.seed,
+            ),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _run_simulate_splits(args: argparse.Namespace) -> int:
+    split_names = ("train", "val", "test")
+    out_dir = args.out
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for offset, (name, patient_count) in enumerate(
+        zip(split_names, args.split_patients, strict=True)
+    ):
+        seed = args.seed + offset
+        path = out_dir / f"{name}.pt"
+        dataset = _generate_simulated_dataset(args, n_patients=patient_count, seed=seed)
+        dataset.save(path)
+        summaries[name] = _simulation_summary(
+            dataset,
+            clusters=args.clusters,
+            out=path,
+            seed=seed,
+        )
+
+    print(
+        json.dumps(
+            {
+                "out_dir": str(out_dir),
+                "split_patients": {
+                    name: count
+                    for name, count in zip(split_names, args.split_patients, strict=True)
+                },
+                "splits": summaries,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _generate_simulated_dataset(
+    args: argparse.Namespace,
+    *,
+    n_patients: int,
+    seed: int,
+) -> ClinicalTimeSeriesDataset:
+    return generate_clinical_time_series_dataset(
+        n_patients=n_patients,
         n_clusters=args.clusters,
         min_visits=args.min_visits,
         max_visits=args.max_visits,
@@ -149,26 +252,27 @@ def _run_simulate(args: argparse.Namespace) -> int:
         x_high=args.x_high,
         beta_low=args.beta_low,
         beta_high=args.beta_high,
-        seed=args.seed,
+        seed=seed,
     )
-    dataset.save(args.out)
+
+
+def _simulation_summary(
+    dataset: ClinicalTimeSeriesDataset,
+    *,
+    clusters: int,
+    out: Path,
+    seed: int,
+) -> dict[str, Any]:
     event_rate = sum(float(sample.event) for sample in dataset) / len(dataset)
-    print(
-        json.dumps(
-            {
-                "censoring_rate": 1.0 - event_rate,
-                "clusters": args.clusters,
-                "features": dataset.feature_names,
-                "n_features": dataset.n_features,
-                "n_patients": len(dataset),
-                "out": str(args.out),
-            },
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        )
-    )
-    return 0
+    return {
+        "censoring_rate": 1.0 - event_rate,
+        "clusters": clusters,
+        "features": dataset.feature_names,
+        "n_features": dataset.n_features,
+        "n_patients": len(dataset),
+        "out": str(out),
+        "seed": seed,
+    }
 
 
 def _run_train(args: argparse.Namespace) -> int:
@@ -197,8 +301,20 @@ def _run_train(args: argparse.Namespace) -> int:
         ),
         seed=args.seed,
     )
-    estimator = TrailsEstimator(config).fit(dataset, validation_data=validation_dataset)
-    metrics = estimator.test(test_dataset)
+    _start_swanlab_run(args, config)
+    try:
+        estimator = TrailsEstimator(config).fit(
+            dataset,
+            validation_data=validation_dataset,
+            history_callback=_swanlab_history_logger() if args.swanlab else None,
+        )
+        metrics = estimator.test(test_dataset)
+        if args.swanlab:
+            _log_swanlab_test_metrics(metrics, estimator.history)
+    finally:
+        if args.swanlab:
+            _finish_swanlab_run()
+
     run_dir = _save_training_artifacts(args, config, estimator, metrics)
 
     if args.save is not None:
@@ -251,6 +367,78 @@ def _save_training_artifacts(
     return run_dir
 
 
+def _start_swanlab_run(args: argparse.Namespace, config: TrailsConfig) -> None:
+    if not args.swanlab:
+        return
+
+    import swanlab
+
+    experiment_name = args.swanlab_experiment or datetime.now().astimezone().strftime(
+        "trails-%Y%m%d-%H%M%S"
+    )
+    init_kwargs: dict[str, Any] = {
+        "project": args.swanlab_project,
+        "experiment_name": experiment_name,
+        "config": _swanlab_config(args, config),
+    }
+    if args.swanlab_mode is not None:
+        init_kwargs["mode"] = args.swanlab_mode
+    swanlab.init(**init_kwargs)
+
+
+def _finish_swanlab_run() -> None:
+    import swanlab
+
+    swanlab.finish()
+
+
+def _swanlab_history_logger() -> Any:
+    import swanlab
+
+    def log_history(entry: dict[str, float | str]) -> None:
+        metrics: dict[str, float] = {}
+        for name, value in entry.items():
+            if not isinstance(value, int | float):
+                continue
+            if name == "global_epoch":
+                metrics["epoch/global"] = float(value)
+            elif name == "epoch":
+                metrics["epoch/local"] = float(value)
+            elif name.startswith("val_"):
+                metrics[f"val/{name.removeprefix('val_')}"] = float(value)
+            else:
+                metrics[f"train/{name}"] = float(value)
+
+        stage = str(entry["stage"])
+        metrics["stage/warmup"] = 1.0 if stage == "warmup" else 0.0
+        metrics["stage/vade"] = 1.0 if stage == "vade" else 0.0
+        step = int(float(entry["global_epoch"]))
+        swanlab.log(metrics, step=step)
+
+    return log_history
+
+
+def _log_swanlab_test_metrics(
+    metrics: dict[str, float], history: list[dict[str, float | str]]
+) -> None:
+    import swanlab
+
+    step = int(float(history[-1]["global_epoch"])) if history else 0
+    swanlab.log({f"test/{name}": value for name, value in metrics.items()}, step=step)
+
+
+def _swanlab_config(args: argparse.Namespace, config: TrailsConfig) -> dict[str, Any]:
+    return {
+        "config": config.model_dump(mode="json"),
+        "paths": {
+            "data": str(args.data),
+            "test_data": None if args.test_data is None else str(args.test_data),
+            "val_data": None if args.val_data is None else str(args.val_data),
+        },
+        "save_artifacts": sorted(args.save_artifacts),
+    }
+
+
 def _training_run_config(
     args: argparse.Namespace,
     config: TrailsConfig,
@@ -283,6 +471,12 @@ def _training_run_config(
             "n_layers": args.n_layers,
             "seed": args.seed,
             "warmup_epochs": args.warmup_epochs,
+        },
+        "swanlab": {
+            "enabled": args.swanlab,
+            "experiment": args.swanlab_experiment,
+            "mode": args.swanlab_mode,
+            "project": args.swanlab_project,
         },
     }
 

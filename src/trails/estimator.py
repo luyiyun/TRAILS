@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,8 @@ from .config import TrailsConfig
 from .data import ClinicalTimeSeriesDataset, infer_data_config
 from .model import TrailsSurvVaderModel
 from .trainer import HistoryEntry, TrailsTrainer
+
+HistoryCallback = Callable[[HistoryEntry], None]
 
 
 class TrailsEstimator:
@@ -25,12 +28,17 @@ class TrailsEstimator:
         self,
         data: ClinicalTimeSeriesDataset,
         validation_data: ClinicalTimeSeriesDataset | None = None,
+        history_callback: HistoryCallback | None = None,
     ) -> TrailsEstimator:
         self._validate_data_config(data)
         if validation_data is not None:
             self._validate_data_config(validation_data)
         self.model.set_feature_means(data.feature_means)
-        self.history = self.trainer.fit(data, validation_data=validation_data)
+        self.history = self.trainer.fit(
+            data,
+            validation_data=validation_data,
+            history_callback=history_callback,
+        )
         return self
 
     def predict(self, data: ClinicalTimeSeriesDataset) -> Tensor:
