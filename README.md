@@ -33,6 +33,21 @@ Dataset 的 `metadata` 会保留 `latent_z`、`cluster_means`、`cluster_covaria
 
 ## 命令
 
+推荐使用 Makefile 管理常用模拟实验命令：
+
+```bash
+make simulate-realistic
+make train-realistic
+make train-swanlab RUN_NAME=debug-1 EPOCHS=5 WARMUP_EPOCHS=2
+```
+
+所有参数都可以通过 make 变量覆盖，例如：
+
+```bash
+make simulate-realistic DATA_DIR=data/simulated/test-1 SEED=20260517
+make train-swanlab DATA_DIR=data/simulated/test-1 RUN_NAME=test-1-debug EPOCHS=5 WARMUP_EPOCHS=2 SWANLAB_MODE=disabled
+```
+
 生成模拟数据：
 
 ```bash

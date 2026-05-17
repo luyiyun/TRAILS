@@ -176,19 +176,19 @@ def _run_simulate(args: argparse.Namespace) -> int:
 
     dataset = _generate_simulated_dataset(args, n_patients=args.patients, seed=args.seed)
     dataset.save(args.out)
-    print(
-        json.dumps(
-            _simulation_summary(
-                dataset,
-                clusters=args.clusters,
-                out=args.out,
-                seed=args.seed,
-            ),
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    # print(
+    #     json.dumps(
+    #         _simulation_summary(
+    #             dataset,
+    #             clusters=args.clusters,
+    #             out=args.out,
+    #             seed=args.seed,
+    #         ),
+    #         ensure_ascii=False,
+    #         indent=2,
+    #         sort_keys=True,
+    #     )
+    # )
     return 0
 
 
@@ -212,21 +212,21 @@ def _run_simulate_splits(args: argparse.Namespace) -> int:
             seed=seed,
         )
 
-    print(
-        json.dumps(
-            {
-                "out_dir": str(out_dir),
-                "split_patients": {
-                    name: count
-                    for name, count in zip(split_names, args.split_patients, strict=True)
-                },
-                "splits": summaries,
-            },
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    # print(
+    #     json.dumps(
+    #         {
+    #             "out_dir": str(out_dir),
+    #             "split_patients": {
+    #                 name: count
+    #                 for name, count in zip(split_names, args.split_patients, strict=True)
+    #             },
+    #             "splits": summaries,
+    #         },
+    #         ensure_ascii=False,
+    #         indent=2,
+    #         sort_keys=True,
+    #     )
+    # )
     return 0
 
 
@@ -320,19 +320,19 @@ def _run_train(args: argparse.Namespace) -> int:
     if args.save is not None:
         estimator.save(args.save)
 
-    output = {
-        "history": estimator.history,
-        "run_dir": None if run_dir is None else str(run_dir),
-        "test": metrics,
-    }
-    print(
-        json.dumps(
-            output,
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        )
-    )
+    # output = {
+    #     "history": estimator.history,
+    #     "run_dir": None if run_dir is None else str(run_dir),
+    #     "test": metrics,
+    # }
+    # print(
+    #     json.dumps(
+    #         output,
+    #         ensure_ascii=False,
+    #         indent=2,
+    #         sort_keys=True,
+    #     )
+    # )
     return 0
 
 
