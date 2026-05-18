@@ -3,7 +3,7 @@ import torch
 
 from trails.config import DataConfig, ModelConfig
 from trails.data import ClinicalTimeSeriesDataset, clinical_collate_fn, make_clinical_sample
-from trails.model import TrailsSurvVaderModel
+from trails.model import SequencePool, TrailsSurvVaderModel
 from trails_simulate import generate_clinical_time_series_dataset
 
 
@@ -131,7 +131,28 @@ def test_simulation_has_asynchronous_masks_and_valid_delta_time() -> None:
     assert 0.45 <= float(event_rate) <= 0.95
 
 
-def test_grud_model_forward_shapes() -> None:
+def test_sequence_pool_masks_padding_visits() -> None:
+    hidden_sequence = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+    sequence_lengths = torch.tensor([2, 3])
+    pool = SequencePool(hidden_size=3)
+    with torch.no_grad():
+        pool.score.weight.zero_()
+        assert pool.score.bias is not None
+        pool.score.bias.zero_()
+
+    weights = pool.attention_weights(hidden_sequence, sequence_lengths)
+    pooled = pool(hidden_sequence, sequence_lengths)
+
+    assert weights.shape == (2, 4)
+    assert torch.allclose(weights.sum(dim=1), torch.ones(2))
+    assert torch.allclose(weights[0, 2:], torch.zeros(2))
+    assert torch.allclose(weights[1, 3:], torch.zeros(1))
+    assert torch.allclose(pooled[0], hidden_sequence[0, :2].mean(dim=0))
+    assert torch.allclose(pooled[1], hidden_sequence[1, :3].mean(dim=0))
+
+
+@pytest.mark.parametrize("survival_head_hidden_layers", [0, 2])
+def test_grud_model_forward_shapes(survival_head_hidden_layers: int) -> None:
     dataset = generate_clinical_time_series_dataset(
         n_patients=4,
         n_clusters=2,
@@ -150,14 +171,16 @@ def test_grud_model_forward_shapes() -> None:
             latent_dim=4,
             encoder_hidden_dim=8,
             decoder_hidden_dim=8,
+            survival_head_hidden_layers=survival_head_hidden_layers,
         ),
     )
     model.set_feature_means(dataset.feature_means)
     output = model(
-        batch["x"],
-        batch["mask"],
-        batch["delta_time"],
-        batch["sequence_lengths"],
+        times=batch["times"],
+        x=batch["x"],
+        mask=batch["mask"],
+        delta_time=batch["delta_time"],
+        sequence_lengths=batch["sequence_lengths"],
     )
 
     assert output.reconstruction.shape == batch["x"].shape

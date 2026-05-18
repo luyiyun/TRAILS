@@ -672,6 +672,7 @@ def _training_run_config(
             "learning_rate": trails_config.trainer.learning_rate,
             "n_layers": trails_config.model.n_layers,
             "seed": trails_config.seed,
+            "survival_head_hidden_layers": trails_config.model.survival_head_hidden_layers,
             "warmup_epochs": trails_config.trainer.warmup_epochs,
         },
     }

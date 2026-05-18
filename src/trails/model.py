@@ -49,12 +49,32 @@ class GRUDCell(nn.Module):
         return next_hidden, next_last_observed
 
 
+class SequencePool(nn.Module):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.score = nn.Linear(hidden_size, 1)
+
+    def forward(self, hidden_sequence: Tensor, sequence_lengths: Tensor) -> Tensor:
+        # SeqPool：只在有效访问上归一化时间权重，再汇总为病人级表示。
+        weights = self.attention_weights(hidden_sequence, sequence_lengths)
+        return torch.sum(weights.unsqueeze(-1) * hidden_sequence, dim=1)
+
+    def attention_weights(self, hidden_sequence: Tensor, sequence_lengths: Tensor) -> Tensor:
+        _batch_size, max_length, _hidden_size = hidden_sequence.shape
+        steps = torch.arange(max_length, device=hidden_sequence.device).unsqueeze(0)
+        active = steps < sequence_lengths.to(hidden_sequence.device).unsqueeze(1)
+        logits = self.score(hidden_sequence).squeeze(-1)
+        logits = logits.masked_fill(~active, torch.finfo(logits.dtype).min)
+        return torch.softmax(logits, dim=-1)
+
+
 class GRUDEncoder(nn.Module):
     def __init__(self, input_size: int, hidden_size: int) -> None:
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.cell = GRUDCell(input_size, hidden_size)
+        self.seq_pool = SequencePool(hidden_size)
 
     def forward(
         self,
@@ -67,6 +87,7 @@ class GRUDEncoder(nn.Module):
         batch_size, max_length, _n_features = x.shape
         hidden = x.new_zeros(batch_size, self.hidden_size)
         last_observed = feature_means.unsqueeze(0).expand(batch_size, self.input_size)
+        hidden_states: list[Tensor] = []
 
         for step in range(max_length):
             next_hidden, next_last_observed = self.cell(
@@ -80,8 +101,10 @@ class GRUDEncoder(nn.Module):
             active = (step < sequence_lengths).to(dtype=x.dtype, device=x.device).unsqueeze(-1)
             hidden = active * next_hidden + (1.0 - active) * hidden
             last_observed = active * next_last_observed + (1.0 - active) * last_observed
+            hidden_states.append(hidden)
 
-        return hidden
+        hidden_sequence = torch.stack(hidden_states, dim=1)
+        return self.seq_pool(hidden_sequence, sequence_lengths)
 
 
 class TrailsSurvVaderModel(nn.Module):
@@ -103,7 +126,7 @@ class TrailsSurvVaderModel(nn.Module):
             model_config.decoder_hidden_dim * model_config.n_layers,
         )
         self.decoder = nn.GRU(
-            input_size=data_config.n_features,
+            input_size=1,
             hidden_size=model_config.decoder_hidden_dim,
             num_layers=model_config.n_layers,
             batch_first=True,
@@ -120,7 +143,7 @@ class TrailsSurvVaderModel(nn.Module):
         self.mixture_log_variances = nn.Parameter(
             torch.zeros(model_config.n_clusters, model_config.latent_dim)
         )
-        self.survival_head = nn.Linear(model_config.latent_dim, model_config.n_clusters * 2)
+        self.survival_head = build_survival_head(model_config)
 
     def set_feature_means(self, feature_means: Tensor) -> None:
         if feature_means.shape != self.feature_means.shape:
@@ -167,6 +190,8 @@ class TrailsSurvVaderModel(nn.Module):
 
     def forward(
         self,
+        *,
+        times: Tensor,
         x: Tensor,
         mask: Tensor,
         delta_time: Tensor,
@@ -182,7 +207,7 @@ class TrailsSurvVaderModel(nn.Module):
         latent_mean = self.latent_mean(hidden)
         latent_log_variance = self.latent_log_variance(hidden).clamp(min=-8.0, max=8.0)
         latent = self._sample_latent(latent_mean, latent_log_variance)
-        reconstruction = self._decode(latent, x.shape[1], x)
+        reconstruction = self._decode(latent, times)
         cluster_logits = self._cluster_logits(latent)
         cluster_probabilities = torch.softmax(cluster_logits, dim=-1)
         survival_raw = self.survival_head(latent).reshape(-1, self.model_config.n_clusters, 2)
@@ -198,14 +223,14 @@ class TrailsSurvVaderModel(nn.Module):
             weibull_scale=weibull_params[..., 1],
         )
 
-    def _decode(self, latent: Tensor, max_length: int, reference: Tensor) -> Tensor:
+    def _decode(self, latent: Tensor, times: Tensor) -> Tensor:
         batch_size = latent.shape[0]
         initial = self.decoder_initial(latent).reshape(
             self.model_config.n_layers,
             batch_size,
             self.model_config.decoder_hidden_dim,
         )
-        decoder_input = reference.new_zeros(batch_size, max_length, self.data_config.n_features)
+        decoder_input = times.unsqueeze(-1)
         decoded, _hidden = self.decoder(decoder_input, initial.contiguous())
         return self.reconstruction_head(decoded)
 
@@ -229,3 +254,12 @@ class TrailsSurvVaderModel(nn.Module):
             + centered.pow(2) / variance
         )
         return log_density.sum(dim=-1)
+
+
+def build_survival_head(model_config: ModelConfig) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    for _layer in range(model_config.survival_head_hidden_layers):
+        layers.append(nn.Linear(model_config.latent_dim, model_config.latent_dim))
+        layers.append(nn.ReLU())
+    layers.append(nn.Linear(model_config.latent_dim, model_config.n_clusters * 2))
+    return nn.Sequential(*layers)

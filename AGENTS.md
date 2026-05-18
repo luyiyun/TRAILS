@@ -86,11 +86,13 @@ clean reusable method library.
   `survival_time`, `event`, and optional `cluster_label`.
 - Dataset metadata preserves latent profiles, cluster parameters, survival
   coefficients, and generation parameters for simulation-study evaluation.
-- The phase-one model uses GRU-D as encoder and GRU as decoder.
+- The phase-one model uses GRU-D with SeqPool as encoder and a GRU decoder
+  driven by visit times with latent-initialized hidden state.
 - Clustering uses a VaDE-style learnable Gaussian mixture latent prior,
   initialized by deterministic k-means after warmup.
 - The survival head remains a cluster-specific Weibull mixture whose mixture
-  weights are the VaDE posterior cluster probabilities.
+  weights are the VaDE posterior cluster probabilities, with a configurable
+  number of latent-width hidden layers before the Weibull output.
 - Validation and test metrics include ARI/NMI only when true cluster labels are
   available.
 

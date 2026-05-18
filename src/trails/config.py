@@ -18,6 +18,7 @@ class ModelConfig(BaseModel):
     n_clusters: int = Field(default=3, gt=1)
     n_layers: int = Field(default=1, gt=0)
     dropout: float = Field(default=0.0, ge=0.0, lt=1.0)
+    survival_head_hidden_layers: int = Field(default=0, ge=0)
 
 
 class TrainerConfig(BaseModel):

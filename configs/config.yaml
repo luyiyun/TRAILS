@@ -41,6 +41,7 @@ model:
   n_clusters: 3
   n_layers: 1
   dropout: 0.0
+  survival_head_hidden_layers: 0
 
 trainer:
   max_epochs: 5

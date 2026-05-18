@@ -90,7 +90,7 @@ class TrailsTrainer:
         if self.config.warmup_epochs > 0:
             for epoch in tqdm(range(self.config.warmup_epochs), desc="Warmup"):
                 losses, scores = self._epoch_loop(loader, phase="train", include_vade_kl=False)
-                entry: HistoryEntry = {
+                entry: HistoryEntry = {  # type: ignore
                     "epoch": epoch + 1,
                     "global_epoch": len(history) + 1,
                     "stage": "warmup",
@@ -112,8 +112,8 @@ class TrailsTrainer:
 
             self.initialize_mixture_from_data(data)
 
-        survival_metrics = {"cindex": Cindex()}
-        cluster_metrics = (
+        survival_metrics: dict[str, Metric] = {"cindex": Cindex()}
+        cluster_metrics: dict[str, Metric] = (
             {"nmi": NormalizedMutualInfoScore(), "ari": AdjustedRandScore()}
             if validation_data is not None and validation_data.has_cluster_labels
             else {}
@@ -162,8 +162,8 @@ class TrailsTrainer:
 
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
         loader = make_data_loader(data, self.config, shuffle=False)
-        survival_metrics = {"cindex": Cindex()}
-        cluster_metrics = (
+        survival_metrics: dict[str, Metric] = {"cindex": Cindex()}
+        cluster_metrics: dict[str, Metric] = (
             {"nmi": NormalizedMutualInfoScore(), "ari": AdjustedRandScore()}
             if data.has_cluster_labels
             else {}
@@ -215,10 +215,11 @@ class TrailsTrainer:
             for batch in tqdm(loader, desc=phase.capitalize(), leave=False):
                 device_batch = self._move_batch(batch)
                 output = self.model(
-                    device_batch["x"],
-                    device_batch["mask"],
-                    device_batch["delta_time"],
-                    device_batch["sequence_lengths"],
+                    times=device_batch["times"],
+                    x=device_batch["x"],
+                    mask=device_batch["mask"],
+                    delta_time=device_batch["delta_time"],
+                    sequence_lengths=device_batch["sequence_lengths"],
                 )
                 loss = self._compute_loss(output, device_batch, include_vade_kl=include_vade_kl)
 
@@ -273,10 +274,11 @@ class TrailsTrainer:
     #     for batch in tqdm(loader, desc="Batch", leave=False):
     #         device_batch = self._move_batch(batch)
     #         output = self.model(
-    #             device_batch["x"],
-    #             device_batch["mask"],
-    #             device_batch["delta_time"],
-    #             device_batch["sequence_lengths"],
+    #             times=device_batch["times"],
+    #             x=device_batch["x"],
+    #             mask=device_batch["mask"],
+    #             delta_time=device_batch["delta_time"],
+    #             sequence_lengths=device_batch["sequence_lengths"],
     #         )
     #         loss = self._compute_loss(output, device_batch, include_vade_kl=include_vade_kl)
     #         self.optimizer.zero_grad()
@@ -350,10 +352,11 @@ class TrailsTrainer:
     #         for batch in tqdm(loader, desc="Eval", leave=False):
     #             device_batch = self._move_batch(batch)
     #             output = self.model(
-    #                 device_batch["x"],
-    #                 device_batch["mask"],
-    #                 device_batch["delta_time"],
-    #                 device_batch["sequence_lengths"],
+    #                 times=device_batch["times"],
+    #                 x=device_batch["x"],
+    #                 mask=device_batch["mask"],
+    #                 delta_time=device_batch["delta_time"],
+    #                 sequence_lengths=device_batch["sequence_lengths"],
     #             )
     #             loss = self._compute_loss(
     #                 output,
@@ -392,10 +395,11 @@ class TrailsTrainer:
                 device_batch = self._move_batch(batch)
                 outputs.append(
                     self.model(
-                        device_batch["x"],
-                        device_batch["mask"],
-                        device_batch["delta_time"],
-                        device_batch["sequence_lengths"],
+                        times=device_batch["times"],
+                        x=device_batch["x"],
+                        mask=device_batch["mask"],
+                        delta_time=device_batch["delta_time"],
+                        sequence_lengths=device_batch["sequence_lengths"],
                     )
                 )
                 batches.append(device_batch)
@@ -416,10 +420,11 @@ class TrailsTrainer:
             for batch in loader:
                 device_batch = self._move_batch(batch)
                 output = self.model(
-                    device_batch["x"],
-                    device_batch["mask"],
-                    device_batch["delta_time"],
-                    device_batch["sequence_lengths"],
+                    times=device_batch["times"],
+                    x=device_batch["x"],
+                    mask=device_batch["mask"],
+                    delta_time=device_batch["delta_time"],
+                    sequence_lengths=device_batch["sequence_lengths"],
                 )
                 latent_means.append(output.latent_mean.detach().cpu())
         return torch.cat(latent_means, dim=0)
