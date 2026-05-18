@@ -1,0 +1,30 @@
+# @package _global_
+
+defaults:
+  - /scenario/debug
+  - _self_
+
+command: optim
+
+experiment:
+  name: optim
+
+artifacts:
+  names: [none]
+  save: null
+
+diagnostics:
+  latent_embeddings:
+    enabled: false
+
+swanlab:
+  enabled: false
+  project: TRAILS
+  experiment: optim
+  mode: null
+
+optim:
+  n_trials: 30
+  study_name: ${experiment.name}
+  root: outputs/optim/${experiment.name}
+  storage: null

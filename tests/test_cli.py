@@ -41,7 +41,7 @@ def test_main_help() -> None:
         text=True,
     )
     assert "powered by Hydra" in result.stdout
-    assert "scenario: debug, formal_5x, quick" in result.stdout
+    assert "scenario: debug, formal_5x, optim, quick" in result.stdout
 
 
 def test_scenario_configs_validate() -> None:
@@ -49,13 +49,17 @@ def test_scenario_configs_validate() -> None:
 
     config_dir = str((ROOT / "configs").resolve())
     with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
-        for scenario in ("quick", "debug", "formal_5x"):
+        for scenario in ("quick", "debug", "formal_5x", "optim"):
             cfg = compose(config_name="config", overrides=[f"scenario={scenario}"])
             payload = OmegaConf.to_container(cfg, resolve=True)
             app_config = ApplicationConfig.model_validate(payload)
             assert app_config.experiment.name
             assert app_config.simulator.split_patients is not None
             assert app_config.diagnostics.latent_embeddings.enabled == (scenario == "debug")
+            if scenario == "optim":
+                assert app_config.command == "optim"
+                assert app_config.artifacts.names == ("none",)
+                assert not app_config.swanlab.enabled
 
 
 def test_simulate_command_generates_train_val_test_splits(tmp_path: Path) -> None:
@@ -221,6 +225,61 @@ def test_experiment_repeats_generate_data_train_and_metric_summaries(tmp_path: P
     assert "loss" in payload["metrics_summary"]
 
 
+def test_optim_command_runs_multiobjective_study_without_validation_artifacts(
+    tmp_path: Path,
+) -> None:
+    optim_root = tmp_path / "optim"
+    run_dir = tmp_path / "optim-run"
+    stdout = run_main(
+        "scenario=optim",
+        f"optim.root={optim_root}",
+        "optim.n_trials=2",
+        "trainer.device=cpu",
+        "trainer.max_epochs=1",
+        f"hydra.run.dir={run_dir}",
+        *tiny_overrides_without_scenario(),
+    )
+    payload = json.loads((optim_root / "optim_summary.json").read_text(encoding="utf-8"))
+    pareto = json.loads((optim_root / "pareto_trials.json").read_text(encoding="utf-8"))
+
+    assert "TRAILS optim complete" in stdout
+    assert "Pareto front:" in stdout
+    assert "cindex=" in stdout
+    assert "ari=" in stdout
+    assert (optim_root / "study.db").exists()
+    assert (optim_root / "data" / "train.pt").exists()
+    assert (optim_root / "data" / "test.pt").exists()
+    assert not (optim_root / "data" / "val.pt").exists()
+    assert not (optim_root / "train").exists()
+    assert (optim_root / "trials.csv").exists()
+    assert payload["command"] == "optim"
+    assert payload["n_completed_after"] == 2
+    assert payload["data"]["val_data"] is None
+    assert payload["data"]["splits"]["train"]["n_patients"] == 8
+    assert payload["data"]["splits"]["test"]["n_patients"] == 4
+    assert len(pareto) >= 1
+
+
+def test_optim_command_resumes_existing_study(tmp_path: Path) -> None:
+    optim_root = tmp_path / "optim-resume"
+    overrides = [
+        "scenario=optim",
+        f"optim.root={optim_root}",
+        "optim.n_trials=1",
+        "trainer.device=cpu",
+        "trainer.max_epochs=1",
+        *tiny_overrides_without_scenario(),
+    ]
+
+    run_main(*overrides, f"hydra.run.dir={tmp_path / 'optim-resume-run-1'}")
+    run_main(*overrides, f"hydra.run.dir={tmp_path / 'optim-resume-run-2'}")
+    payload = json.loads((optim_root / "optim_summary.json").read_text(encoding="utf-8"))
+
+    assert payload["n_completed_before"] == 1
+    assert payload["n_completed_after"] == 2
+    assert len([trial for trial in payload["trials"] if trial["state"] == "COMPLETE"]) == 2
+
+
 def write_fake_umap_module(root: Path) -> Path:
     package = root / "umap"
     package.mkdir(parents=True)
@@ -254,6 +313,10 @@ def pythonpath_env(path: Path) -> dict[str, str]:
     if existing:
         paths.append(existing)
     return {"PYTHONPATH": os.pathsep.join(paths)}
+
+
+def tiny_overrides_without_scenario() -> list[str]:
+    return [override for override in TINY_OVERRIDES if not override.startswith("scenario=")]
 
 
 def run_main(*overrides: str, env: dict[str, str] | None = None) -> str:

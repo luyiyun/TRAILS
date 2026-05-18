@@ -70,6 +70,12 @@ swanlab:
   experiment: null
   mode: null
 
+optim:
+  n_trials: 30
+  study_name: ${experiment.name}
+  root: outputs/optim/${experiment.name}
+  storage: null
+
 hydra:
   job:
     chdir: false

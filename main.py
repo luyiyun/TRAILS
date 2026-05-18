@@ -29,8 +29,21 @@ from trails.estimator import TrailsEstimator
 from trails.trainer import HistoryEntry
 from trails_simulate import generate_clinical_time_series_dataset
 
-Command = Literal["experiment", "simulate", "train"]
+Command = Literal["experiment", "simulate", "train", "optim"]
 SplitNames = tuple[Literal["train"], Literal["val"], Literal["test"]]
+OPTIM_PARAM_NAMES = (
+    "hidden_dim",
+    "latent_dim",
+    "n_layers",
+    "dropout",
+    "survival_head_hidden_layers",
+    "learning_rate",
+    "batch_size",
+    "survival_weight",
+    "cluster_weight",
+    "warmup_epochs",
+    "gmm_init_iters",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +119,15 @@ class SwanLabConfig(BaseModel):
     mode: str | None = None
 
 
+class OptimConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    n_trials: int = Field(default=30, gt=0)
+    study_name: str = Field(default="optim", min_length=1)
+    root: Path = Path("outputs/optim/optim")
+    storage: str | None = None
+
+
 class ApplicationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -118,6 +140,7 @@ class ApplicationConfig(BaseModel):
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
     swanlab: SwanLabConfig = Field(default_factory=SwanLabConfig)
+    optim: OptimConfig = Field(default_factory=OptimConfig)
 
 
 @dataclass(frozen=True)
@@ -135,6 +158,14 @@ class TrainResult:
     history: list[HistoryEntry]
     metrics: dict[str, float]
     run_dir: Path | None
+
+
+@dataclass(frozen=True)
+class OptimDataPaths:
+    train_data: Path
+    test_data: Path
+    source: str
+    splits: dict[str, dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +203,8 @@ def run(
         return _run_train_command(config, hydra_run_dir, project_root)
     if config.command == "experiment":
         return _run_experiment_command(config, hydra_run_dir, project_root)
+    if config.command == "optim":
+        return _run_optim_command(config, hydra_run_dir, project_root)
 
     raise ValueError(f"Unsupported command: {config.command}")
 
@@ -310,6 +343,394 @@ def _run_experiment_command(
     _save_repeat_metrics_csv(hydra_run_dir / "test_metrics.csv", repeats)
     save_json(hydra_run_dir / "test_metrics_summary.json", metrics_summary)
     return summary
+
+
+def _run_optim_command(
+    config: ApplicationConfig,
+    hydra_run_dir: Path,
+    project_root: Path,
+) -> dict[str, Any]:
+    optuna = _load_optuna()
+    optim_root = _resolve_path(config.optim.root, project_root)
+    optim_root.mkdir(parents=True, exist_ok=True)
+
+    optim_data = _optim_data_paths(config, optim_root=optim_root, project_root=project_root)
+    _validate_optim_test_data(optim_data.test_data)
+
+    storage_url = _optim_storage_url(config.optim.storage, optim_root, project_root)
+    sampler = optuna.samplers.TPESampler(seed=config.experiment.seed)
+    study = optuna.create_study(
+        directions=["maximize", "maximize"],
+        load_if_exists=True,
+        sampler=sampler,
+        storage=storage_url,
+        study_name=config.optim.study_name,
+    )
+
+    completed_before = _count_completed_trials(study.trials)
+    study.optimize(
+        lambda trial: _run_optim_trial(
+            trial,
+            config=config,
+            optim_root=optim_root,
+            train_data=optim_data.train_data,
+            test_data=optim_data.test_data,
+        ),
+        n_trials=config.optim.n_trials,
+    )
+    completed_after = _count_completed_trials(study.trials)
+
+    summary_path = optim_root / "optim_summary.json"
+    trials_csv_path = optim_root / "trials.csv"
+    pareto_path = optim_root / "pareto_trials.json"
+    pareto_trials = _serialize_optim_trials(study.best_trials)
+    all_trials = _serialize_optim_trials(study.trials)
+    summary = {
+        "command": "optim",
+        "config": config.model_dump(mode="json"),
+        "data": _optim_data_payload(optim_data),
+        "hydra_run_dir": str(hydra_run_dir),
+        "n_completed_after": completed_after,
+        "n_completed_before": completed_before,
+        "n_trials_requested": config.optim.n_trials,
+        "optim_root": str(optim_root),
+        "pareto_trials": pareto_trials,
+        "paths": {
+            "optim_summary": str(summary_path),
+            "pareto_trials": str(pareto_path),
+            "trials_csv": str(trials_csv_path),
+        },
+        "storage": storage_url,
+        "study_name": study.study_name,
+        "trials": all_trials,
+    }
+
+    save_json(summary_path, summary)
+    _save_optim_trials_csv(trials_csv_path, study.trials)
+    save_json(pareto_path, pareto_trials)
+    return summary
+
+
+def _load_optuna() -> Any:
+    try:
+        import optuna
+    except ImportError as error:
+        raise RuntimeError(
+            "command=optim requires Optuna. Install the project dev dependencies with "
+            "`uv sync --group dev` before running `uv run main.py scenario=optim`."
+        ) from error
+    return optuna
+
+
+def _run_optim_trial(
+    trial: Any,
+    *,
+    config: ApplicationConfig,
+    optim_root: Path,
+    train_data: Path,
+    test_data: Path,
+) -> tuple[float, float]:
+    trial_seed = config.experiment.seed + trial.number * config.experiment.seed_stride
+    trial_config = _optim_trial_config(config, trial)
+    train_paths = TrainPaths(
+        data=train_data,
+        val_data=None,
+        test_data=test_data,
+        test_data_used=test_data,
+        train_root=optim_root / "train",
+        save=None,
+    )
+    result = _fit_training_run(
+        trial_config,
+        train_paths=train_paths,
+        seed=trial_seed,
+        swanlab_repeat_label=None,
+    )
+    cindex = _required_metric(result.metrics, "cindex", trial.number)
+    ari = _required_metric(result.metrics, "ari", trial.number)
+
+    trial.set_user_attr("seed", trial_seed)
+    trial.set_user_attr("metrics", _json_safe_metrics(result.metrics))
+    trial.set_user_attr("model_config", trial_config.model.model_dump(mode="json"))
+    trial.set_user_attr("trainer_config", trial_config.trainer.model_dump(mode="json"))
+    return cindex, ari
+
+
+def _optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationConfig:
+    hidden_dim = int(trial.suggest_categorical("hidden_dim", [32, 64, 128]))
+    model_config = config.model.model_copy(
+        update={
+            "decoder_hidden_dim": hidden_dim,
+            "dropout": float(trial.suggest_float("dropout", 0.0, 0.3)),
+            "encoder_hidden_dim": hidden_dim,
+            "latent_dim": int(trial.suggest_categorical("latent_dim", [8, 16, 32])),
+            "n_layers": int(trial.suggest_categorical("n_layers", [1, 2, 3])),
+            "survival_head_hidden_layers": int(
+                trial.suggest_categorical("survival_head_hidden_layers", [0, 1, 2])
+            ),
+        }
+    )
+    trainer_config = config.trainer.model_copy(
+        update={
+            "batch_size": int(trial.suggest_categorical("batch_size", [128, 256, 512])),
+            "cluster_weight": float(trial.suggest_float("cluster_weight", 0.005, 0.5, log=True)),
+            "gmm_init_iters": int(trial.suggest_categorical("gmm_init_iters", [10, 20, 50])),
+            "learning_rate": float(trial.suggest_float("learning_rate", 1e-4, 3e-2, log=True)),
+            "survival_weight": float(trial.suggest_float("survival_weight", 0.05, 1.0, log=True)),
+            "warmup_epochs": int(trial.suggest_int("warmup_epochs", 0, 5)),
+        }
+    )
+
+    # optim 只保留 Optuna bookkeeping，训练过程中的模型、图和诊断产物全部关闭。
+    diagnostics_config = config.diagnostics.model_copy(
+        update={
+            "latent_embeddings": config.diagnostics.latent_embeddings.model_copy(
+                update={"enabled": False}
+            )
+        }
+    )
+    return config.model_copy(
+        update={
+            "artifacts": ArtifactsConfig(names=("none",), save=None),
+            "diagnostics": diagnostics_config,
+            "model": model_config,
+            "swanlab": config.swanlab.model_copy(update={"enabled": False}),
+            "trainer": trainer_config,
+        }
+    )
+
+
+def _optim_data_paths(
+    config: ApplicationConfig,
+    *,
+    optim_root: Path,
+    project_root: Path,
+) -> OptimDataPaths:
+    data_root = (
+        None
+        if config.paths.data_root is None
+        else _resolve_path(config.paths.data_root, project_root)
+    )
+    if data_root is not None:
+        train_data = (
+            _resolve_path(config.paths.data, project_root)
+            if config.paths.data is not None
+            else data_root / "train.pt"
+        )
+        test_data = (
+            _resolve_path(config.paths.test_data, project_root)
+            if config.paths.test_data is not None
+            else data_root / "test.pt"
+        )
+        return OptimDataPaths(
+            train_data=train_data,
+            test_data=test_data,
+            source="external",
+            splits=_optim_existing_split_summaries(config.simulator, train_data, test_data),
+        )
+
+    if config.paths.data is not None or config.paths.test_data is not None:
+        if config.paths.data is None or config.paths.test_data is None:
+            raise ValueError(
+                "command=optim requires both paths.data and paths.test_data when paths.data_root "
+                "is not set."
+            )
+        train_data = _resolve_path(config.paths.data, project_root)
+        test_data = _resolve_path(config.paths.test_data, project_root)
+        return OptimDataPaths(
+            train_data=train_data,
+            test_data=test_data,
+            source="external",
+            splits=_optim_existing_split_summaries(config.simulator, train_data, test_data),
+        )
+
+    data_dir = optim_root / "data"
+    train_data = data_dir / "train.pt"
+    test_data = data_dir / "test.pt"
+    train_patients, test_patients = _optim_patient_counts(config.simulator)
+    splits = {
+        "train": _optim_cached_or_generate_split(
+            config.simulator,
+            out=train_data,
+            n_patients=train_patients,
+            seed=config.experiment.seed,
+        ),
+        "test": _optim_cached_or_generate_split(
+            config.simulator,
+            out=test_data,
+            n_patients=test_patients,
+            seed=config.experiment.seed + 2,
+        ),
+    }
+    return OptimDataPaths(
+        train_data=train_data,
+        test_data=test_data,
+        source="cache",
+        splits=splits,
+    )
+
+
+def _optim_existing_split_summaries(
+    simulator: SimulatorConfig,
+    train_data: Path,
+    test_data: Path,
+) -> dict[str, dict[str, Any]]:
+    return {
+        "train": _existing_dataset_summary(
+            train_data,
+            clusters=simulator.n_clusters,
+            default_seed=0,
+        ),
+        "test": _existing_dataset_summary(
+            test_data,
+            clusters=simulator.n_clusters,
+            default_seed=0,
+        ),
+    }
+
+
+def _optim_cached_or_generate_split(
+    simulator: SimulatorConfig,
+    *,
+    out: Path,
+    n_patients: int,
+    seed: int,
+) -> dict[str, Any]:
+    if out.exists():
+        return _existing_dataset_summary(out, clusters=simulator.n_clusters, default_seed=seed)
+    return _simulate_one_dataset(
+        simulator,
+        out=out,
+        n_patients=n_patients,
+        seed=seed,
+    )
+
+
+def _existing_dataset_summary(
+    path: Path,
+    *,
+    clusters: int,
+    default_seed: int,
+) -> dict[str, Any]:
+    dataset = ClinicalTimeSeriesDataset.load(path)
+    metadata_params = dataset.metadata.get("generation_params")
+    if isinstance(metadata_params, Mapping):
+        seed = int(metadata_params.get("seed", default_seed))
+        clusters = int(metadata_params.get("n_clusters", clusters))
+    else:
+        seed = default_seed
+    return _simulation_summary(dataset, clusters=clusters, out=path, seed=seed)
+
+
+def _optim_patient_counts(simulator: SimulatorConfig) -> tuple[int, int]:
+    if simulator.split_patients is None:
+        return simulator.patients, simulator.patients
+    train_patients, _val_patients, test_patients = simulator.split_patients
+    return train_patients, test_patients
+
+
+def _validate_optim_test_data(test_data: Path) -> None:
+    dataset = ClinicalTimeSeriesDataset.load(test_data)
+    if not dataset.has_cluster_labels:
+        raise ValueError("command=optim requires test data with cluster_label for ARI.")
+
+
+def _optim_storage_url(storage: str | None, optim_root: Path, project_root: Path) -> str:
+    if storage is None:
+        return f"sqlite:///{(optim_root / 'study.db').as_posix()}"
+    if "://" in storage:
+        return storage
+    return f"sqlite:///{_resolve_path(Path(storage), project_root).as_posix()}"
+
+
+def _required_metric(metrics: Mapping[str, float], name: str, trial_number: int) -> float:
+    if name not in metrics:
+        raise ValueError(f"Trial {trial_number} did not produce required metric '{name}'.")
+    value = float(metrics[name])
+    if not math.isfinite(value):
+        raise ValueError(f"Trial {trial_number} produced non-finite metric '{name}={value}'.")
+    return value
+
+
+def _json_safe_metrics(metrics: Mapping[str, float]) -> dict[str, float | str]:
+    payload: dict[str, float | str] = {}
+    for name, value in metrics.items():
+        number = float(value)
+        payload[name] = number if math.isfinite(number) else str(number)
+    return payload
+
+
+def _count_completed_trials(trials: Sequence[Any]) -> int:
+    return sum(1 for trial in trials if trial.state.name == "COMPLETE")
+
+
+def _optim_data_payload(optim_data: OptimDataPaths) -> dict[str, Any]:
+    return {
+        "source": optim_data.source,
+        "splits": optim_data.splits,
+        "test_data": str(optim_data.test_data),
+        "train_data": str(optim_data.train_data),
+        "val_data": None,
+    }
+
+
+def _serialize_optim_trials(trials: Sequence[Any]) -> list[dict[str, Any]]:
+    return [_serialize_optim_trial(trial) for trial in trials]
+
+
+def _serialize_optim_trial(trial: Any) -> dict[str, Any]:
+    values = None if trial.values is None else [float(value) for value in trial.values]
+    return {
+        "datetime_complete": None
+        if trial.datetime_complete is None
+        else trial.datetime_complete.isoformat(timespec="seconds"),
+        "datetime_start": None
+        if trial.datetime_start is None
+        else trial.datetime_start.isoformat(timespec="seconds"),
+        "duration_seconds": _trial_duration_seconds(trial),
+        "number": trial.number,
+        "params": dict(trial.params),
+        "state": trial.state.name,
+        "user_attrs": dict(trial.user_attrs),
+        "values": values,
+    }
+
+
+def _trial_duration_seconds(trial: Any) -> float | None:
+    if trial.datetime_start is None or trial.datetime_complete is None:
+        return None
+    return (trial.datetime_complete - trial.datetime_start).total_seconds()
+
+
+def _save_optim_trials_csv(path: Path, trials: Sequence[Any]) -> None:
+    fieldnames = [
+        "number",
+        "state",
+        "cindex",
+        "ari",
+        "seed",
+        *OPTIM_PARAM_NAMES,
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for trial in trials:
+            row: dict[str, Any] = {
+                "ari": _trial_objective_value(trial, 1),
+                "cindex": _trial_objective_value(trial, 0),
+                "number": trial.number,
+                "seed": trial.user_attrs.get("seed", ""),
+                "state": trial.state.name,
+            }
+            row.update({name: trial.params.get(name, "") for name in OPTIM_PARAM_NAMES})
+            writer.writerow(row)
+
+
+def _trial_objective_value(trial: Any, index: int) -> float | str:
+    if trial.values is None or len(trial.values) <= index:
+        return ""
+    return float(trial.values[index])
 
 
 # ---------------------------------------------------------------------------
@@ -883,6 +1304,8 @@ def format_run_summary(result: Mapping[str, Any]) -> str:
         return _format_train_summary(result)
     if command == "experiment":
         return _format_experiment_summary(result)
+    if command == "optim":
+        return _format_optim_summary(result)
     raise ValueError(f"Unsupported command summary: {command}")
 
 
@@ -950,6 +1373,58 @@ def _format_experiment_summary(result: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_optim_summary(result: Mapping[str, Any]) -> str:
+    paths = dict(result["paths"])
+    pareto_trials = [dict(trial) for trial in result["pareto_trials"]]
+    lines = [
+        "TRAILS optim complete",
+        f"Hydra run: {result['hydra_run_dir']}",
+        f"Optim root: {result['optim_root']}",
+        f"Study: {result['study_name']}",
+        f"Storage: {result['storage']}",
+        "Trials: "
+        f"{result['n_completed_before']} -> {result['n_completed_after']} "
+        f"(requested {result['n_trials_requested']})",
+        "",
+        "Saved summaries:",
+        f"  summary: {paths['optim_summary']}",
+        f"  trials csv: {paths['trials_csv']}",
+        f"  pareto: {paths['pareto_trials']}",
+    ]
+    if pareto_trials:
+        lines.append("")
+        lines.append("Pareto front:")
+        for trial in pareto_trials[:8]:
+            values = trial.get("values")
+            params = dict(trial.get("params", {}))
+            metric_text = _format_optim_objectives(values)
+            param_text = _format_optim_params(params)
+            lines.append(f"  trial {trial['number']:<4} {metric_text} {param_text}")
+    return "\n".join(lines)
+
+
+def _format_optim_objectives(values: Any) -> str:
+    if not isinstance(values, Sequence) or len(values) < 2:
+        return "cindex=NA ari=NA"
+    return f"cindex={_format_float(values[0])} ari={_format_float(values[1])}"
+
+
+def _format_optim_params(params: Mapping[str, Any]) -> str:
+    selected = ["hidden_dim", "latent_dim", "learning_rate", "survival_weight", "cluster_weight"]
+    chunks = [
+        f"{name}={_format_optim_param_value(params[name])}" for name in selected if name in params
+    ]
+    return " ".join(chunks)
+
+
+def _format_optim_param_value(value: Any) -> str:
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return _format_float(value)
+    return str(value)
+
+
 def _format_metrics_block(title: str, metrics: Mapping[str, Any]) -> list[str]:
     names = _ordered_metric_names(metrics.keys())
     if not names:
@@ -1006,6 +1481,7 @@ def _format_repeat_block(repeats: Sequence[Mapping[str, Any]]) -> list[str]:
 def _ordered_metric_names(names: Iterable[str]) -> list[str]:
     preferred = [
         "loss",
+        "cindex",
         "c_index",
         "ari",
         "nmi",
