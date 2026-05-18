@@ -43,7 +43,7 @@ uv run main.py scenario=quick
 
 ```bash
 uv run main.py scenario=quick
-uv run main.py scenario=normal_swanlab trainer.max_epochs=5 swanlab.mode=disabled
+uv run main.py scenario=debug trainer.max_epochs=5 swanlab.mode=disabled
 uv run main.py scenario=formal_5x
 ```
 
@@ -91,7 +91,7 @@ uv run main.py scenario=quick 'artifacts.names=[none]'
 SwanLab 由配置控制，重复实验会自动在实验名后追加 `-r000`、`-r001`：
 
 ```bash
-uv run main.py scenario=normal_swanlab swanlab.mode=disabled
+uv run main.py scenario=debug swanlab.mode=disabled
 uv run main.py scenario=formal_5x swanlab.enabled=true swanlab.experiment=formal-debug
 ```
 

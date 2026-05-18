@@ -41,7 +41,7 @@ clean reusable method library.
 ## Commands
 
 - Quick end-to-end experiment: `uv run main.py scenario=quick`
-- Normal SwanLab tuning run: `uv run main.py scenario=normal_swanlab trainer.max_epochs=5 swanlab.mode=disabled`
+- Normal SwanLab tuning run: `uv run main.py scenario=debug trainer.max_epochs=5 swanlab.mode=disabled`
 - Formal repeated experiment: `uv run main.py scenario=formal_5x`
 - Simulate only: `uv run main.py command=simulate scenario=quick paths.data_root=data/simulated/quick`
 - Train existing splits: `uv run main.py command=train scenario=quick paths.data_root=data/simulated/quick`
@@ -73,7 +73,7 @@ clean reusable method library.
 - `main.py` is a Hydra app. Default `command=experiment` generates split
   simulation data and trains once per repeat.
 - Common scenarios live under `configs/scenario/`: `quick`,
-  `normal_swanlab`, and `formal_5x`.
+  `debug`, and `formal_5x`.
 - `experiment.repeats` means paired repeats: each repeat generates its own
   train/validation/test splits and trains on those splits.
 - Repeat seeds use `experiment.seed + repeat_index * experiment.seed_stride`;
