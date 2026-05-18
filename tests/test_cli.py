@@ -2,7 +2,6 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
@@ -59,7 +58,7 @@ def test_scenario_configs_validate() -> None:
 def test_simulate_command_generates_train_val_test_splits(tmp_path: Path) -> None:
     data_root = tmp_path / "splits"
     run_dir = tmp_path / "simulate-run"
-    payload = run_main(
+    stdout = run_main(
         "command=simulate",
         f"paths.data_root={data_root}",
         f"hydra.run.dir={run_dir}",
@@ -69,13 +68,11 @@ def test_simulate_command_generates_train_val_test_splits(tmp_path: Path) -> Non
     assert (data_root / "train.pt").exists()
     assert (data_root / "val.pt").exists()
     assert (data_root / "test.pt").exists()
-    assert payload["command"] == "simulate"
-    assert payload["out_dir"] == str(data_root)
-    assert payload["split_patients"] == {"test": 4, "train": 8, "val": 6}
-    assert payload["splits"]["train"]["seed"] == 20260517
-    assert payload["splits"]["val"]["seed"] == 20260518
-    assert payload["splits"]["test"]["seed"] == 20260519
-    assert payload["splits"]["train"]["n_patients"] == 8
+    assert "TRAILS simulate complete" in stdout
+    assert f"Data root: {data_root}" in stdout
+    assert "train patients=8 seed=20260517" in stdout
+    assert "val   patients=6 seed=20260518" in stdout
+    assert "test  patients=4 seed=20260519" in stdout
 
 
 def test_train_command_uses_generated_splits(tmp_path: Path) -> None:
@@ -88,29 +85,33 @@ def test_train_command_uses_generated_splits(tmp_path: Path) -> None:
         *TINY_OVERRIDES,
     )
 
-    payload = run_main(
+    stdout = run_main(
         "command=train",
         f"paths.data_root={data_root}",
         f"hydra.run.dir={run_dir}",
         "artifacts.names=[config,history,test,model,plot]",
         *TINY_OVERRIDES,
     )
-    artifact_run = Path(payload["run_dir"])
+    artifact_run = next((run_dir / "train").iterdir())
 
-    assert payload["command"] == "train"
-    assert payload["paths"]["data"] == str(data_root / "train.pt")
-    assert payload["paths"]["val_data"] == str(data_root / "val.pt")
-    assert payload["paths"]["test_data"] == str(data_root / "test.pt")
-    assert payload["paths"]["test_data_used"] == str(data_root / "test.pt")
-    assert "history" in payload
-    assert "test" in payload
-    assert "ari" in payload["test"]
+    assert "TRAILS train complete" in stdout
+    assert f"Train data: {data_root / 'train.pt'}" in stdout
+    assert f"Validation data: {data_root / 'val.pt'}" in stdout
+    assert f"Test data: {data_root / 'test.pt'}" in stdout
+    assert "Test metrics:" in stdout
+    assert "loss" in stdout
+    assert "ari" in stdout
     assert (artifact_run / "config.json").exists()
     assert (artifact_run / "history.json").exists()
     assert (artifact_run / "history.csv").exists()
     assert (artifact_run / "test_metrics.json").exists()
     assert (artifact_run / "model.pt").exists()
     assert (artifact_run / "history.png").stat().st_size > 0
+    config = json.loads((artifact_run / "config.json").read_text(encoding="utf-8"))
+    assert config["paths"]["data"] == str(data_root / "train.pt")
+    assert config["paths"]["val_data"] == str(data_root / "val.pt")
+    assert config["paths"]["test_data"] == str(data_root / "test.pt")
+    assert config["paths"]["test_data_used"] == str(data_root / "test.pt")
 
 
 def test_train_artifacts_none_skips_train_artifact_dir(tmp_path: Path) -> None:
@@ -123,7 +124,7 @@ def test_train_artifacts_none_skips_train_artifact_dir(tmp_path: Path) -> None:
         *TINY_OVERRIDES,
     )
 
-    payload = run_main(
+    stdout = run_main(
         "command=train",
         f"paths.data_root={data_root}",
         f"hydra.run.dir={run_dir}",
@@ -131,13 +132,14 @@ def test_train_artifacts_none_skips_train_artifact_dir(tmp_path: Path) -> None:
         *TINY_OVERRIDES,
     )
 
-    assert payload["run_dir"] is None
+    assert "TRAILS train complete" in stdout
+    assert "Artifacts: not saved" in stdout
     assert not (run_dir / "train").exists()
 
 
 def test_experiment_repeats_generate_data_train_and_metric_summaries(tmp_path: Path) -> None:
     run_dir = tmp_path / "experiment-run"
-    payload = run_main(
+    stdout = run_main(
         "command=experiment",
         "experiment.repeats=2",
         "experiment.seed=101",
@@ -146,7 +148,14 @@ def test_experiment_repeats_generate_data_train_and_metric_summaries(tmp_path: P
         f"hydra.run.dir={run_dir}",
         *TINY_OVERRIDES,
     )
+    payload = json.loads((run_dir / "experiment_summary.json").read_text(encoding="utf-8"))
 
+    assert "TRAILS experiment complete" in stdout
+    assert f"Hydra run: {run_dir}" in stdout
+    assert "Repeats: 2" in stdout
+    assert "Seeds: 101, 111" in stdout
+    assert "Metric summary:" in stdout
+    assert "Repeat results:" in stdout
     assert payload["command"] == "experiment"
     assert payload["hydra_run_dir"] == str(run_dir)
     assert [repeat["seed"] for repeat in payload["repeats"]] == [101, 111]
@@ -171,11 +180,11 @@ def test_experiment_repeats_generate_data_train_and_metric_summaries(tmp_path: P
     assert "loss" in payload["metrics_summary"]
 
 
-def run_main(*overrides: str) -> dict[str, Any]:
+def run_main(*overrides: str) -> str:
     result = subprocess.run(
         [sys.executable, "main.py", *overrides],
         check=True,
         capture_output=True,
         text=True,
     )
-    return json.loads(result.stdout)
+    return result.stdout

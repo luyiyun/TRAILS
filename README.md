@@ -78,6 +78,9 @@ uv run main.py command=train scenario=quick paths.data=data/simulated/demo.pt
 run 根目录会额外保存 `experiment_summary.json`、`test_metrics.csv` 和
 `test_metrics_summary.json`。
 
+命令结束时 stdout 会打印精简的可读 summary；完整机器可读结果保存在上述
+JSON/CSV artifacts 中。
+
 可以用 `artifacts.names` 控制训练保存内容：
 
 ```bash

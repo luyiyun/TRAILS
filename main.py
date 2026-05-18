@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import csv
-import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -133,7 +132,7 @@ def main(raw_config: DictConfig) -> None:
     project_root = Path(get_original_cwd())
     hydra_run_dir = Path(HydraConfig.get().runtime.output_dir)
     result = run(config, hydra_run_dir=hydra_run_dir, project_root=project_root)
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    print(format_run_summary(result))
 
 
 def run(
@@ -769,6 +768,167 @@ def _save_repeat_metrics_csv(path: Path, repeats: Sequence[Mapping[str, Any]]) -
             row = {name: repeat.get(name) for name in fieldnames}
             row.update({name: metrics.get(name, "") for name in metric_names})
             writer.writerow(row)
+
+
+def format_run_summary(result: Mapping[str, Any]) -> str:
+    command = str(result["command"])
+    if command == "simulate":
+        return _format_simulate_summary(result)
+    if command == "train":
+        return _format_train_summary(result)
+    if command == "experiment":
+        return _format_experiment_summary(result)
+    raise ValueError(f"Unsupported command summary: {command}")
+
+
+def _format_simulate_summary(result: Mapping[str, Any]) -> str:
+    lines = ["TRAILS simulate complete", f"Hydra run: {result['hydra_run_dir']}"]
+    if "splits" in result:
+        lines.append(f"Data root: {result['out_dir']}")
+        lines.append("")
+        lines.append("Splits:")
+        for name in ("train", "val", "test"):
+            split = dict(dict(result["splits"])[name])
+            lines.append(
+                "  "
+                f"{name:<5} patients={split['n_patients']} "
+                f"seed={split['seed']} "
+                f"censoring={_format_float(split['censoring_rate'])} "
+                f"path={split['out']}"
+            )
+    else:
+        lines.extend(
+            [
+                f"Dataset: {result['out']}",
+                f"Patients: {result['n_patients']}",
+                f"Clusters: {result['clusters']}",
+                f"Features: {result['n_features']}",
+                f"Seed: {result['seed']}",
+                f"Censoring rate: {_format_float(result['censoring_rate'])}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _format_train_summary(result: Mapping[str, Any]) -> str:
+    paths = dict(result["paths"])
+    lines = [
+        "TRAILS train complete",
+        f"Hydra run: {result['hydra_run_dir']}",
+        f"Seed: {result['seed']}",
+        f"Train data: {paths['data']}",
+    ]
+    if paths.get("val_data") is not None:
+        lines.append(f"Validation data: {paths['val_data']}")
+    lines.append(f"Test data: {paths['test_data_used']}")
+    lines.append(f"Artifacts: {result['run_dir'] or 'not saved'}")
+    lines.extend(_format_metrics_block("Test metrics", dict(result["test"])))
+    return "\n".join(lines)
+
+
+def _format_experiment_summary(result: Mapping[str, Any]) -> str:
+    run_dir = Path(str(result["hydra_run_dir"]))
+    repeats = [dict(repeat) for repeat in result["repeats"]]
+    lines = [
+        "TRAILS experiment complete",
+        f"Hydra run: {run_dir}",
+        f"Repeats: {len(repeats)}",
+        f"Seeds: {_format_seed_list([int(repeat['seed']) for repeat in repeats])}",
+        "",
+        "Saved summaries:",
+        f"  experiment: {run_dir / 'experiment_summary.json'}",
+        f"  metrics csv: {run_dir / 'test_metrics.csv'}",
+        f"  metrics summary: {run_dir / 'test_metrics_summary.json'}",
+    ]
+    lines.extend(_format_metric_summary_block(dict(result["metrics_summary"])))
+    lines.extend(_format_repeat_block(repeats))
+    return "\n".join(lines)
+
+
+def _format_metrics_block(title: str, metrics: Mapping[str, Any]) -> list[str]:
+    names = _ordered_metric_names(metrics.keys())
+    if not names:
+        return []
+    lines = ["", f"{title}:"]
+    for name in names:
+        value = metrics[name]
+        if isinstance(value, int | float):
+            lines.append(f"  {name:<22} {_format_float(value)}")
+    return lines
+
+
+def _format_metric_summary_block(summary: Mapping[str, Any]) -> list[str]:
+    names = _ordered_metric_names(summary.keys())
+    if not names:
+        return []
+    lines = ["", "Metric summary:"]
+    header = f"  {'metric':<22} {'mean':>10} {'std':>10} {'min':>10} {'max':>10} {'n':>4}"
+    lines.append(header)
+    for name in names:
+        stats = dict(summary[name])
+        lines.append(
+            "  "
+            f"{name:<22} "
+            f"{_format_float(stats['mean']):>10} "
+            f"{_format_float(stats['std']):>10} "
+            f"{_format_float(stats['min']):>10} "
+            f"{_format_float(stats['max']):>10} "
+            f"{int(stats['n']):>4}"
+        )
+    return lines
+
+
+def _format_repeat_block(repeats: Sequence[Mapping[str, Any]]) -> list[str]:
+    if not repeats:
+        return []
+    lines = ["", "Repeat results:"]
+    for repeat in repeats:
+        metrics = dict(repeat["metrics"])
+        metric_text = ", ".join(
+            f"{name}={_format_float(metrics[name])}"
+            for name in _ordered_metric_names(metrics.keys())[:4]
+            if isinstance(metrics.get(name), int | float)
+        )
+        lines.append(
+            "  "
+            f"{repeat['repeat']} seed={repeat['seed']} "
+            f"{metric_text} "
+            f"artifacts={repeat['train_run_dir'] or 'not saved'}"
+        )
+    return lines
+
+
+def _ordered_metric_names(names: Iterable[str]) -> list[str]:
+    preferred = [
+        "loss",
+        "c_index",
+        "ari",
+        "nmi",
+        "reconstruction_loss",
+        "survival_loss",
+        "vade_kl_loss",
+    ]
+    available = set(names)
+    ordered = [name for name in preferred if name in available]
+    ordered.extend(sorted(available - set(ordered)))
+    return ordered
+
+
+def _format_seed_list(seeds: Sequence[int]) -> str:
+    if len(seeds) <= 8:
+        return ", ".join(str(seed) for seed in seeds)
+    head = ", ".join(str(seed) for seed in seeds[:4])
+    tail = ", ".join(str(seed) for seed in seeds[-2:])
+    return f"{head}, ..., {tail}"
+
+
+def _format_float(value: Any) -> str:
+    number = float(value)
+    if math.isnan(number) or math.isinf(number):
+        return str(number)
+    if abs(number) >= 1000 or (0 < abs(number) < 0.001):
+        return f"{number:.4e}"
+    return f"{number:.4f}"
 
 
 if __name__ == "__main__":
