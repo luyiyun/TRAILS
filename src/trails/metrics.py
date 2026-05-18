@@ -5,7 +5,6 @@ import math
 import torch
 from torch import Tensor
 from torchmetrics import Metric
-from torchmetrics.clustering import AdjustedRandScore, NormalizedMutualInfoScore
 
 
 def masked_mse(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
@@ -110,6 +109,6 @@ class Cindex(Metric):
 
         comparable = (time < time[:, None]) & (event > 0)
         concordant = (risk > risk[:, None] + self.tied_tol) & comparable
-        tied = ((risk - risk[:None]).abs() <= self.tied_tol) & comparable
+        tied = ((risk - risk[:, None]).abs() <= self.tied_tol) & comparable
 
         return (concordant.sum() + 0.5 * tied.sum()) / comparable.sum().clamp_min(1.0)
