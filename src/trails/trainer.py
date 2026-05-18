@@ -78,26 +78,30 @@ class TrailsTrainer:
             valid_loader = None
 
         history: list[HistoryEntry] = []
-        for epoch in tqdm(range(self.config.warmup_epochs), desc="Warmup"):
-            metrics = self._train_epoch(loader, include_vade_kl=False)
-            entry: HistoryEntry = {
-                **metrics,
-                "epoch": float(epoch + 1),
-                "global_epoch": float(len(history) + 1),
-                "stage": "warmup",
-            }
 
-            if valid_loader is not None:
-                validation_metrics = self._evaluate(
-                    valid_loader, include_vade_kl=False, cal_cluster_metrics=False
-                )
-                entry.update({f"val_{name}": value for name, value in validation_metrics.items()})
+        if self.config.warmup_epochs > 0:
+            for epoch in tqdm(range(self.config.warmup_epochs), desc="Warmup"):
+                metrics = self._train_epoch(loader, include_vade_kl=False)
+                entry: HistoryEntry = {
+                    **metrics,
+                    "epoch": float(epoch + 1),
+                    "global_epoch": float(len(history) + 1),
+                    "stage": "warmup",
+                }
 
-            history.append(entry)
-            if history_callback is not None:
-                history_callback(entry)
+                if valid_loader is not None:
+                    validation_metrics = self._evaluate(
+                        valid_loader, include_vade_kl=False, cal_cluster_metrics=False
+                    )
+                    entry.update(
+                        {f"val_{name}": value for name, value in validation_metrics.items()}
+                    )
 
-        self.initialize_mixture_from_data(data)
+                history.append(entry)
+                if history_callback is not None:
+                    history_callback(entry)
+
+            self.initialize_mixture_from_data(data)
 
         for epoch in tqdm(range(self.config.max_epochs), desc="Epoch"):
             metrics = self._train_epoch(loader, include_vade_kl=True)
@@ -233,7 +237,7 @@ class TrailsTrainer:
 
         self.model.eval()
         with torch.no_grad():
-            for batch in loader:
+            for batch in tqdm(loader, desc="Eval", leave=False):
                 device_batch = self._move_batch(batch)
                 output = self.model(
                     device_batch["x"],

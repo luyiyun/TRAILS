@@ -31,6 +31,10 @@ Command = Literal["experiment", "simulate", "train"]
 SplitNames = tuple[Literal["train"], Literal["val"], Literal["test"]]
 
 
+# ---------------------------------------------------------------------------
+# Config schema
+
+
 class ExperimentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -116,6 +120,10 @@ class TrainResult:
     run_dir: Path | None
 
 
+# ---------------------------------------------------------------------------
+# Hydra entrypoint and command dispatch
+
+
 def _load_app_config(raw_config: DictConfig) -> ApplicationConfig:
     payload = OmegaConf.to_container(raw_config, resolve=True)
     if not isinstance(payload, dict):
@@ -151,11 +159,17 @@ def run(
     raise ValueError(f"Unsupported command: {config.command}")
 
 
+# ---------------------------------------------------------------------------
+# Command flows
+
+
 def _run_simulate_command(
     config: ApplicationConfig,
     hydra_run_dir: Path,
     project_root: Path,
 ) -> dict[str, Any]:
+    seed = config.experiment.seed
+
     if config.simulator.split_patients is not None:
         if config.paths.data is not None:
             raise ValueError("paths.data cannot be combined with simulator.split_patients.")
@@ -163,23 +177,21 @@ def _run_simulate_command(
         payload = _simulate_splits(
             config.simulator,
             out_dir=data_root,
-            seed=config.experiment.seed,
+            seed=seed,
         )
-    else:
-        out = _single_dataset_path(config, hydra_run_dir, project_root)
-        dataset = _generate_simulated_dataset(
-            config.simulator,
-            n_patients=config.simulator.patients,
-            seed=config.experiment.seed,
-        )
-        dataset.save(out)
-        payload = _simulation_summary(
-            dataset,
-            clusters=config.simulator.n_clusters,
-            out=out,
-            seed=config.experiment.seed,
-        )
+        return {
+            "command": "simulate",
+            "hydra_run_dir": str(hydra_run_dir),
+            **payload,
+        }
 
+    out = _single_dataset_path(config, hydra_run_dir, project_root)
+    payload = _simulate_one_dataset(
+        config.simulator,
+        out=out,
+        n_patients=config.simulator.patients,
+        seed=seed,
+    )
     return {
         "command": "simulate",
         "hydra_run_dir": str(hydra_run_dir),
@@ -192,11 +204,12 @@ def _run_train_command(
     hydra_run_dir: Path,
     project_root: Path,
 ) -> dict[str, Any]:
+    seed = config.experiment.seed
     train_paths = _train_paths_from_config(config, hydra_run_dir, project_root)
     result = _fit_training_run(
         config,
         train_paths=train_paths,
-        seed=config.experiment.seed,
+        seed=seed,
         swanlab_repeat_label=None,
     )
     return _train_output_payload(
@@ -204,7 +217,7 @@ def _run_train_command(
         hydra_run_dir=hydra_run_dir,
         train_paths=train_paths,
         result=result,
-        seed=config.experiment.seed,
+        seed=seed,
     )
 
 
@@ -226,6 +239,7 @@ def _run_experiment_command(
 
     repeats: list[dict[str, Any]] = []
     for index in range(config.experiment.repeats):
+        # paired repeat: 同一个 repeat seed 同时驱动该轮 split 生成和模型训练。
         repeat_name = f"repeat_{index:03d}"
         repeat_seed = config.experiment.seed + index * config.experiment.seed_stride
         repeat_dir = hydra_run_dir / repeat_name
@@ -281,6 +295,10 @@ def _run_experiment_command(
     return summary
 
 
+# ---------------------------------------------------------------------------
+# Simulation
+
+
 def _simulate_splits(
     simulator: SimulatorConfig,
     *,
@@ -292,6 +310,7 @@ def _simulate_splits(
         raise ValueError("simulator.split_patients is required for split simulation.")
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # split seed 固定为 repeat seed + 0/1/2，便于复现实验中的 train/val/test。
     summaries: dict[str, dict[str, Any]] = {}
     for offset, (name, patient_count) in enumerate(
         zip(split_names, simulator.split_patients, strict=True)
@@ -318,6 +337,27 @@ def _simulate_splits(
         },
         "splits": summaries,
     }
+
+
+def _simulate_one_dataset(
+    simulator: SimulatorConfig,
+    *,
+    out: Path,
+    n_patients: int,
+    seed: int,
+) -> dict[str, Any]:
+    dataset = _generate_simulated_dataset(
+        simulator,
+        n_patients=n_patients,
+        seed=seed,
+    )
+    dataset.save(out)
+    return _simulation_summary(
+        dataset,
+        clusters=simulator.n_clusters,
+        out=out,
+        seed=seed,
+    )
 
 
 def _generate_simulated_dataset(
@@ -364,6 +404,10 @@ def _simulation_summary(
     }
 
 
+# ---------------------------------------------------------------------------
+# Training
+
+
 def _fit_training_run(
     config: ApplicationConfig,
     *,
@@ -401,7 +445,7 @@ def _fit_training_run(
         estimator = TrailsEstimator(trails_config).fit(
             dataset,
             validation_data=validation_dataset,
-            history_callback=_swanlab_history_logger() if config.swanlab.enabled else None,
+            history_callback=_log_swanlab_history if config.swanlab.enabled else None,
         )
         metrics = estimator.test(test_dataset)
         if config.swanlab.enabled:
@@ -440,6 +484,7 @@ def _save_training_artifacts(
     created_at = datetime.now().astimezone()
     run_dir = create_timestamped_run_dir(train_paths.train_root, created_at)
 
+    # artifacts.names 决定训练产物边界；不在这里隐式保存额外文件。
     if "config" in artifacts:
         save_json(
             run_dir / "config.json",
@@ -465,6 +510,10 @@ def _save_training_artifacts(
     return run_dir
 
 
+# ---------------------------------------------------------------------------
+# SwanLab integration
+
+
 def _start_swanlab_run(
     swanlab_config: SwanLabConfig,
     trails_config: TrailsConfig,
@@ -478,6 +527,7 @@ def _start_swanlab_run(
 
     import swanlab
 
+    # 每次训练单独打开/关闭 SwanLab run，repeat 标签避免多轮实验同名。
     experiment_name = swanlab_config.experiment or datetime.now().astimezone().strftime(
         "trails-%Y%m%d-%H%M%S"
     )
@@ -500,30 +550,27 @@ def _finish_swanlab_run() -> None:
     swanlab.finish()
 
 
-def _swanlab_history_logger() -> Any:
+def _log_swanlab_history(entry: HistoryEntry) -> None:
     import swanlab
 
-    def log_history(entry: HistoryEntry) -> None:
-        metrics: dict[str, float] = {}
-        for name, value in entry.items():
-            if not isinstance(value, int | float):
-                continue
-            if name == "global_epoch":
-                metrics["epoch/global"] = float(value)
-            elif name == "epoch":
-                metrics["epoch/local"] = float(value)
-            elif name.startswith("val_"):
-                metrics[f"val/{name.removeprefix('val_')}"] = float(value)
-            else:
-                metrics[f"train/{name}"] = float(value)
+    metrics: dict[str, float] = {}
+    for name, value in entry.items():
+        if not isinstance(value, int | float):
+            continue
+        if name == "global_epoch":
+            metrics["epoch/global"] = float(value)
+        elif name == "epoch":
+            metrics["epoch/local"] = float(value)
+        elif name.startswith("val_"):
+            metrics[f"val/{name.removeprefix('val_')}"] = float(value)
+        else:
+            metrics[f"train/{name}"] = float(value)
 
-        stage = str(entry["stage"])
-        metrics["stage/warmup"] = 1.0 if stage == "warmup" else 0.0
-        metrics["stage/vade"] = 1.0 if stage == "vade" else 0.0
-        step = int(float(entry["global_epoch"]))
-        swanlab.log(metrics, step=step)
-
-    return log_history
+    stage = str(entry["stage"])
+    metrics["stage/warmup"] = 1.0 if stage == "warmup" else 0.0
+    metrics["stage/vade"] = 1.0 if stage == "vade" else 0.0
+    step = int(float(entry["global_epoch"]))
+    swanlab.log(metrics, step=step)
 
 
 def _log_swanlab_test_metrics(metrics: dict[str, float], history: list[HistoryEntry]) -> None:
@@ -611,6 +658,10 @@ def _train_paths_payload(train_paths: TrainPaths) -> dict[str, str | None]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Path resolution
+
+
 def _train_paths_from_config(
     config: ApplicationConfig,
     hydra_run_dir: Path,
@@ -624,11 +675,13 @@ def _train_paths_from_config(
         if config.paths.data_root is None
         else _resolve_path(config.paths.data_root, project_root)
     )
-    data_path = (
-        _resolve_path(config.paths.data, project_root)
-        if config.paths.data is not None
-        else _required_data_root(data_root) / "train.pt"
-    )
+    if config.paths.data is not None:
+        data_path = _resolve_path(config.paths.data, project_root)
+    else:
+        if data_root is None:
+            raise ValueError("paths.data_root is required when paths.data is not set.")
+        data_path = data_root / "train.pt"
+
     val_data = _optional_split_path(config.paths.val_data, data_root, "val", project_root)
     test_data = _optional_split_path(config.paths.test_data, data_root, "test", project_root)
     train_root = _train_root(config, hydra_run_dir, project_root)
@@ -657,12 +710,6 @@ def _optional_split_path(
         return None
     candidate = data_root / f"{name}.pt"
     return candidate if candidate.exists() else None
-
-
-def _required_data_root(data_root: Path | None) -> Path:
-    if data_root is None:
-        raise ValueError("paths.data_root is required when paths.data is not set.")
-    return data_root
 
 
 def _data_root(
@@ -717,6 +764,10 @@ def _resolve_path(path: Path, project_root: Path) -> Path:
     return project_root / path
 
 
+# ---------------------------------------------------------------------------
+# Repeat metric summaries
+
+
 def _summarize_repeat_metrics(repeats: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     metric_names = sorted(
         {
@@ -768,6 +819,10 @@ def _save_repeat_metrics_csv(path: Path, repeats: Sequence[Mapping[str, Any]]) -
             row = {name: repeat.get(name) for name in fieldnames}
             row.update({name: metrics.get(name, "") for name in metric_names})
             writer.writerow(row)
+
+
+# ---------------------------------------------------------------------------
+# Human-readable output
 
 
 def format_run_summary(result: Mapping[str, Any]) -> str:
