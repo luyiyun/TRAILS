@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .config import DataConfig, ModelConfig
+from .config import DataConfig, DecoderConfig, EncoderConfig, EncoderMappingConfig, ModelConfig
 
 
 @dataclass(frozen=True)
@@ -68,16 +68,51 @@ class SequencePool(nn.Module):
         return torch.softmax(logits, dim=-1)
 
 
-class GRUDEncoder(nn.Module):
+def sequence_padding_mask(
+    sequence_lengths: Tensor,
+    max_length: int,
+    device: torch.device,
+) -> Tensor:
+    lengths = sequence_lengths.to(device)
+    steps = torch.arange(max_length, device=device).unsqueeze(0)
+    return steps >= lengths.unsqueeze(1)
+
+
+def active_sequence_mask(
+    sequence_lengths: Tensor,
+    max_length: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tensor:
+    return (
+        (~sequence_padding_mask(sequence_lengths, max_length, device)).to(dtype=dtype).unsqueeze(-1)
+    )
+
+
+def visit_time_features(times: Tensor) -> Tensor:
+    nonnegative_times = times.clamp_min(0.0)
+    return torch.stack(
+        [
+            times,
+            torch.log1p(nonnegative_times),
+            torch.sin(times),
+            torch.cos(times),
+        ],
+        dim=-1,
+    )
+
+
+class GRUDInputLayer(nn.Module):
     def __init__(self, input_size: int, hidden_size: int) -> None:
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.cell = GRUDCell(input_size, hidden_size)
-        self.seq_pool = SequencePool(hidden_size)
 
     def forward(
         self,
+        *,
         x: Tensor,
         mask: Tensor,
         delta_time: Tensor,
@@ -103,8 +138,339 @@ class GRUDEncoder(nn.Module):
             last_observed = active * next_last_observed + (1.0 - active) * last_observed
             hidden_states.append(hidden)
 
-        hidden_sequence = torch.stack(hidden_states, dim=1)
-        return self.seq_pool(hidden_sequence, sequence_lengths)
+        return torch.stack(hidden_states, dim=1)
+
+
+class MTANInputLayer(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, n_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.value_projection = nn.Linear(input_size * 3, hidden_size)
+        self.time_projection = nn.Linear(4, hidden_size)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attention_norm = nn.LayerNorm(hidden_size)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 2, hidden_size),
+        )
+        self.ffn_norm = nn.LayerNorm(hidden_size)
+
+    def forward(
+        self,
+        *,
+        times: Tensor,
+        x: Tensor,
+        mask: Tensor,
+        delta_time: Tensor,
+        sequence_lengths: Tensor,
+        feature_means: Tensor,
+    ) -> Tensor:
+        mean = feature_means.view(1, 1, -1).expand_as(x)
+        imputed = mask * x + (1.0 - mask) * mean
+        values = self.value_projection(torch.cat([imputed, mask, delta_time], dim=-1))
+        time_embedding = self.time_projection(visit_time_features(times))
+        padding_mask = sequence_padding_mask(sequence_lengths, x.shape[1], x.device)
+        # mTAN-like 输入层：用观测值/缺失模式作 value，用真实访问时间构造 query/key。
+        attended, _weights = self.attention(
+            query=time_embedding,
+            key=time_embedding,
+            value=values,
+            key_padding_mask=padding_mask,
+            need_weights=False,
+        )
+        attended = self.attention_norm(attended + values)
+        encoded = self.ffn_norm(attended + self.ffn(attended))
+        return encoded * active_sequence_mask(
+            sequence_lengths,
+            x.shape[1],
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+
+class RecurrentMappingLayer(nn.Module):
+    def __init__(
+        self,
+        *,
+        kind: str,
+        input_dim: int,
+        hidden_dim: int,
+        n_layers: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        recurrent_dropout = dropout if n_layers > 1 else 0.0
+        rnn_cls = nn.GRU if kind == "gru" else nn.LSTM
+        self.rnn = rnn_cls(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=n_layers,
+            batch_first=True,
+            dropout=recurrent_dropout,
+        )
+
+    def forward(self, sequence: Tensor, times: Tensor, sequence_lengths: Tensor) -> Tensor:
+        del times
+        encoded, _hidden = self.rnn(sequence)
+        return encoded * active_sequence_mask(
+            sequence_lengths,
+            sequence.shape[1],
+            dtype=sequence.dtype,
+            device=sequence.device,
+        )
+
+
+class TransformerMappingLayer(nn.Module):
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        hidden_dim: int,
+        n_layers: int,
+        n_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        self.time_projection = nn.Linear(4, hidden_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+
+    def forward(self, sequence: Tensor, times: Tensor, sequence_lengths: Tensor) -> Tensor:
+        padding_mask = sequence_padding_mask(sequence_lengths, sequence.shape[1], sequence.device)
+        tokens = self.input_projection(sequence) + self.time_projection(visit_time_features(times))
+        encoded = self.transformer(tokens, src_key_padding_mask=padding_mask)
+        return encoded * active_sequence_mask(
+            sequence_lengths,
+            sequence.shape[1],
+            dtype=sequence.dtype,
+            device=sequence.device,
+        )
+
+
+class TrailsEncoder(nn.Module):
+    def __init__(
+        self,
+        data_config: DataConfig,
+        encoder_config: EncoderConfig,
+        *,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.encoder_config = encoder_config
+        if encoder_config.input.kind == "grud":
+            self.input_layer = GRUDInputLayer(
+                data_config.n_features,
+                encoder_config.input.hidden_dim,
+            )
+        else:
+            self.input_layer = MTANInputLayer(
+                data_config.n_features,
+                encoder_config.input.hidden_dim,
+                encoder_config.input.n_heads,
+                dropout,
+            )
+        self.mapping = build_encoder_mapping(
+            encoder_config.mapping,
+            input_dim=encoder_config.input.hidden_dim,
+            dropout=dropout,
+        )
+        self.seq_pool = SequencePool(encoder_config.mapping.hidden_dim)
+
+    def forward(
+        self,
+        *,
+        times: Tensor,
+        x: Tensor,
+        mask: Tensor,
+        delta_time: Tensor,
+        sequence_lengths: Tensor,
+        feature_means: Tensor,
+    ) -> Tensor:
+        if self.encoder_config.input.kind == "grud":
+            input_sequence = self.input_layer(
+                x=x,
+                mask=mask,
+                delta_time=delta_time,
+                sequence_lengths=sequence_lengths,
+                feature_means=feature_means,
+            )
+        else:
+            input_sequence = self.input_layer(
+                times=times,
+                x=x,
+                mask=mask,
+                delta_time=delta_time,
+                sequence_lengths=sequence_lengths,
+                feature_means=feature_means,
+            )
+        mapped_sequence = self.mapping(input_sequence, times, sequence_lengths)
+        return self.seq_pool(mapped_sequence, sequence_lengths)
+
+
+def build_encoder_mapping(
+    mapping_config: EncoderMappingConfig,
+    *,
+    input_dim: int,
+    dropout: float,
+) -> nn.Module:
+    if mapping_config.kind in {"gru", "lstm"}:
+        return RecurrentMappingLayer(
+            kind=mapping_config.kind,
+            input_dim=input_dim,
+            hidden_dim=mapping_config.hidden_dim,
+            n_layers=mapping_config.n_layers,
+            dropout=dropout,
+        )
+    return TransformerMappingLayer(
+        input_dim=input_dim,
+        hidden_dim=mapping_config.hidden_dim,
+        n_layers=mapping_config.n_layers,
+        n_heads=mapping_config.n_heads,
+        dropout=dropout,
+    )
+
+
+class RecurrentDecoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        data_config: DataConfig,
+        decoder_config: DecoderConfig,
+        latent_dim: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.decoder_config = decoder_config
+        recurrent_dropout = dropout if decoder_config.n_layers > 1 else 0.0
+        input_size = 1 if decoder_config.conditioning == "initial_state" else latent_dim + 1
+        rnn_cls = nn.GRU if decoder_config.kind == "gru" else nn.LSTM
+        self.rnn = rnn_cls(
+            input_size=input_size,
+            hidden_size=decoder_config.hidden_dim,
+            num_layers=decoder_config.n_layers,
+            batch_first=True,
+            dropout=recurrent_dropout,
+        )
+        if decoder_config.conditioning == "initial_state":
+            self.initial_hidden = nn.Linear(
+                latent_dim,
+                decoder_config.hidden_dim * decoder_config.n_layers,
+            )
+            self.initial_cell = (
+                nn.Linear(latent_dim, decoder_config.hidden_dim * decoder_config.n_layers)
+                if decoder_config.kind == "lstm"
+                else None
+            )
+        else:
+            self.initial_hidden = None
+            self.initial_cell = None
+        self.reconstruction_head = nn.Linear(decoder_config.hidden_dim, data_config.n_features)
+
+    def forward(self, latent: Tensor, times: Tensor, sequence_lengths: Tensor) -> Tensor:
+        del sequence_lengths
+        if self.decoder_config.conditioning == "initial_state":
+            decoded = self._decode_with_initial_state(latent, times)
+        else:
+            decoded = self._decode_with_concat_time(latent, times)
+        return self.reconstruction_head(decoded)
+
+    def _decode_with_initial_state(self, latent: Tensor, times: Tensor) -> Tensor:
+        if self.initial_hidden is None:
+            raise RuntimeError("initial hidden layer is required for initial_state decoding.")
+        batch_size = latent.shape[0]
+        hidden = self.initial_hidden(latent).reshape(
+            self.decoder_config.n_layers,
+            batch_size,
+            self.decoder_config.hidden_dim,
+        )
+        decoder_input = times.unsqueeze(-1)
+        if self.decoder_config.kind == "lstm":
+            if self.initial_cell is None:
+                raise RuntimeError("initial cell layer is required for LSTM decoding.")
+            cell = self.initial_cell(latent).reshape(
+                self.decoder_config.n_layers,
+                batch_size,
+                self.decoder_config.hidden_dim,
+            )
+            decoded, _state = self.rnn(decoder_input, (hidden.contiguous(), cell.contiguous()))
+        else:
+            decoded, _state = self.rnn(decoder_input, hidden.contiguous())
+        return decoded
+
+    def _decode_with_concat_time(self, latent: Tensor, times: Tensor) -> Tensor:
+        repeated_latent = latent.unsqueeze(1).expand(-1, times.shape[1], -1)
+        decoder_input = torch.cat([times.unsqueeze(-1), repeated_latent], dim=-1)
+        decoded, _state = self.rnn(decoder_input)
+        return decoded
+
+
+class TransformerDecoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        data_config: DataConfig,
+        decoder_config: DecoderConfig,
+        latent_dim: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.input_projection = nn.Linear(latent_dim + 1, decoder_config.hidden_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=decoder_config.hidden_dim,
+            nhead=decoder_config.n_heads,
+            dim_feedforward=decoder_config.hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=decoder_config.n_layers)
+        self.reconstruction_head = nn.Linear(decoder_config.hidden_dim, data_config.n_features)
+
+    def forward(self, latent: Tensor, times: Tensor, sequence_lengths: Tensor) -> Tensor:
+        repeated_latent = latent.unsqueeze(1).expand(-1, times.shape[1], -1)
+        decoder_input = torch.cat([times.unsqueeze(-1), repeated_latent], dim=-1)
+        padding_mask = sequence_padding_mask(sequence_lengths, times.shape[1], times.device)
+        decoded = self.transformer(
+            self.input_projection(decoder_input),
+            src_key_padding_mask=padding_mask,
+        )
+        return self.reconstruction_head(decoded)
+
+
+def build_decoder(
+    *,
+    data_config: DataConfig,
+    decoder_config: DecoderConfig,
+    latent_dim: int,
+    dropout: float,
+) -> nn.Module:
+    if decoder_config.kind in {"gru", "lstm"}:
+        return RecurrentDecoder(
+            data_config=data_config,
+            decoder_config=decoder_config,
+            latent_dim=latent_dim,
+            dropout=dropout,
+        )
+    return TransformerDecoder(
+        data_config=data_config,
+        decoder_config=decoder_config,
+        latent_dim=latent_dim,
+        dropout=dropout,
+    )
 
 
 class TrailsSurvVaderModel(nn.Module):
@@ -114,26 +480,24 @@ class TrailsSurvVaderModel(nn.Module):
         self.model_config = model_config
         self.register_buffer("_feature_means", torch.zeros(data_config.n_features))
 
-        decoder_dropout = model_config.dropout if model_config.n_layers > 1 else 0.0
-        self.encoder = GRUDEncoder(data_config.n_features, model_config.encoder_hidden_dim)
-        self.latent_mean = nn.Linear(model_config.encoder_hidden_dim, model_config.latent_dim)
+        self.encoder = TrailsEncoder(
+            data_config,
+            model_config.encoder,
+            dropout=model_config.dropout,
+        )
+        self.latent_mean = nn.Linear(
+            model_config.encoder.mapping.hidden_dim,
+            model_config.latent_dim,
+        )
         self.latent_log_variance = nn.Linear(
-            model_config.encoder_hidden_dim,
+            model_config.encoder.mapping.hidden_dim,
             model_config.latent_dim,
         )
-        self.decoder_initial = nn.Linear(
-            model_config.latent_dim,
-            model_config.decoder_hidden_dim * model_config.n_layers,
-        )
-        self.decoder = nn.GRU(
-            input_size=1,
-            hidden_size=model_config.decoder_hidden_dim,
-            num_layers=model_config.n_layers,
-            batch_first=True,
-            dropout=decoder_dropout,
-        )
-        self.reconstruction_head = nn.Linear(
-            model_config.decoder_hidden_dim, data_config.n_features
+        self.decoder = build_decoder(
+            data_config=data_config,
+            decoder_config=model_config.decoder,
+            latent_dim=model_config.latent_dim,
+            dropout=model_config.dropout,
         )
         # VaDE 聚类先验：c ~ Cat(pi), z | c ~ Normal(mu_c, var_c)。
         self.mixture_logits = nn.Parameter(torch.zeros(model_config.n_clusters))
@@ -198,6 +562,7 @@ class TrailsSurvVaderModel(nn.Module):
         sequence_lengths: Tensor,
     ) -> TrailsModelOutput:
         hidden = self.encoder(
+            times=times,
             x=x,
             mask=mask,
             delta_time=delta_time,
@@ -207,7 +572,7 @@ class TrailsSurvVaderModel(nn.Module):
         latent_mean = self.latent_mean(hidden)
         latent_log_variance = self.latent_log_variance(hidden).clamp(min=-8.0, max=8.0)
         latent = self._sample_latent(latent_mean, latent_log_variance)
-        reconstruction = self._decode(latent, times)
+        reconstruction = self.decoder(latent, times, sequence_lengths)
         cluster_logits = self._cluster_logits(latent)
         cluster_probabilities = torch.softmax(cluster_logits, dim=-1)
         survival_raw = self.survival_head(latent).reshape(-1, self.model_config.n_clusters, 2)
@@ -222,17 +587,6 @@ class TrailsSurvVaderModel(nn.Module):
             weibull_shape=weibull_params[..., 0],
             weibull_scale=weibull_params[..., 1],
         )
-
-    def _decode(self, latent: Tensor, times: Tensor) -> Tensor:
-        batch_size = latent.shape[0]
-        initial = self.decoder_initial(latent).reshape(
-            self.model_config.n_layers,
-            batch_size,
-            self.model_config.decoder_hidden_dim,
-        )
-        decoder_input = times.unsqueeze(-1)
-        decoded, _hidden = self.decoder(decoder_input, initial.contiguous())
-        return self.reconstruction_head(decoded)
 
     def _sample_latent(self, mean: Tensor, log_variance: Tensor) -> Tensor:
         if not self.training:

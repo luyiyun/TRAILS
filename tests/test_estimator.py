@@ -2,7 +2,16 @@ from pathlib import Path
 
 import torch
 
-from trails.config import DataConfig, ModelConfig, TrailsConfig, TrainerConfig
+from trails.config import (
+    DataConfig,
+    DecoderConfig,
+    EncoderConfig,
+    EncoderInputConfig,
+    EncoderMappingConfig,
+    ModelConfig,
+    TrailsConfig,
+    TrainerConfig,
+)
 from trails.data import ClinicalTimeSeriesDataset, make_clinical_sample
 from trails.estimator import TrailsEstimator
 from trails_simulate import generate_clinical_time_series_dataset
@@ -13,9 +22,12 @@ def tiny_config(n_features: int) -> TrailsConfig:
         data=DataConfig(n_features=n_features),
         model=ModelConfig(
             n_clusters=2,
-            encoder_hidden_dim=8,
-            decoder_hidden_dim=8,
             latent_dim=4,
+            encoder=EncoderConfig(
+                input=EncoderInputConfig(hidden_dim=8),
+                mapping=EncoderMappingConfig(hidden_dim=8),
+            ),
+            decoder=DecoderConfig(hidden_dim=8),
         ),
         trainer=TrainerConfig(max_epochs=1, warmup_epochs=1, batch_size=4, gmm_init_iters=2),
         seed=13,

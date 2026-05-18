@@ -13,7 +13,7 @@ import swanlab
 from hydra.core.hydra_config import HydraConfig
 from hydra.utils import get_original_cwd
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from trails.artifacts import (
     create_timestamped_run_dir,
@@ -32,6 +32,10 @@ from trails_simulate import generate_clinical_time_series_dataset
 Command = Literal["experiment", "simulate", "train", "optim"]
 SplitNames = tuple[Literal["train"], Literal["val"], Literal["test"]]
 OPTIM_PARAM_NAMES = (
+    "encoder_input_kind",
+    "encoder_mapping_kind",
+    "decoder_kind",
+    "decoder_conditioning",
     "hidden_dim",
     "latent_dim",
     "n_layers",
@@ -119,6 +123,86 @@ class SwanLabConfig(BaseModel):
     mode: str | None = None
 
 
+class FloatSearchRangeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    low: float
+    high: float
+    log: bool = False
+
+    @model_validator(mode="after")
+    def validate_range(self) -> FloatSearchRangeConfig:
+        if self.high <= self.low:
+            raise ValueError("high must be greater than low.")
+        if self.log and self.low <= 0.0:
+            raise ValueError("log-scaled float search ranges require low > 0.")
+        return self
+
+
+class IntSearchRangeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    low: int
+    high: int
+
+    @model_validator(mode="after")
+    def validate_range(self) -> IntSearchRangeConfig:
+        if self.high < self.low:
+            raise ValueError("high must be greater than or equal to low.")
+        return self
+
+
+class OptimSearchSpaceConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    encoder_input_kind: tuple[Literal["grud", "mtan"], ...] = Field(
+        default=("grud", "mtan"),
+        min_length=1,
+    )
+    encoder_mapping_kind: tuple[Literal["gru", "lstm", "transformer"], ...] = Field(
+        default=("gru", "lstm", "transformer"),
+        min_length=1,
+    )
+    decoder_kind: tuple[Literal["gru", "lstm", "transformer"], ...] = Field(
+        default=("gru", "lstm", "transformer"),
+        min_length=1,
+    )
+    decoder_conditioning: tuple[Literal["initial_state", "concat_time"], ...] = Field(
+        default=("initial_state", "concat_time"),
+        min_length=1,
+    )
+    hidden_dim: tuple[int, ...] = Field(default=(32, 64, 128), min_length=1)
+    latent_dim: tuple[int, ...] = Field(default=(8, 16, 32), min_length=1)
+    n_layers: tuple[int, ...] = Field(default=(1, 2, 3), min_length=1)
+    dropout: FloatSearchRangeConfig = Field(
+        default_factory=lambda: FloatSearchRangeConfig(low=0.0, high=0.3)
+    )
+    survival_head_hidden_layers: tuple[int, ...] = Field(default=(0, 1, 2), min_length=1)
+    batch_size: tuple[int, ...] = Field(default=(128, 256, 512), min_length=1)
+    cluster_weight: FloatSearchRangeConfig = Field(
+        default_factory=lambda: FloatSearchRangeConfig(low=0.005, high=0.5, log=True)
+    )
+    gmm_init_iters: tuple[int, ...] = Field(default=(10, 20, 50), min_length=1)
+    learning_rate: FloatSearchRangeConfig = Field(
+        default_factory=lambda: FloatSearchRangeConfig(low=1e-4, high=3e-2, log=True)
+    )
+    survival_weight: FloatSearchRangeConfig = Field(
+        default_factory=lambda: FloatSearchRangeConfig(low=0.05, high=1.0, log=True)
+    )
+    warmup_epochs: IntSearchRangeConfig = Field(
+        default_factory=lambda: IntSearchRangeConfig(low=0, high=5)
+    )
+
+    @model_validator(mode="after")
+    def validate_decoder_search_space(self) -> OptimSearchSpaceConfig:
+        if "transformer" in self.decoder_kind and "concat_time" not in self.decoder_conditioning:
+            raise ValueError(
+                "optim.search.decoder_conditioning must include 'concat_time' when "
+                "decoder_kind includes 'transformer'."
+            )
+        return self
+
+
 class OptimConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -126,6 +210,7 @@ class OptimConfig(BaseModel):
     study_name: str = Field(default="optim", min_length=1)
     root: Path = Path("outputs/optim/optim")
     storage: str | None = None
+    search: OptimSearchSpaceConfig = Field(default_factory=OptimSearchSpaceConfig)
 
 
 class ApplicationConfig(BaseModel):
@@ -457,27 +542,82 @@ def _run_optim_trial(
 
 
 def _optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationConfig:
-    hidden_dim = int(trial.suggest_categorical("hidden_dim", [32, 64, 128]))
+    search = config.optim.search
+    encoder_input_kind = str(
+        trial.suggest_categorical("encoder_input_kind", list(search.encoder_input_kind))
+    )
+    encoder_mapping_kind = str(
+        trial.suggest_categorical("encoder_mapping_kind", list(search.encoder_mapping_kind))
+    )
+    decoder_kind = str(trial.suggest_categorical("decoder_kind", list(search.decoder_kind)))
+    if decoder_kind == "transformer":
+        decoder_conditioning = "concat_time"
+    else:
+        decoder_conditioning = str(
+            trial.suggest_categorical(
+                "decoder_conditioning",
+                list(search.decoder_conditioning),
+            )
+        )
+    set_trial_user_attr(trial, "decoder_conditioning", decoder_conditioning)
+    hidden_dim = int(trial.suggest_categorical("hidden_dim", list(search.hidden_dim)))
+    n_layers = int(trial.suggest_categorical("n_layers", list(search.n_layers)))
+    encoder_config = config.model.encoder.model_copy(
+        update={
+            "input": config.model.encoder.input.model_copy(
+                update={"kind": encoder_input_kind, "hidden_dim": hidden_dim}
+            ),
+            "mapping": config.model.encoder.mapping.model_copy(
+                update={
+                    "kind": encoder_mapping_kind,
+                    "hidden_dim": hidden_dim,
+                    "n_layers": n_layers,
+                }
+            ),
+        }
+    )
+    decoder_config = config.model.decoder.model_copy(
+        update={
+            "kind": decoder_kind,
+            "conditioning": decoder_conditioning,
+            "hidden_dim": hidden_dim,
+            "n_layers": n_layers,
+        }
+    )
     model_config = config.model.model_copy(
         update={
-            "decoder_hidden_dim": hidden_dim,
-            "dropout": float(trial.suggest_float("dropout", 0.0, 0.3)),
-            "encoder_hidden_dim": hidden_dim,
-            "latent_dim": int(trial.suggest_categorical("latent_dim", [8, 16, 32])),
-            "n_layers": int(trial.suggest_categorical("n_layers", [1, 2, 3])),
+            "dropout": suggest_float_range(trial, "dropout", search.dropout),
+            "encoder": encoder_config,
+            "decoder": decoder_config,
+            "latent_dim": int(trial.suggest_categorical("latent_dim", list(search.latent_dim))),
             "survival_head_hidden_layers": int(
-                trial.suggest_categorical("survival_head_hidden_layers", [0, 1, 2])
+                trial.suggest_categorical(
+                    "survival_head_hidden_layers",
+                    list(search.survival_head_hidden_layers),
+                )
             ),
         }
     )
     trainer_config = config.trainer.model_copy(
         update={
-            "batch_size": int(trial.suggest_categorical("batch_size", [128, 256, 512])),
-            "cluster_weight": float(trial.suggest_float("cluster_weight", 0.005, 0.5, log=True)),
-            "gmm_init_iters": int(trial.suggest_categorical("gmm_init_iters", [10, 20, 50])),
-            "learning_rate": float(trial.suggest_float("learning_rate", 1e-4, 3e-2, log=True)),
-            "survival_weight": float(trial.suggest_float("survival_weight", 0.05, 1.0, log=True)),
-            "warmup_epochs": int(trial.suggest_int("warmup_epochs", 0, 5)),
+            "batch_size": int(trial.suggest_categorical("batch_size", list(search.batch_size))),
+            "cluster_weight": suggest_float_range(trial, "cluster_weight", search.cluster_weight),
+            "gmm_init_iters": int(
+                trial.suggest_categorical("gmm_init_iters", list(search.gmm_init_iters))
+            ),
+            "learning_rate": suggest_float_range(trial, "learning_rate", search.learning_rate),
+            "survival_weight": suggest_float_range(
+                trial,
+                "survival_weight",
+                search.survival_weight,
+            ),
+            "warmup_epochs": int(
+                trial.suggest_int(
+                    "warmup_epochs",
+                    search.warmup_epochs.low,
+                    search.warmup_epochs.high,
+                )
+            ),
         }
     )
 
@@ -498,6 +638,23 @@ def _optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationCon
             "trainer": trainer_config,
         }
     )
+
+
+def suggest_float_range(trial: Any, name: str, search_range: FloatSearchRangeConfig) -> float:
+    return float(
+        trial.suggest_float(
+            name,
+            search_range.low,
+            search_range.high,
+            log=search_range.log,
+        )
+    )
+
+
+def set_trial_user_attr(trial: Any, name: str, value: Any) -> None:
+    set_user_attr = getattr(trial, "set_user_attr", None)
+    if callable(set_user_attr):
+        set_user_attr(name, value)
 
 
 def _optim_data_paths(
@@ -680,6 +837,11 @@ def _serialize_optim_trials(trials: Sequence[Any]) -> list[dict[str, Any]]:
 
 def _serialize_optim_trial(trial: Any) -> dict[str, Any]:
     values = None if trial.values is None else [float(value) for value in trial.values]
+    user_attrs = dict(trial.user_attrs)
+    params = dict(trial.params)
+    for name in OPTIM_PARAM_NAMES:
+        if name not in params and name in user_attrs:
+            params[name] = user_attrs[name]
     return {
         "datetime_complete": None
         if trial.datetime_complete is None
@@ -689,9 +851,9 @@ def _serialize_optim_trial(trial: Any) -> dict[str, Any]:
         else trial.datetime_start.isoformat(timespec="seconds"),
         "duration_seconds": _trial_duration_seconds(trial),
         "number": trial.number,
-        "params": dict(trial.params),
+        "params": params,
         "state": trial.state.name,
-        "user_attrs": dict(trial.user_attrs),
+        "user_attrs": user_attrs,
         "values": values,
     }
 
@@ -723,7 +885,12 @@ def _save_optim_trials_csv(path: Path, trials: Sequence[Any]) -> None:
                 "seed": trial.user_attrs.get("seed", ""),
                 "state": trial.state.name,
             }
-            row.update({name: trial.params.get(name, "") for name in OPTIM_PARAM_NAMES})
+            row.update(
+                {
+                    name: trial.params.get(name, trial.user_attrs.get(name, ""))
+                    for name in OPTIM_PARAM_NAMES
+                }
+            )
             writer.writerow(row)
 
 
@@ -1085,13 +1252,19 @@ def _training_run_config(
         "train_args": {
             "batch_size": trails_config.trainer.batch_size,
             "clusters": trails_config.model.n_clusters,
-            "decoder_hidden_dim": trails_config.model.decoder_hidden_dim,
+            "decoder_conditioning": trails_config.model.decoder.conditioning,
+            "decoder_hidden_dim": trails_config.model.decoder.hidden_dim,
+            "decoder_kind": trails_config.model.decoder.kind,
+            "decoder_n_layers": trails_config.model.decoder.n_layers,
             "dropout": trails_config.model.dropout,
-            "encoder_hidden_dim": trails_config.model.encoder_hidden_dim,
+            "encoder_input_hidden_dim": trails_config.model.encoder.input.hidden_dim,
+            "encoder_input_kind": trails_config.model.encoder.input.kind,
+            "encoder_mapping_hidden_dim": trails_config.model.encoder.mapping.hidden_dim,
+            "encoder_mapping_kind": trails_config.model.encoder.mapping.kind,
+            "encoder_mapping_n_layers": trails_config.model.encoder.mapping.n_layers,
             "epochs": trails_config.trainer.max_epochs,
             "latent_dim": trails_config.model.latent_dim,
             "learning_rate": trails_config.trainer.learning_rate,
-            "n_layers": trails_config.model.n_layers,
             "seed": trails_config.seed,
             "survival_head_hidden_layers": trails_config.model.survival_head_hidden_layers,
             "warmup_epochs": trails_config.trainer.warmup_epochs,
@@ -1410,7 +1583,17 @@ def _format_optim_objectives(values: Any) -> str:
 
 
 def _format_optim_params(params: Mapping[str, Any]) -> str:
-    selected = ["hidden_dim", "latent_dim", "learning_rate", "survival_weight", "cluster_weight"]
+    selected = [
+        "encoder_input_kind",
+        "encoder_mapping_kind",
+        "decoder_kind",
+        "decoder_conditioning",
+        "hidden_dim",
+        "latent_dim",
+        "learning_rate",
+        "survival_weight",
+        "cluster_weight",
+    ]
     chunks = [
         f"{name}={_format_optim_param_value(params[name])}" for name in selected if name in params
     ]

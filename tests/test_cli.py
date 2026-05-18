@@ -22,8 +22,9 @@ TINY_OVERRIDES = [
     "simulator.attention_layers=2",
     "simulator.attention_heads=2",
     "model.n_clusters=2",
-    "model.encoder_hidden_dim=8",
-    "model.decoder_hidden_dim=8",
+    "model.encoder.input.hidden_dim=8",
+    "model.encoder.mapping.hidden_dim=8",
+    "model.decoder.hidden_dim=8",
     "model.latent_dim=4",
     "trainer.max_epochs=1",
     "trainer.warmup_epochs=0",
@@ -59,7 +60,135 @@ def test_scenario_configs_validate() -> None:
             if scenario == "optim":
                 assert app_config.command == "optim"
                 assert app_config.artifacts.names == ("none",)
+                assert app_config.optim.search.encoder_input_kind == ("grud", "mtan")
+                assert app_config.optim.search.encoder_mapping_kind == (
+                    "gru",
+                    "lstm",
+                    "transformer",
+                )
+                assert app_config.optim.search.decoder_kind == ("gru", "lstm", "transformer")
+                assert app_config.optim.search.decoder_conditioning == (
+                    "initial_state",
+                    "concat_time",
+                )
+                assert app_config.optim.search.hidden_dim == (32, 64, 128)
+                assert app_config.optim.search.learning_rate.log
+                assert app_config.optim.search.warmup_epochs.high == 5
                 assert not app_config.swanlab.enabled
+
+
+def test_optim_trial_config_uses_hydra_search_space() -> None:
+    from main import ApplicationConfig, _optim_trial_config
+
+    class FakeTrial:
+        def __init__(self) -> None:
+            self.categorical: dict[str, list[object]] = {}
+            self.floats: dict[str, tuple[float, float, bool]] = {}
+            self.ints: dict[str, tuple[int, int]] = {}
+            self.user_attrs: dict[str, object] = {}
+
+        def suggest_categorical(self, name: str, choices: list[object]) -> object:
+            self.categorical[name] = choices
+            return choices[0]
+
+        def suggest_float(self, name: str, low: float, high: float, *, log: bool) -> float:
+            self.floats[name] = (low, high, log)
+            return low
+
+        def suggest_int(self, name: str, low: int, high: int) -> int:
+            self.ints[name] = (low, high)
+            return low
+
+        def set_user_attr(self, name: str, value: object) -> None:
+            self.user_attrs[name] = value
+
+    config = ApplicationConfig.model_validate(
+        {
+            "optim": {
+                "search": {
+                    "encoder_input_kind": ["mtan"],
+                    "encoder_mapping_kind": ["transformer"],
+                    "decoder_kind": ["lstm"],
+                    "decoder_conditioning": ["concat_time"],
+                    "hidden_dim": [12],
+                    "latent_dim": [6],
+                    "n_layers": [2],
+                    "dropout": {"low": 0.1, "high": 0.2},
+                    "survival_head_hidden_layers": [1],
+                    "batch_size": [7],
+                    "cluster_weight": {"low": 0.01, "high": 0.02, "log": True},
+                    "gmm_init_iters": [3],
+                    "learning_rate": {"low": 0.001, "high": 0.002, "log": True},
+                    "survival_weight": {"low": 0.2, "high": 0.3, "log": True},
+                    "warmup_epochs": {"low": 4, "high": 4},
+                }
+            }
+        }
+    )
+    trial = FakeTrial()
+    trial_config = _optim_trial_config(config, trial)
+
+    assert trial.categorical["hidden_dim"] == [12]
+    assert trial.categorical["encoder_input_kind"] == ["mtan"]
+    assert trial.categorical["encoder_mapping_kind"] == ["transformer"]
+    assert trial.categorical["decoder_kind"] == ["lstm"]
+    assert trial.categorical["decoder_conditioning"] == ["concat_time"]
+    assert trial.categorical["batch_size"] == [7]
+    assert trial.floats["learning_rate"] == (0.001, 0.002, True)
+    assert trial.ints["warmup_epochs"] == (4, 4)
+    assert trial.user_attrs["decoder_conditioning"] == "concat_time"
+    assert trial_config.model.encoder.input.kind == "mtan"
+    assert trial_config.model.encoder.input.hidden_dim == 12
+    assert trial_config.model.encoder.mapping.kind == "transformer"
+    assert trial_config.model.encoder.mapping.n_layers == 2
+    assert trial_config.model.decoder.kind == "lstm"
+    assert trial_config.model.decoder.conditioning == "concat_time"
+    assert trial_config.model.latent_dim == 6
+    assert trial_config.trainer.batch_size == 7
+
+
+def test_optim_trial_config_forces_transformer_decoder_concat_time() -> None:
+    from main import ApplicationConfig, _optim_trial_config
+
+    class FakeTrial:
+        def __init__(self) -> None:
+            self.categorical: dict[str, list[object]] = {}
+            self.floats: dict[str, tuple[float, float, bool]] = {}
+            self.ints: dict[str, tuple[int, int]] = {}
+            self.user_attrs: dict[str, object] = {}
+
+        def suggest_categorical(self, name: str, choices: list[object]) -> object:
+            self.categorical[name] = choices
+            return choices[0]
+
+        def suggest_float(self, name: str, low: float, high: float, *, log: bool) -> float:
+            self.floats[name] = (low, high, log)
+            return low
+
+        def suggest_int(self, name: str, low: int, high: int) -> int:
+            self.ints[name] = (low, high)
+            return low
+
+        def set_user_attr(self, name: str, value: object) -> None:
+            self.user_attrs[name] = value
+
+    config = ApplicationConfig.model_validate(
+        {
+            "optim": {
+                "search": {
+                    "decoder_kind": ["transformer"],
+                    "decoder_conditioning": ["initial_state", "concat_time"],
+                }
+            }
+        }
+    )
+    trial = FakeTrial()
+    trial_config = _optim_trial_config(config, trial)
+
+    assert "decoder_conditioning" not in trial.categorical
+    assert trial_config.model.decoder.kind == "transformer"
+    assert trial_config.model.decoder.conditioning == "concat_time"
+    assert trial.user_attrs["decoder_conditioning"] == "concat_time"
 
 
 def test_simulate_command_generates_train_val_test_splits(tmp_path: Path) -> None:

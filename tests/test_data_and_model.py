@@ -1,10 +1,25 @@
+from typing import Literal
+
 import pytest
 import torch
+from pydantic import ValidationError
 
-from trails.config import DataConfig, ModelConfig
+from trails.config import (
+    DataConfig,
+    DecoderConfig,
+    EncoderConfig,
+    EncoderInputConfig,
+    EncoderMappingConfig,
+    ModelConfig,
+)
 from trails.data import ClinicalTimeSeriesDataset, clinical_collate_fn, make_clinical_sample
 from trails.model import SequencePool, TrailsSurvVaderModel
 from trails_simulate import generate_clinical_time_series_dataset
+
+EncoderInputKind = Literal["grud", "mtan"]
+EncoderMappingKind = Literal["gru", "lstm", "transformer"]
+DecoderKind = Literal["gru", "lstm", "transformer"]
+DecoderConditioning = Literal["initial_state", "concat_time"]
 
 
 def test_clinical_dataset_and_collate_shapes() -> None:
@@ -151,8 +166,33 @@ def test_sequence_pool_masks_padding_visits() -> None:
     assert torch.allclose(pooled[1], hidden_sequence[1, :3].mean(dim=0))
 
 
-@pytest.mark.parametrize("survival_head_hidden_layers", [0, 2])
-def test_grud_model_forward_shapes(survival_head_hidden_layers: int) -> None:
+def make_architecture_config(
+    *,
+    encoder_input_kind: EncoderInputKind = "grud",
+    encoder_mapping_kind: EncoderMappingKind = "gru",
+    decoder_kind: DecoderKind = "gru",
+    decoder_conditioning: DecoderConditioning = "initial_state",
+    survival_head_hidden_layers: int = 0,
+) -> ModelConfig:
+    return ModelConfig(
+        n_clusters=2,
+        latent_dim=4,
+        survival_head_hidden_layers=survival_head_hidden_layers,
+        encoder=EncoderConfig(
+            input=EncoderInputConfig(kind=encoder_input_kind, hidden_dim=8, n_heads=2),
+            mapping=EncoderMappingConfig(kind=encoder_mapping_kind, hidden_dim=8, n_layers=1),
+        ),
+        decoder=DecoderConfig(
+            kind=decoder_kind,
+            conditioning=decoder_conditioning,
+            hidden_dim=8,
+            n_layers=1,
+            n_heads=2,
+        ),
+    )
+
+
+def assert_model_forward_shapes(model_config: ModelConfig) -> None:
     dataset = generate_clinical_time_series_dataset(
         n_patients=4,
         n_clusters=2,
@@ -166,13 +206,7 @@ def test_grud_model_forward_shapes(survival_head_hidden_layers: int) -> None:
     batch = clinical_collate_fn([dataset[0], dataset[1], dataset[2], dataset[3]])
     model = TrailsSurvVaderModel(
         DataConfig(n_features=dataset.n_features),
-        ModelConfig(
-            n_clusters=2,
-            latent_dim=4,
-            encoder_hidden_dim=8,
-            decoder_hidden_dim=8,
-            survival_head_hidden_layers=survival_head_hidden_layers,
-        ),
+        model_config,
     )
     model.set_feature_means(dataset.feature_means)
     output = model(
@@ -195,3 +229,63 @@ def test_grud_model_forward_shapes(survival_head_hidden_layers: int) -> None:
     assert torch.all(output.weibull_scale > 0)
     assert model.mixture_means.shape == (2, 4)
     assert model.mixture_log_variances.shape == (2, 4)
+
+
+@pytest.mark.parametrize("survival_head_hidden_layers", [0, 2])
+def test_grud_model_forward_shapes(survival_head_hidden_layers: int) -> None:
+    assert_model_forward_shapes(
+        make_architecture_config(survival_head_hidden_layers=survival_head_hidden_layers)
+    )
+
+
+@pytest.mark.parametrize(
+    ("decoder_kind", "decoder_conditioning"),
+    [
+        ("gru", "initial_state"),
+        ("lstm", "initial_state"),
+        ("gru", "concat_time"),
+        ("lstm", "concat_time"),
+        ("transformer", "concat_time"),
+    ],
+)
+def test_model_forward_shapes_for_decoder_architectures(
+    decoder_kind: DecoderKind,
+    decoder_conditioning: DecoderConditioning,
+) -> None:
+    assert_model_forward_shapes(
+        make_architecture_config(
+            decoder_kind=decoder_kind,
+            decoder_conditioning=decoder_conditioning,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("encoder_input_kind", "encoder_mapping_kind"),
+    [
+        ("grud", "gru"),
+        ("mtan", "gru"),
+        ("grud", "lstm"),
+        ("mtan", "transformer"),
+    ],
+)
+def test_model_forward_shapes_for_encoder_architectures(
+    encoder_input_kind: EncoderInputKind,
+    encoder_mapping_kind: EncoderMappingKind,
+) -> None:
+    assert_model_forward_shapes(
+        make_architecture_config(
+            encoder_input_kind=encoder_input_kind,
+            encoder_mapping_kind=encoder_mapping_kind,
+        )
+    )
+
+
+def test_transformer_decoder_rejects_initial_state_conditioning() -> None:
+    with pytest.raises(ValidationError, match="Transformer decoder only supports"):
+        DecoderConfig(kind="transformer", conditioning="initial_state")
+
+
+def test_model_config_rejects_stale_flat_architecture_fields() -> None:
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ModelConfig.model_validate({"encoder_hidden_dim": 8})

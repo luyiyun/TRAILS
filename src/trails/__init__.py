@@ -1,4 +1,13 @@
-from .config import DataConfig, ModelConfig, TrailsConfig, TrainerConfig
+from .config import (
+    DataConfig,
+    DecoderConfig,
+    EncoderConfig,
+    EncoderInputConfig,
+    EncoderMappingConfig,
+    ModelConfig,
+    TrailsConfig,
+    TrainerConfig,
+)
 from .data import (
     ClinicalSample,
     ClinicalTimeSeriesDataset,
@@ -10,8 +19,12 @@ __all__ = [
     "ClinicalSample",
     "ClinicalTimeSeriesDataset",
     "DataConfig",
-    "TrailsConfig",
+    "DecoderConfig",
+    "EncoderConfig",
+    "EncoderInputConfig",
+    "EncoderMappingConfig",
     "ModelConfig",
+    "TrailsConfig",
     "TrainerConfig",
     "TrailsEstimator",
     "clinical_collate_fn",

@@ -24,7 +24,37 @@ swanlab:
   mode: null
 
 optim:
-  n_trials: 30
+  n_trials: 300
   study_name: ${experiment.name}
   root: outputs/optim/${experiment.name}
   storage: null
+  search:
+    encoder_input_kind: [grud, mtan]
+    encoder_mapping_kind: [gru, lstm, transformer]
+    decoder_kind: [gru, lstm, transformer]
+    decoder_conditioning: [initial_state, concat_time]
+    hidden_dim: [32, 64, 128]
+    latent_dim: [8, 16, 32]
+    n_layers: [1, 2, 3]
+    dropout:
+      low: 0.0
+      high: 0.3
+      log: false
+    survival_head_hidden_layers: [0, 1, 2]
+    batch_size: [128, 256, 512]
+    cluster_weight:
+      low: 0.005
+      high: 0.5
+      log: true
+    gmm_init_iters: [10, 20, 50]
+    learning_rate:
+      low: 1.0e-4
+      high: 3.0e-2
+      log: true
+    survival_weight:
+      low: 0.05
+      high: 1.0
+      log: true
+    warmup_epochs:
+      low: 0
+      high: 5

@@ -6,10 +6,10 @@ TRAILS studies deep survival trajectory clustering for asynchronous multivariate
 medical longitudinal data. The method targets patient subtypes that differ in
 both clinical trajectories and time-to-event risk.
 
-The current scope is phase one: a GRU-D Surv-VaDER/VaDE prototype for
+The current scope is phase one: a modular Surv-VaDER/VaDE prototype for
 variable-length clinical visit sequences with `x`, `mask`, and `delta_time`.
-mTAN, mixed-type likelihoods, competing risks, and recurrent events are later
-roadmap items.
+Mixed-type likelihoods, competing risks, and recurrent events are later roadmap
+items.
 
 ## Layout
 
@@ -86,8 +86,13 @@ clean reusable method library.
   `survival_time`, `event`, and optional `cluster_label`.
 - Dataset metadata preserves latent profiles, cluster parameters, survival
   coefficients, and generation parameters for simulation-study evaluation.
-- The phase-one model uses GRU-D with SeqPool as encoder and a GRU decoder
-  driven by visit times with latent-initialized hidden state.
+- The phase-one model uses a modular encoder: an asynchronous input layer
+  (`grud` or lightweight `mtan`) followed by a nonlinear mapping layer (`gru`,
+  `lstm`, or `transformer`) and SeqPool.
+- The reconstruction decoder is configurable as `gru`, `lstm`, or
+  `transformer`; recurrent decoders support latent-initialized hidden state or
+  repeated latent plus visit-time input, while transformer decoding only uses
+  repeated latent plus visit-time input.
 - Clustering uses a VaDE-style learnable Gaussian mixture latent prior,
   initialized by deterministic k-means after warmup.
 - The survival head remains a cluster-specific Weibull mixture whose mixture
