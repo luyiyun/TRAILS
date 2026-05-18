@@ -27,6 +27,7 @@ dev = [
     "pyright>=1.1.409",
     "pytest>=9.0.3",
     "ruff>=0.15.13",
+    "umap-learn>=0.5.12",
 ]
 
 [tool.ruff]

@@ -4,11 +4,15 @@ import csv
 import json
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
 import matplotlib
+import torch
+from torch import Tensor
 
+from .diagnostics import LatentDiagnostics
 from .trainer import HistoryEntry
 
 matplotlib.use("Agg")
@@ -110,6 +114,75 @@ def plot_history(path: str | Path, history: Sequence[HistoryEntry]) -> None:
     plt.close(fig)
 
 
+def save_latent_embedding_artifacts(
+    root_dir: str | Path,
+    split_name: str,
+    diagnostics: LatentDiagnostics,
+    *,
+    random_state: int,
+) -> dict[str, str]:
+    destination = Path(root_dir) / "latent_embeddings"
+    destination.mkdir(parents=True, exist_ok=True)
+
+    payload: dict[str, Any] = {"split": split_name}
+    payload.update(diagnostics)
+    data_path = destination / f"{split_name}_embeddings.pt"
+    torch.save(payload, data_path)
+
+    plot_path = destination / f"{split_name}_pca_umap.png"
+    plot_latent_embedding_projection(
+        plot_path,
+        z=diagnostics["z"],
+        pred_cluster=diagnostics["pred_cluster"],
+        true_cluster=diagnostics.get("true_cluster"),
+        split_name=split_name,
+        random_state=random_state,
+    )
+    return {"data": str(data_path), "plot": str(plot_path)}
+
+
+def plot_latent_embedding_projection(
+    path: str | Path,
+    *,
+    z: Tensor,
+    pred_cluster: Tensor,
+    true_cluster: Tensor | None,
+    split_name: str,
+    random_state: int,
+) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    pca = _pca_projection(z)
+    umap_projection = _umap_projection(z, random_state=random_state)
+
+    fig, axes = plt.subplots(2, 2, figsize=(11.0, 9.0), constrained_layout=True)
+    panels = [
+        (axes[0, 0], pca, true_cluster, "PCA by true label", "No true labels"),
+        (axes[0, 1], pca, pred_cluster, "PCA by predicted cluster", "No predictions"),
+        (axes[1, 0], umap_projection, true_cluster, "UMAP by true label", "No true labels"),
+        (
+            axes[1, 1],
+            umap_projection,
+            pred_cluster,
+            "UMAP by predicted cluster",
+            "No predictions",
+        ),
+    ]
+    for ax, coordinates, labels, title, unavailable_text in panels:
+        _plot_labeled_scatter(
+            ax,
+            coordinates,
+            labels,
+            title=title,
+            unavailable_text=unavailable_text,
+        )
+
+    fig.suptitle(f"TRAILS latent embeddings: {split_name}", fontsize=13, fontweight="bold")
+    fig.savefig(destination, dpi=180)
+    plt.close(fig)
+
+
 def _history_fieldnames(history: Sequence[HistoryEntry]) -> list[str]:
     preferred = [
         "global_epoch",
@@ -200,3 +273,74 @@ def _mark_stage_boundary(
                 color="0.35",
             )
             return
+
+
+def _pca_projection(z: Tensor) -> Tensor:
+    embeddings = z.detach().cpu().float()
+    n_samples = int(embeddings.shape[0])
+    if n_samples <= 1:
+        return embeddings.new_zeros((n_samples, 2))
+
+    centered = embeddings - embeddings.mean(dim=0, keepdim=True)
+    _u, _s, vh = torch.linalg.svd(centered, full_matrices=False)
+    n_components = min(2, int(vh.shape[0]))
+    projection = centered @ vh[:n_components].T
+    if n_components == 2:
+        return projection
+    return torch.cat([projection, projection.new_zeros((n_samples, 2 - n_components))], dim=1)
+
+
+def _umap_projection(z: Tensor, *, random_state: int) -> Tensor:
+    embeddings = z.detach().cpu().float()
+    n_samples = int(embeddings.shape[0])
+    if n_samples <= 3:
+        return _pca_projection(embeddings)
+
+    try:
+        umap_module: Any = import_module("umap")
+    except ImportError as error:
+        raise RuntimeError(
+            "diagnostics.latent_embeddings.enabled requires umap-learn. "
+            "Add umap-learn to pyproject.toml and run uv sync before using debug diagnostics."
+        ) from error
+
+    n_neighbors = min(15, max(2, n_samples - 1))
+    reducer = umap_module.UMAP(
+        n_components=2,
+        n_neighbors=n_neighbors,
+        random_state=random_state,
+    )
+    return torch.as_tensor(reducer.fit_transform(embeddings.numpy()), dtype=torch.float32)
+
+
+def _plot_labeled_scatter(
+    ax: Any,
+    coordinates: Tensor,
+    labels: Tensor | None,
+    *,
+    title: str,
+    unavailable_text: str,
+) -> None:
+    ax.set_title(title, loc="left", fontsize=11, fontweight="bold")
+    ax.grid(True, alpha=0.22)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.set_xlabel("Component 1")
+    ax.set_ylabel("Component 2")
+
+    if labels is None:
+        ax.text(0.5, 0.5, unavailable_text, ha="center", va="center", transform=ax.transAxes)
+        return
+
+    label_values = labels.detach().cpu().long()
+    points = coordinates.detach().cpu().float()
+    for label in torch.unique(label_values, sorted=True):
+        mask = label_values == label
+        ax.scatter(
+            points[mask, 0].tolist(),
+            points[mask, 1].tolist(),
+            s=18,
+            alpha=0.78,
+            label=str(int(label.item())),
+        )
+    ax.legend(title="label", frameon=False, markerscale=1.2)

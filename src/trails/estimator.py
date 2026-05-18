@@ -9,6 +9,7 @@ from torch import Tensor
 
 from .config import TrailsConfig
 from .data import ClinicalTimeSeriesDataset, infer_data_config
+from .diagnostics import LatentDiagnostics
 from .model import TrailsSurvVaderModel
 from .trainer import HistoryEntry, TrailsTrainer
 
@@ -52,6 +53,20 @@ class TrailsEstimator:
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
         self._validate_data_config(data)
         return self.trainer.test(data)
+
+    def latent_diagnostics(self, data: ClinicalTimeSeriesDataset) -> LatentDiagnostics:
+        self._validate_data_config(data)
+        outputs, batch = self.trainer._collect_outputs(data)
+        cluster_probabilities = outputs.cluster_probabilities.detach().cpu()
+        diagnostics: LatentDiagnostics = {
+            "z": outputs.latent_mean.detach().cpu(),
+            "cluster_probabilities": cluster_probabilities,
+            "pred_cluster": torch.argmax(cluster_probabilities, dim=-1).long(),
+            "sample_index": torch.arange(len(data), dtype=torch.long),
+        }
+        if "cluster_label" in batch:
+            diagnostics["true_cluster"] = batch["cluster_label"].detach().cpu().long()
+        return diagnostics
 
     def save(self, path: str | Path) -> None:
         checkpoint = {

@@ -1,8 +1,10 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
+import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
@@ -39,7 +41,7 @@ def test_main_help() -> None:
         text=True,
     )
     assert "powered by Hydra" in result.stdout
-    assert "scenario: formal_5x, normal_swanlab, quick" in result.stdout
+    assert "scenario: debug, formal_5x, quick" in result.stdout
 
 
 def test_scenario_configs_validate() -> None:
@@ -47,12 +49,13 @@ def test_scenario_configs_validate() -> None:
 
     config_dir = str((ROOT / "configs").resolve())
     with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
-        for scenario in ("quick", "normal_swanlab", "formal_5x"):
+        for scenario in ("quick", "debug", "formal_5x"):
             cfg = compose(config_name="config", overrides=[f"scenario={scenario}"])
             payload = OmegaConf.to_container(cfg, resolve=True)
             app_config = ApplicationConfig.model_validate(payload)
             assert app_config.experiment.name
             assert app_config.simulator.split_patients is not None
+            assert app_config.diagnostics.latent_embeddings.enabled == (scenario == "debug")
 
 
 def test_simulate_command_generates_train_val_test_splits(tmp_path: Path) -> None:
@@ -112,6 +115,44 @@ def test_train_command_uses_generated_splits(tmp_path: Path) -> None:
     assert config["paths"]["val_data"] == str(data_root / "val.pt")
     assert config["paths"]["test_data"] == str(data_root / "test.pt")
     assert config["paths"]["test_data_used"] == str(data_root / "test.pt")
+
+
+def test_train_command_saves_latent_embedding_diagnostics(tmp_path: Path) -> None:
+    data_root = tmp_path / "splits"
+    run_dir = tmp_path / "train-diagnostics-run"
+    fake_umap_root = write_fake_umap_module(tmp_path / "fake-umap")
+    run_main(
+        "command=simulate",
+        f"paths.data_root={data_root}",
+        f"hydra.run.dir={tmp_path / 'simulate-diagnostics-run'}",
+        *TINY_OVERRIDES,
+    )
+
+    stdout = run_main(
+        "command=train",
+        f"paths.data_root={data_root}",
+        f"hydra.run.dir={run_dir}",
+        "artifacts.names=[none]",
+        "diagnostics.latent_embeddings.enabled=true",
+        *TINY_OVERRIDES,
+        env=pythonpath_env(fake_umap_root),
+    )
+    artifact_run = next((run_dir / "train").iterdir())
+    embedding_dir = artifact_run / "latent_embeddings"
+
+    assert "TRAILS train complete" in stdout
+    assert f"Artifacts: {artifact_run}" in stdout
+    for split, n_samples in {"train": 8, "val": 6, "test": 4}.items():
+        data_path = embedding_dir / f"{split}_embeddings.pt"
+        plot_path = embedding_dir / f"{split}_pca_umap.png"
+
+        assert data_path.exists()
+        assert plot_path.stat().st_size > 0
+        payload = torch.load(data_path, map_location="cpu", weights_only=False)
+        assert payload["split"] == split
+        assert payload["z"].shape == (n_samples, 4)
+        assert payload["pred_cluster"].shape == (n_samples,)
+        assert payload["true_cluster"].shape == (n_samples,)
 
 
 def test_train_artifacts_none_skips_train_artifact_dir(tmp_path: Path) -> None:
@@ -180,11 +221,48 @@ def test_experiment_repeats_generate_data_train_and_metric_summaries(tmp_path: P
     assert "loss" in payload["metrics_summary"]
 
 
-def run_main(*overrides: str) -> str:
+def write_fake_umap_module(root: Path) -> Path:
+    package = root / "umap"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        "\n".join(
+            [
+                "import numpy as np",
+                "",
+                "class UMAP:",
+                "    def __init__(self, n_components=2, n_neighbors=15, random_state=None):",
+                "        self.n_components = n_components",
+                "",
+                "    def fit_transform(self, x):",
+                "        array = np.asarray(x, dtype=float)",
+                "        if array.shape[1] >= 2:",
+                "            return array[:, :2]",
+                "        if array.shape[1] == 1:",
+                "            return np.column_stack([array[:, 0], np.zeros(array.shape[0])])",
+                "        return np.zeros((array.shape[0], 2))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return root
+
+
+def pythonpath_env(path: Path) -> dict[str, str]:
+    existing = os.environ.get("PYTHONPATH")
+    paths = [str(path)]
+    if existing:
+        paths.append(existing)
+    return {"PYTHONPATH": os.pathsep.join(paths)}
+
+
+def run_main(*overrides: str, env: dict[str, str] | None = None) -> str:
+    subprocess_env = None if env is None else {**os.environ, **env}
     result = subprocess.run(
         [sys.executable, "main.py", *overrides],
         check=True,
         capture_output=True,
         text=True,
+        env=subprocess_env,
     )
     return result.stdout

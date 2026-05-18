@@ -59,6 +59,10 @@ artifacts:
   names: [all]
   save: null
 
+diagnostics:
+  latent_embeddings:
+    enabled: false
+
 swanlab:
   enabled: false
   project: TRAILS

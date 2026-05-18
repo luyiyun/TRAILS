@@ -21,6 +21,7 @@ from trails.artifacts import (
     resolve_artifact_names,
     save_history_csv,
     save_json,
+    save_latent_embedding_artifacts,
 )
 from trails.config import DataConfig, ModelConfig, TrailsConfig, TrainerConfig
 from trails.data import ClinicalTimeSeriesDataset
@@ -82,6 +83,20 @@ class ArtifactsConfig(BaseModel):
     save: Path | None = None
 
 
+class LatentEmbeddingDiagnosticsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+
+
+class DiagnosticsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    latent_embeddings: LatentEmbeddingDiagnosticsConfig = Field(
+        default_factory=LatentEmbeddingDiagnosticsConfig
+    )
+
+
 class SwanLabConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -101,6 +116,7 @@ class ApplicationConfig(BaseModel):
     model: ModelConfig = Field(default_factory=ModelConfig)
     trainer: TrainerConfig = Field(default_factory=TrainerConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
+    diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
     swanlab: SwanLabConfig = Field(default_factory=SwanLabConfig)
 
 
@@ -440,6 +456,7 @@ def _fit_training_run(
         trails_config,
         train_paths,
         artifacts,
+        config.diagnostics,
         repeat_label=swanlab_repeat_label,
     )
     try:
@@ -460,6 +477,9 @@ def _fit_training_run(
         train_paths=train_paths,
         trails_config=trails_config,
         estimator=estimator,
+        train_dataset=dataset,
+        validation_dataset=validation_dataset,
+        test_dataset=test_dataset,
         metrics=metrics,
         artifacts=artifacts,
     )
@@ -476,16 +496,20 @@ def _save_training_artifacts(
     train_paths: TrainPaths,
     trails_config: TrailsConfig,
     estimator: TrailsEstimator,
+    train_dataset: ClinicalTimeSeriesDataset,
+    validation_dataset: ClinicalTimeSeriesDataset | None,
+    test_dataset: ClinicalTimeSeriesDataset,
     metrics: dict[str, float],
     artifacts: frozenset[str],
 ) -> Path | None:
-    if not artifacts:
+    should_save_diagnostics = config.diagnostics.latent_embeddings.enabled
+    if not artifacts and not should_save_diagnostics:
         return None
 
     created_at = datetime.now().astimezone()
     run_dir = create_timestamped_run_dir(train_paths.train_root, created_at)
 
-    # artifacts.names 决定训练产物边界；不在这里隐式保存额外文件。
+    # artifacts.names 与 diagnostics 开关共同决定训练后落盘产物边界。
     if "config" in artifacts:
         save_json(
             run_dir / "config.json",
@@ -507,8 +531,41 @@ def _save_training_artifacts(
         estimator.save(run_dir / "model.pt")
     if "plot" in artifacts:
         plot_history(run_dir / "history.png", estimator.history)
+    if should_save_diagnostics:
+        _save_latent_embedding_diagnostics(
+            run_dir=run_dir,
+            estimator=estimator,
+            train_dataset=train_dataset,
+            validation_dataset=validation_dataset,
+            test_dataset=test_dataset,
+            seed=trails_config.seed,
+        )
 
     return run_dir
+
+
+def _save_latent_embedding_diagnostics(
+    *,
+    run_dir: Path,
+    estimator: TrailsEstimator,
+    train_dataset: ClinicalTimeSeriesDataset,
+    validation_dataset: ClinicalTimeSeriesDataset | None,
+    test_dataset: ClinicalTimeSeriesDataset,
+    seed: int,
+) -> None:
+    split_datasets: list[tuple[str, ClinicalTimeSeriesDataset]] = [("train", train_dataset)]
+    if validation_dataset is not None:
+        split_datasets.append(("val", validation_dataset))
+    split_datasets.append(("test", test_dataset))
+
+    for split_name, split_dataset in split_datasets:
+        diagnostics = estimator.latent_diagnostics(split_dataset)
+        save_latent_embedding_artifacts(
+            run_dir,
+            split_name,
+            diagnostics,
+            random_state=seed,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +577,7 @@ def _start_swanlab_run(
     trails_config: TrailsConfig,
     train_paths: TrainPaths,
     artifacts: frozenset[str],
+    diagnostics_config: DiagnosticsConfig,
     *,
     repeat_label: str | None,
 ) -> None:
@@ -538,7 +596,13 @@ def _start_swanlab_run(
     init_kwargs: dict[str, Any] = {
         "project": swanlab_config.project,
         "experiment_name": experiment_name,
-        "config": _swanlab_config(swanlab_config, trails_config, train_paths, artifacts),
+        "config": _swanlab_config(
+            swanlab_config,
+            trails_config,
+            train_paths,
+            artifacts,
+            diagnostics_config,
+        ),
     }
     if swanlab_config.mode is not None:
         init_kwargs["mode"] = swanlab_config.mode
@@ -567,9 +631,11 @@ def _swanlab_config(
     trails_config: TrailsConfig,
     train_paths: TrainPaths,
     artifacts: frozenset[str],
+    diagnostics_config: DiagnosticsConfig,
 ) -> dict[str, Any]:
     return {
         "config": trails_config.model_dump(mode="json"),
+        "diagnostics": diagnostics_config.model_dump(mode="json"),
         "paths": _train_paths_payload(train_paths),
         "save_artifacts": sorted(artifacts),
         "swanlab": swanlab_config.model_dump(mode="json"),
@@ -593,6 +659,7 @@ def _training_run_config(
             **_train_paths_payload(train_paths),
             "run_dir": str(run_dir),
         },
+        "diagnostics": app_config.diagnostics.model_dump(mode="json"),
         "swanlab": app_config.swanlab.model_dump(mode="json"),
         "train_args": {
             "batch_size": trails_config.trainer.batch_size,
