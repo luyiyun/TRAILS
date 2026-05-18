@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import Tensor
+from torchmetrics import Metric
 from torchmetrics.clustering import AdjustedRandScore, NormalizedMutualInfoScore
 
 
@@ -45,30 +46,6 @@ def gaussian_log_prob(value: Tensor, mean: Tensor, log_variance: Tensor) -> Tens
     return -0.5 * (log_two_pi + clamped_log_variance + (value - mean).pow(2) / variance)
 
 
-class ClusterMetricAccumulator:
-    def __init__(self) -> None:
-        self.adjusted_rand = AdjustedRandScore()
-        self.normalized_mutual_info = NormalizedMutualInfoScore()
-
-    def reset(self) -> None:
-        self.adjusted_rand.reset()
-        self.normalized_mutual_info.reset()
-
-    def update(self, predictions: Tensor, target: Tensor) -> None:
-        self.adjusted_rand.update(predictions, target)
-        self.normalized_mutual_info.update(predictions, target)
-
-    def compute(self) -> dict[str, float]:
-        return {
-            "ari": float(self.adjusted_rand.compute().detach().cpu()),
-            "nmi": float(self.normalized_mutual_info.compute().detach().cpu()),
-        }
-
-    def to(self, device: str | torch.device) -> None:
-        self.adjusted_rand.to(device)
-        self.normalized_mutual_info.to(device)
-
-
 def weibull_mixture_negative_log_likelihood(
     cluster_logits: Tensor,
     weibull_shape: Tensor,
@@ -106,3 +83,33 @@ def concordance_index(risk_score: Tensor, survival_time: Tensor, event: Tensor) 
     if comparable == 0:
         return 0.0
     return concordant / comparable
+
+
+class Cindex(Metric):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.tied_tol = 1e-8
+
+        self.add_state("risk", default=[], dist_reduce_fx="cat")
+        self.add_state("time", default=[], dist_reduce_fx="cat")
+        self.add_state("event", default=[], dist_reduce_fx="cat")
+
+        self.risk: list
+        self.time: list
+        self.event: list
+
+    def update(self, risk: Tensor, time: Tensor, event: Tensor) -> None:
+        self.risk.append(risk)
+        self.time.append(time)
+        self.event.append(event)
+
+    def compute(self) -> Tensor:
+        risk = torch.cat(self.risk, dim=0).squeeze()
+        time = torch.cat(self.time, dim=0)
+        event = torch.cat(self.event, dim=0)
+
+        comparable = (time < time[:, None]) & (event > 0)
+        concordant = (risk > risk[:, None] + self.tied_tol) & comparable
+        tied = ((risk - risk[:None]).abs() <= self.tied_tol) & comparable
+
+        return (concordant.sum() + 0.5 * tied.sum()) / comparable.sum().clamp_min(1.0)

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import hydra
+import swanlab
 from hydra.core.hydra_config import HydraConfig
 from hydra.utils import get_original_cwd
 from omegaconf import DictConfig, OmegaConf
@@ -452,7 +453,7 @@ def _fit_training_run(
             _log_swanlab_test_metrics(metrics, estimator.history)
     finally:
         if config.swanlab.enabled:
-            _finish_swanlab_run()
+            swanlab.finish()
 
     run_dir = _save_training_artifacts(
         config=config,
@@ -544,38 +545,19 @@ def _start_swanlab_run(
     swanlab.init(**init_kwargs)
 
 
-def _finish_swanlab_run() -> None:
-    import swanlab
-
-    swanlab.finish()
-
-
 def _log_swanlab_history(entry: HistoryEntry) -> None:
-    import swanlab
-
-    metrics: dict[str, float] = {}
-    for name, value in entry.items():
-        if not isinstance(value, int | float):
-            continue
-        if name == "global_epoch":
-            metrics["epoch/global"] = float(value)
-        elif name == "epoch":
-            metrics["epoch/local"] = float(value)
-        elif name.startswith("val_"):
-            metrics[f"val/{name.removeprefix('val_')}"] = float(value)
-        else:
-            metrics[f"train/{name}"] = float(value)
-
-    stage = str(entry["stage"])
-    metrics["stage/warmup"] = 1.0 if stage == "warmup" else 0.0
-    metrics["stage/vade"] = 1.0 if stage == "vade" else 0.0
-    step = int(float(entry["global_epoch"]))
+    metrics = {
+        "epoch/global": entry["global_epoch"],
+        "epoch/local": entry["epoch"],
+        **{f"train/{k}": v for k, v in entry["train"].items()},
+    }
+    if "valid" in entry:
+        metrics.update({f"val/{k}": v for k, v in entry["valid"].items()})
+    step = entry["global_epoch"]
     swanlab.log(metrics, step=step)
 
 
 def _log_swanlab_test_metrics(metrics: dict[str, float], history: list[HistoryEntry]) -> None:
-    import swanlab
-
     step = int(float(history[-1]["global_epoch"])) if history else 0
     swanlab.log({f"test/{name}": value for name, value in metrics.items()}, step=step)
 

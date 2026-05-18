@@ -2,23 +2,33 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal, NotRequired, TypedDict
 
 import torch
 from torch import Tensor
+from torchmetrics import Metric
+from torchmetrics.clustering import AdjustedRandScore, NormalizedMutualInfoScore
 from tqdm import tqdm
 
 from .config import TrainerConfig
 from .data import Batch, ClinicalTimeSeriesDataset, make_data_loader
 from .metrics import (
-    ClusterMetricAccumulator,
-    concordance_index,
+    Cindex,
     masked_mse,
     vade_kl_loss,
     weibull_mixture_negative_log_likelihood,
 )
 from .model import TrailsModelOutput, TrailsSurvVaderModel
 
-HistoryEntry = dict[str, float | str]
+
+class HistoryEntry(TypedDict):
+    epoch: int
+    global_epoch: int
+    stage: str
+    train: dict[str, float]
+    valid: NotRequired[dict[str, float]]
+
+
 HistoryCallback = Callable[[HistoryEntry], None]
 
 
@@ -61,9 +71,7 @@ class TrailsTrainer:
         self.config = config
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
 
-        self.metrics = ClusterMetricAccumulator()
         self.losses = LossAccumulator()
-        self.metrics.to(config.device)
 
     def fit(
         self,
@@ -81,21 +89,22 @@ class TrailsTrainer:
 
         if self.config.warmup_epochs > 0:
             for epoch in tqdm(range(self.config.warmup_epochs), desc="Warmup"):
-                metrics = self._train_epoch(loader, include_vade_kl=False)
+                losses, scores = self._epoch_loop(loader, phase="train", include_vade_kl=False)
                 entry: HistoryEntry = {
-                    **metrics,
-                    "epoch": float(epoch + 1),
-                    "global_epoch": float(len(history) + 1),
+                    "epoch": epoch + 1,
+                    "global_epoch": len(history) + 1,
                     "stage": "warmup",
+                    "train": {
+                        **losses,
+                        **scores,
+                    },
                 }
 
                 if valid_loader is not None:
-                    validation_metrics = self._evaluate(
-                        valid_loader, include_vade_kl=False, cal_cluster_metrics=False
+                    losses, scores = self._epoch_loop(
+                        valid_loader, phase="valid", include_vade_kl=False
                     )
-                    entry.update(
-                        {f"val_{name}": value for name, value in validation_metrics.items()}
-                    )
+                    entry["valid"] = {**losses, **scores}
 
                 history.append(entry)
                 if history_callback is not None:
@@ -103,23 +112,40 @@ class TrailsTrainer:
 
             self.initialize_mixture_from_data(data)
 
+        survival_metrics = {"cindex": Cindex()}
+        cluster_metrics = (
+            {"nmi": NormalizedMutualInfoScore(), "ari": AdjustedRandScore()}
+            if validation_data is not None and validation_data.has_cluster_labels
+            else {}
+        )
+
         for epoch in tqdm(range(self.config.max_epochs), desc="Epoch"):
-            metrics = self._train_epoch(loader, include_vade_kl=True)
-            entry = {
-                **metrics,
-                "epoch": float(epoch + 1),
-                "global_epoch": float(len(history) + 1),
+            losses, scores = self._epoch_loop(
+                loader,
+                phase="train",
+                include_vade_kl=True,
+                survival_metrics=survival_metrics,
+                cluster_metrics=cluster_metrics,
+            )
+            entry: HistoryEntry = {
+                "epoch": epoch + 1,
+                "global_epoch": len(history) + 1,
                 "stage": "vade",
+                "train": {
+                    **losses,
+                    **scores,
+                },
             }
 
             if valid_loader is not None:
-                validation_metrics = self._evaluate(
+                losses, scores = self._epoch_loop(
                     valid_loader,
+                    phase="valid",
                     include_vade_kl=True,
-                    cal_cluster_metrics=(validation_data is not None)
-                    and validation_data.has_cluster_labels,
+                    survival_metrics=survival_metrics,
+                    cluster_metrics=cluster_metrics,
                 )
-                entry.update({f"val_{name}": value for name, value in validation_metrics.items()})
+                entry["valid"] = {**losses, **scores}
 
             history.append(entry)
             if history_callback is not None:
@@ -136,9 +162,21 @@ class TrailsTrainer:
 
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
         loader = make_data_loader(data, self.config, shuffle=False)
-        return self._evaluate(
-            loader, include_vade_kl=True, cal_cluster_metrics=data.has_cluster_labels
+        survival_metrics = {"cindex": Cindex()}
+        cluster_metrics = (
+            {"nmi": NormalizedMutualInfoScore(), "ari": AdjustedRandScore()}
+            if data.has_cluster_labels
+            else {}
         )
+        losses, scores = self._epoch_loop(
+            loader,
+            phase="valid",
+            include_vade_kl=True,
+            survival_metrics=survival_metrics,
+            cluster_metrics=cluster_metrics,
+        )
+
+        return {**losses, **scores}
 
     def initialize_mixture_from_data(self, data: ClinicalTimeSeriesDataset) -> None:
         latent_means = self._collect_latent_means(data)
@@ -151,35 +189,107 @@ class TrailsTrainer:
         )
         self.model.set_mixture_parameters(prior_probabilities, means, variances)
 
-    def _train_epoch(
+    def _epoch_loop(
         self,
         loader: torch.utils.data.DataLoader[Batch],
         *,
-        include_vade_kl: bool,
-    ) -> dict[str, float]:
+        phase: Literal["train", "valid"] = "train",
+        include_vade_kl: bool = True,
+        survival_metrics: dict[str, Metric] | None = None,
+        cluster_metrics: dict[str, Metric] | None = None,
+    ) -> tuple[dict[str, float], dict[str, float]]:
         self.losses.reset()
+        if survival_metrics is not None:
+            for m in survival_metrics.values():
+                m.reset()
+        if cluster_metrics is not None:
+            for m in cluster_metrics.values():
+                m.reset()
 
-        self.model.train()
-        for batch in tqdm(loader, desc="Batch", leave=False):
-            device_batch = self._move_batch(batch)
-            output = self.model(
-                device_batch["x"],
-                device_batch["mask"],
-                device_batch["delta_time"],
-                device_batch["sequence_lengths"],
-            )
-            loss = self._compute_loss(output, device_batch, include_vade_kl=include_vade_kl)
-            self.optimizer.zero_grad()
-            loss.loss.backward()
-            if self.config.gradient_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.gradient_clip_norm,
+        if phase == "train":
+            self.model.train()
+        else:
+            self.model.eval()
+
+        with torch.set_grad_enabled(phase == "train"):
+            for batch in tqdm(loader, desc=phase.capitalize(), leave=False):
+                device_batch = self._move_batch(batch)
+                output = self.model(
+                    device_batch["x"],
+                    device_batch["mask"],
+                    device_batch["delta_time"],
+                    device_batch["sequence_lengths"],
                 )
-            self.optimizer.step()
-            self.losses.update(device_batch["x"].size(0), loss)
+                loss = self._compute_loss(output, device_batch, include_vade_kl=include_vade_kl)
 
-        return self.losses.compute()
+                if phase == "train":
+                    self.optimizer.zero_grad()
+                    loss.loss.backward()
+                    if self.config.gradient_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.config.gradient_clip_norm,
+                        )
+                    self.optimizer.step()
+
+                self.losses.update(device_batch["x"].size(0), loss)
+
+                if survival_metrics is not None:
+                    for m in survival_metrics.values():
+                        m.update(
+                            self._risk_score(output),
+                            device_batch["survival_time"],
+                            device_batch["event"],
+                        )
+                if cluster_metrics is not None:
+                    for m in cluster_metrics.values():
+                        m.update(
+                            torch.argmax(output.cluster_probabilities, dim=-1),
+                            device_batch["cluster_label"],
+                        )
+
+        return self.losses.compute(), {
+            **(
+                {}
+                if survival_metrics is None
+                else {k: m.compute().item() for k, m in survival_metrics.items()}
+            ),
+            **(
+                {}
+                if cluster_metrics is None
+                else {k: m.compute().item() for k, m in cluster_metrics.items()}
+            ),
+        }
+
+    # def _train_epoch(
+    #     self,
+    #     loader: torch.utils.data.DataLoader[Batch],
+    #     *,
+    #     include_vade_kl: bool,
+    # ) -> dict[str, float]:
+    #     self.losses.reset()
+    #
+    #     self.model.train()
+    #     for batch in tqdm(loader, desc="Batch", leave=False):
+    #         device_batch = self._move_batch(batch)
+    #         output = self.model(
+    #             device_batch["x"],
+    #             device_batch["mask"],
+    #             device_batch["delta_time"],
+    #             device_batch["sequence_lengths"],
+    #         )
+    #         loss = self._compute_loss(output, device_batch, include_vade_kl=include_vade_kl)
+    #         self.optimizer.zero_grad()
+    #         loss.loss.backward()
+    #         if self.config.gradient_clip_norm is not None:
+    #             torch.nn.utils.clip_grad_norm_(
+    #                 self.model.parameters(),
+    #                 self.config.gradient_clip_norm,
+    #             )
+    #         self.optimizer.step()
+    #         self.losses.update(device_batch["x"].size(0), loss)
+    #
+    #     return self.losses.compute()
 
     def _compute_loss(
         self,
@@ -220,57 +330,57 @@ class TrailsTrainer:
             vade_kl_loss=vade_kl,
         )
 
-    def _evaluate(
-        self,
-        loader: torch.utils.data.DataLoader[Batch],
-        *,
-        include_vade_kl: bool,
-        cal_cluster_metrics: bool = False,
-    ) -> dict[str, float]:
-        self.losses.reset()
-        if cal_cluster_metrics:
-            self.metrics.reset()
-
-        risk_scores: list[Tensor] = []
-        survival_times: list[Tensor] = []
-        events: list[Tensor] = []
-
-        self.model.eval()
-        with torch.no_grad():
-            for batch in tqdm(loader, desc="Eval", leave=False):
-                device_batch = self._move_batch(batch)
-                output = self.model(
-                    device_batch["x"],
-                    device_batch["mask"],
-                    device_batch["delta_time"],
-                    device_batch["sequence_lengths"],
-                )
-                loss = self._compute_loss(
-                    output,
-                    device_batch,
-                    include_vade_kl=include_vade_kl,
-                )
-                self.losses.update(device_batch["x"].size(0), loss)
-
-                risk_scores.append(self._risk_score(output).cpu())
-                survival_times.append(device_batch["survival_time"].cpu())
-                events.append(device_batch["event"].cpu())
-
-                if cal_cluster_metrics:
-                    self.metrics.update(
-                        torch.argmax(output.cluster_probabilities, dim=-1),
-                        device_batch["cluster_label"],
-                    )
-
-        scores = self.losses.compute()
-        scores["c_index"] = concordance_index(
-            torch.cat(risk_scores),
-            torch.cat(survival_times),
-            torch.cat(events),
-        )
-        if cal_cluster_metrics:
-            scores.update(self.metrics.compute())
-        return scores
+    # def _evaluate(
+    #     self,
+    #     loader: torch.utils.data.DataLoader[Batch],
+    #     *,
+    #     include_vade_kl: bool,
+    #     cal_cluster_metrics: bool = False,
+    # ) -> dict[str, float]:
+    #     self.losses.reset()
+    #     if cal_cluster_metrics:
+    #         self.metrics.reset()
+    #
+    #     risk_scores: list[Tensor] = []
+    #     survival_times: list[Tensor] = []
+    #     events: list[Tensor] = []
+    #
+    #     self.model.eval()
+    #     with torch.no_grad():
+    #         for batch in tqdm(loader, desc="Eval", leave=False):
+    #             device_batch = self._move_batch(batch)
+    #             output = self.model(
+    #                 device_batch["x"],
+    #                 device_batch["mask"],
+    #                 device_batch["delta_time"],
+    #                 device_batch["sequence_lengths"],
+    #             )
+    #             loss = self._compute_loss(
+    #                 output,
+    #                 device_batch,
+    #                 include_vade_kl=include_vade_kl,
+    #             )
+    #             self.losses.update(device_batch["x"].size(0), loss)
+    #
+    #             risk_scores.append(self._risk_score(output).cpu())
+    #             survival_times.append(device_batch["survival_time"].cpu())
+    #             events.append(device_batch["event"].cpu())
+    #
+    #             if cal_cluster_metrics:
+    #                 self.metrics.update(
+    #                     torch.argmax(output.cluster_probabilities, dim=-1),
+    #                     device_batch["cluster_label"],
+    #                 )
+    #
+    #     scores = self.losses.compute()
+    #     scores["c_index"] = concordance_index(
+    #         torch.cat(risk_scores),
+    #         torch.cat(survival_times),
+    #         torch.cat(events),
+    #     )
+    #     if cal_cluster_metrics:
+    #         scores.update(self.metrics.compute())
+    #     return scores
 
     def _collect_outputs(self, data: ClinicalTimeSeriesDataset) -> tuple[TrailsModelOutput, Batch]:
         loader = make_data_loader(data, self.config, shuffle=False)
