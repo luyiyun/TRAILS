@@ -1,0 +1,5 @@
+name: base
+repeats: 1
+train_size: 128
+test_size: 32
+seed: 20260517

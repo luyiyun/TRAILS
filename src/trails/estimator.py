@@ -28,16 +28,12 @@ class TrailsEstimator:
     def fit(
         self,
         data: ClinicalTimeSeriesDataset,
-        validation_data: ClinicalTimeSeriesDataset | None = None,
         history_callback: HistoryCallback | None = None,
     ) -> TrailsEstimator:
         self._validate_data_config(data)
-        if validation_data is not None:
-            self._validate_data_config(validation_data)
         self.model.set_feature_means(data.feature_means)
         self.history = self.trainer.fit(
             data,
-            validation_data=validation_data,
             history_callback=history_callback,
         )
         return self

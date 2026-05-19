@@ -1,123 +1,22 @@
 defaults:
   - _self_
+  - experiment: base
+  - simulator: base
+  - model: base
+  - trainer: base
+  - artifacts: all
+  - diagnostics: disabled
+  - swanlab: disabled
+  - optim: default
   - scenario: quick
 
 command: experiment
 
-experiment:
-  name: base
-  repeats: 1
-  seed: 20260517
-  seed_stride: 100
-
 paths:
   data_root: null
   data: null
-  val_data: null
   test_data: null
   train_root: null
-
-simulator:
-  patients: 128
-  split_patients: [128, 32, 32]
-  n_clusters: 3
-  min_visits: 4
-  max_visits: 8
-  hidden_size: 100
-  latent_dim: 5
-  attention_layers: 3
-  attention_heads: null
-  censoring_rate: 0.3
-  weibull_shape: 1.0
-  x_low: -10.0
-  x_high: 10.0
-  beta_low: -2.5
-  beta_high: 2.5
-
-model:
-  latent_dim: 8
-  n_clusters: 3
-  dropout: 0.0
-  survival_head_hidden_layers: 0
-  encoder:
-    input:
-      kind: grud
-      hidden_dim: 32
-      n_heads: 2
-    mapping:
-      kind: gru
-      hidden_dim: 32
-      n_layers: 1
-      n_heads: 2
-  decoder:
-    kind: gru
-    conditioning: initial_state
-    hidden_dim: 32
-    n_layers: 1
-    n_heads: 2
-
-trainer:
-  max_epochs: 5
-  batch_size: 16
-  learning_rate: 1.0e-3
-  reconstruction_weight: 1.0
-  survival_weight: 0.2
-  cluster_weight: 0.05
-  warmup_epochs: 1
-  gmm_init_iters: 20
-  gradient_clip_norm: 5.0
-  device: cpu
-  seed: 2026
-
-artifacts:
-  names: [all]
-  save: null
-
-diagnostics:
-  latent_embeddings:
-    enabled: false
-
-swanlab:
-  enabled: false
-  project: TRAILS
-  experiment: null
-  mode: null
-
-optim:
-  n_trials: 30
-  study_name: ${experiment.name}
-  root: outputs/optim/${experiment.name}
-  storage: null
-  search:
-    encoder_input_kind: [grud, mtan]
-    encoder_mapping_kind: [gru, lstm, transformer]
-    decoder_kind: [gru, lstm, transformer]
-    decoder_conditioning: [initial_state, concat_time]
-    hidden_dim: [32, 64, 128]
-    latent_dim: [8, 16, 32]
-    n_layers: [1, 2, 3]
-    dropout:
-      low: 0.0
-      high: 0.3
-      log: false
-    survival_head_hidden_layers: [0, 1, 2]
-    batch_size: [128, 256, 512]
-    cluster_weight:
-      low: 0.005
-      high: 0.5
-      log: true
-    gmm_init_iters: [10, 20, 50]
-    learning_rate:
-      low: 1.0e-4
-      high: 3.0e-2
-      log: true
-    survival_weight:
-      low: 0.05
-      high: 1.0
-      log: true
-    warmup_epochs:
-      low: 0
-      high: 5
 
 hydra:
   job:

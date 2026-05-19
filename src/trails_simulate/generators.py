@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+from typing import Self
 
 import torch
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor
 
 from trails.data import ClinicalSample, ClinicalTimeSeriesDataset, make_clinical_sample
@@ -29,6 +31,205 @@ DEFAULT_FEATURE_NAMES = [
     "carbohydrate_antigen_199",
     "tumor_size",
 ]
+
+
+class ClinicalTimeSeriesDatasetGeneratorConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    patients: int = 128
+    n_clusters: int = Field(default=3, gt=1)
+    min_visits: int = Field(default=4, gt=0)
+    max_visits: int = Field(default=8, gt=0)
+    hidden_size: int = Field(default=100, gt=0)
+    latent_dim: int = Field(default=5, gt=0)
+    attention_layers: int = Field(default=3, gt=0)
+    attention_heads: int | None = None
+    censoring_rate: float = Field(default=0.3, ge=0.0, le=1.0)
+    weibull_shape: float = Field(default=1.0, gt=0.0)
+    x_low: float = -10.0
+    x_high: float = 10.0
+    beta_low: float = -2.5
+    beta_high: float = 2.5
+    feature_names: list[str] = Field(default_factory=lambda: list(DEFAULT_FEATURE_NAMES))
+
+    @model_validator(mode="after")
+    def check_config(self) -> Self:
+        if self.patients <= self.n_clusters:
+            raise ValueError("each patients value must be greater than n_clusters.")
+        if self.max_visits < self.min_visits:
+            raise ValueError("max_visits must be greater than or equal to min_visits.")
+        if self.attention_heads is not None and (
+            self.attention_heads <= 0 or self.hidden_size % self.attention_heads != 0
+        ):
+            raise ValueError("attention_heads must divide hidden_size.")
+        if self.x_low >= self.x_high or self.beta_low >= self.beta_high:
+            raise ValueError("low bounds must be smaller than high bounds.")
+
+        return self
+
+
+class ClinicalTimeSeriesDatasetGenerator:
+    def __init__(self, config: ClinicalTimeSeriesDatasetGeneratorConfig):
+        self.config = config
+
+    def simulate(self, seed: int = 2026) -> ClinicalTimeSeriesDataset:
+        generator = torch.Generator().manual_seed(seed)
+
+        names = self.config.feature_names
+        n_features = len(names)
+        resolved_attention_heads = self.config.attention_heads or _default_attention_heads(
+            self.config.hidden_size
+        )
+
+        # 1. VaDeSC-EHR 风格的均匀 cluster prior 与 cluster-specific latent profile。
+        cluster_prior = (
+            torch.ones(self.config.n_clusters, dtype=torch.float32) / self.config.n_clusters
+        )
+        cluster_labels = torch.multinomial(
+            cluster_prior,
+            num_samples=self.config.patients,
+            replacement=True,
+            generator=generator,
+        )
+        cluster_means = _uniform(
+            (self.config.n_clusters, self.config.latent_dim),
+            self.config.x_low,
+            self.config.x_high,
+            generator,
+        )
+        cluster_covariances = torch.stack(
+            [
+                _random_spd_matrix(self.config.latent_dim, generator)
+                for _cluster in range(self.config.n_clusters)
+            ]
+        )
+
+        latent_z = _sample_latent_profiles(
+            cluster_labels=cluster_labels,
+            cluster_means=cluster_means,
+            cluster_covariances=cluster_covariances,
+            generator=generator,
+        )
+
+        # 2. 生存变量模拟
+        survival_coefficients = _uniform(
+            (self.config.n_clusters, self.config.latent_dim),
+            self.config.beta_low,
+            self.config.beta_high,
+            generator,
+        )
+        survival_intercepts = _uniform(
+            (self.config.n_clusters,), self.config.beta_low, self.config.beta_high, generator
+        )
+        event_times, events = _sample_survival_times(
+            latent_z=latent_z,
+            cluster_labels=cluster_labels,
+            survival_coefficients=survival_coefficients,
+            survival_intercepts=survival_intercepts,
+            weibull_shape=self.config.weibull_shape,
+            censoring_rate=self.config.censoring_rate,
+            generator=generator,
+        )
+
+        # 3. 随机非线性 profile generator：对应原实现中 Z -> max_pos * hidden_size。
+        hidden_profile = _random_nonlin_map(
+            latent_z,
+            self.config.hidden_size * self.config.max_visits,
+            generator=generator,
+        ).reshape(self.config.patients, self.config.max_visits, self.config.hidden_size)
+        hidden_profile = _standardize_active_profile(hidden_profile)
+
+        # 上面我们模拟得到的是patient-level hidden variable，但是每个patient都是一个
+        # sequence，所以现在我们需要模拟每个patient的sequence length
+        sequence_lengths = torch.randint(
+            self.config.min_visits,
+            self.config.max_visits + 1,
+            size=(self.config.patients,),
+            generator=generator,
+        )
+        visit_mask = _sequence_mask(sequence_lengths, self.config.max_visits)
+        hidden_profile = hidden_profile * visit_mask.unsqueeze(-1)
+
+        # 4. 多层 pseudo attention：保留原模拟器“随机注意力层 + 残差”的结构。
+        for _layer in range(self.config.attention_layers):
+            attention_output = _pseudo_attention(
+                hidden_profile,
+                visit_mask,
+                hidden_size=self.config.hidden_size,
+                attention_heads=resolved_attention_heads,
+                generator=generator,
+            )
+            hidden_profile = (hidden_profile + attention_output) * visit_mask.unsqueeze(-1)
+
+        # 5. 连续临床变量 decoder：替换 ICD softmax/argmax，输出多变量检查值。
+        true_values = _decode_continuous_clinical_values(
+            hidden_profile,
+            n_features=n_features,
+            generator=generator,
+        )
+
+        # 6. 非同步采样
+        samples: list[ClinicalSample] = []
+        for patient_index in range(self.config.patients):
+            seq_len = int(sequence_lengths[patient_index])
+            # 检查记录只能发生在患者实际观测终点之前；否则会出现事件/删失后仍有检查的矛盾。
+            times = _sample_visit_times(seq_len, event_times[patient_index], generator)
+            values = true_values[patient_index, :seq_len]
+            severity = torch.sigmoid(latent_z[patient_index, 0] / max(abs(self.config.x_high), 1.0))
+            mask = _sample_asynchronous_observation_mask(
+                values=values,
+                severity=severity,
+                generator=generator,
+            )
+            delta_time = _compute_delta_time(times, mask)
+
+            samples.append(
+                make_clinical_sample(
+                    times=times,
+                    x=values * mask,
+                    mask=mask,
+                    delta_time=delta_time,
+                    survival_time=event_times[patient_index],
+                    event=events[patient_index],
+                    cluster_label=int(cluster_labels[patient_index]),
+                )
+            )
+
+        metadata = {
+            "generation_params": {
+                "patients": self.config.patients,
+                "n_clusters": self.config.n_clusters,
+                "min_visits": self.config.min_visits,
+                "max_visits": self.config.max_visits,
+                "latent_dim": self.config.latent_dim,
+                "hidden_size": self.config.hidden_size,
+                "attention_layers": self.config.attention_layers,
+                "attention_heads": resolved_attention_heads,
+                "censoring_rate": self.config.censoring_rate,
+                "weibull_shape": self.config.weibull_shape,
+                "x_low": self.config.x_low,
+                "x_high": self.config.x_high,
+                "beta_low": self.config.beta_low,
+                "beta_high": self.config.beta_high,
+                "seed": seed,
+            },
+            "cluster_prior": cluster_prior,
+            "cluster_means": cluster_means,
+            "cluster_covariances": cluster_covariances,
+            "latent_z": latent_z,
+            "survival_coefficients": survival_coefficients,
+            "survival_intercepts": survival_intercepts,
+            "sequence_lengths": sequence_lengths,
+        }
+        return ClinicalTimeSeriesDataset(
+            samples,
+            feature_names=names,
+            description=(
+                "VaDeSC-EHR-style synthetic asynchronous continuous clinical time-series "
+                "dataset with latent clusters and Weibull survival outcomes."
+            ),
+            metadata=metadata,
+        )
 
 
 def _pseudo_attention(
@@ -58,7 +259,7 @@ def _pseudo_attention(
     value = value.transpose(1, 2)
 
     scores = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(float(head_size))
-    scores = scores.masked_fill(~visit_mask[:, None, None, :], -10000.0)
+    scores = scores.masked_fill(~visit_mask[:, None, None, :], -torch.inf)
     attention = torch.softmax(scores, dim=-1)
     attended = torch.matmul(attention, value)
     attended = attended.transpose(1, 2).reshape(inputs.shape[0], inputs.shape[1], hidden_size)
@@ -111,222 +312,6 @@ def _sample_survival_times(
     )
 
     return event_times, events
-
-
-def generate_clinical_time_series_dataset(
-    *,
-    n_patients: int = 128,
-    n_clusters: int = 3,
-    min_visits: int = 4,
-    max_visits: int = 8,
-    latent_dim: int = 5,
-    hidden_size: int = 100,
-    attention_layers: int = 3,
-    attention_heads: int | None = None,
-    censoring_rate: float = 0.3,
-    weibull_shape: float = 1.0,
-    x_low: float = -10.0,
-    x_high: float = 10.0,
-    beta_low: float = -2.5,
-    beta_high: float = 2.5,
-    feature_names: list[str] | None = None,
-    seed: int = 2026,
-) -> ClinicalTimeSeriesDataset:
-    _validate_generation_args(
-        n_patients=n_patients,
-        n_clusters=n_clusters,
-        min_visits=min_visits,
-        max_visits=max_visits,
-        latent_dim=latent_dim,
-        hidden_size=hidden_size,
-        attention_layers=attention_layers,
-        attention_heads=attention_heads,
-        censoring_rate=censoring_rate,
-        weibull_shape=weibull_shape,
-        x_low=x_low,
-        x_high=x_high,
-        beta_low=beta_low,
-        beta_high=beta_high,
-    )
-
-    names = feature_names or DEFAULT_FEATURE_NAMES
-    generator = torch.Generator().manual_seed(seed)
-    n_features = len(names)
-    resolved_attention_heads = attention_heads or _default_attention_heads(hidden_size)
-
-    # 1. VaDeSC-EHR 风格的均匀 cluster prior 与 cluster-specific latent profile。
-    cluster_prior = torch.ones(n_clusters, dtype=torch.float32) / n_clusters
-    cluster_labels = torch.multinomial(
-        cluster_prior,
-        num_samples=n_patients,
-        replacement=True,
-        generator=generator,
-    )
-    cluster_means = _uniform((n_clusters, latent_dim), x_low, x_high, generator)
-    cluster_covariances = torch.stack(
-        [_random_spd_matrix(latent_dim, generator) for _cluster in range(n_clusters)]
-    )
-
-    latent_z = _sample_latent_profiles(
-        cluster_labels=cluster_labels,
-        cluster_means=cluster_means,
-        cluster_covariances=cluster_covariances,
-        generator=generator,
-    )
-
-    # 2. 生存变量模拟
-    survival_coefficients = _uniform((n_clusters, latent_dim), beta_low, beta_high, generator)
-    survival_intercepts = _uniform((n_clusters,), beta_low, beta_high, generator)
-    event_times, events = _sample_survival_times(
-        latent_z=latent_z,
-        cluster_labels=cluster_labels,
-        survival_coefficients=survival_coefficients,
-        survival_intercepts=survival_intercepts,
-        weibull_shape=weibull_shape,
-        censoring_rate=censoring_rate,
-        generator=generator,
-    )
-
-    # 3. 随机非线性 profile generator：对应原实现中 Z -> max_pos * hidden_size。
-    hidden_profile = _random_nonlin_map(
-        latent_z,
-        hidden_size * max_visits,
-        generator=generator,
-    ).reshape(n_patients, max_visits, hidden_size)
-    hidden_profile = _standardize_active_profile(hidden_profile)
-
-    # 上面我们模拟得到的是patient-level hidden variable，但是每个patient都是一个
-    # sequence，所以现在我们需要模拟每个patient的sequence length
-    sequence_lengths = torch.randint(
-        min_visits,
-        max_visits + 1,
-        size=(n_patients,),
-        generator=generator,
-    )
-    visit_mask = _sequence_mask(sequence_lengths, max_visits)
-    hidden_profile = hidden_profile * visit_mask.unsqueeze(-1)
-
-    # 4. 多层 pseudo attention：保留原模拟器“随机注意力层 + 残差”的结构。
-    for _layer in range(attention_layers):
-        attention_output = _pseudo_attention(
-            hidden_profile,
-            visit_mask,
-            hidden_size=hidden_size,
-            attention_heads=resolved_attention_heads,
-            generator=generator,
-        )
-        hidden_profile = (hidden_profile + attention_output) * visit_mask.unsqueeze(-1)
-
-    # 5. 连续临床变量 decoder：替换 ICD softmax/argmax，输出多变量检查值。
-    true_values = _decode_continuous_clinical_values(
-        hidden_profile,
-        n_features=n_features,
-        generator=generator,
-    )
-
-    # 6. 非同步采样
-    samples: list[ClinicalSample] = []
-    for patient_index in range(n_patients):
-        seq_len = int(sequence_lengths[patient_index])
-        # 检查记录只能发生在患者实际观测终点之前；否则会出现事件/删失后仍有检查的矛盾。
-        times = _sample_visit_times(seq_len, event_times[patient_index], generator)
-        values = true_values[patient_index, :seq_len]
-        severity = torch.sigmoid(latent_z[patient_index, 0] / max(abs(x_high), 1.0))
-        mask = _sample_asynchronous_observation_mask(
-            values=values,
-            severity=severity,
-            generator=generator,
-        )
-        delta_time = _compute_delta_time(times, mask)
-
-        samples.append(
-            make_clinical_sample(
-                times=times,
-                x=values * mask,
-                mask=mask,
-                delta_time=delta_time,
-                survival_time=event_times[patient_index],
-                event=events[patient_index],
-                cluster_label=int(cluster_labels[patient_index]),
-            )
-        )
-
-    metadata = {
-        "generation_params": {
-            "n_patients": n_patients,
-            "n_clusters": n_clusters,
-            "min_visits": min_visits,
-            "max_visits": max_visits,
-            "latent_dim": latent_dim,
-            "hidden_size": hidden_size,
-            "attention_layers": attention_layers,
-            "attention_heads": resolved_attention_heads,
-            "censoring_rate": censoring_rate,
-            "weibull_shape": weibull_shape,
-            "x_low": x_low,
-            "x_high": x_high,
-            "beta_low": beta_low,
-            "beta_high": beta_high,
-            "seed": seed,
-        },
-        "cluster_prior": cluster_prior,
-        "cluster_means": cluster_means,
-        "cluster_covariances": cluster_covariances,
-        "latent_z": latent_z,
-        "survival_coefficients": survival_coefficients,
-        "survival_intercepts": survival_intercepts,
-        "sequence_lengths": sequence_lengths,
-    }
-    return ClinicalTimeSeriesDataset(
-        samples,
-        feature_names=names,
-        description=(
-            "VaDeSC-EHR-style synthetic asynchronous continuous clinical time-series "
-            "dataset with latent clusters and Weibull survival outcomes."
-        ),
-        metadata=metadata,
-    )
-
-
-def _validate_generation_args(
-    *,
-    n_patients: int,
-    n_clusters: int,
-    min_visits: int,
-    max_visits: int,
-    latent_dim: int,
-    hidden_size: int,
-    attention_layers: int,
-    attention_heads: int | None,
-    censoring_rate: float,
-    weibull_shape: float,
-    x_low: float,
-    x_high: float,
-    beta_low: float,
-    beta_high: float,
-) -> None:
-    if n_patients <= n_clusters:
-        raise ValueError("n_patients must be greater than n_clusters.")
-    if n_clusters < 2:
-        raise ValueError("n_clusters must be at least 2.")
-    if min_visits < 2:
-        raise ValueError("min_visits must be at least 2.")
-    if max_visits < min_visits:
-        raise ValueError("max_visits must be greater than or equal to min_visits.")
-    if latent_dim <= 0 or hidden_size <= 0:
-        raise ValueError("latent_dim and hidden_size must be positive.")
-    if attention_layers < 0:
-        raise ValueError("attention_layers must be non-negative.")
-    if attention_heads is None:
-        attention_heads = _default_attention_heads(hidden_size)
-    if attention_heads <= 0 or hidden_size % attention_heads != 0:
-        raise ValueError("attention_heads must divide hidden_size.")
-    if not 0.0 <= censoring_rate < 1.0:
-        raise ValueError("censoring_rate must be in [0, 1).")
-    if weibull_shape <= 0:
-        raise ValueError("weibull_shape must be positive.")
-    if x_low >= x_high or beta_low >= beta_high:
-        raise ValueError("low bounds must be smaller than high bounds.")
 
 
 def _default_attention_heads(hidden_size: int) -> int:

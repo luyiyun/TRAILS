@@ -90,6 +90,7 @@ class TrainerConfig(BaseModel):
     gradient_clip_norm: float | None = Field(default=5.0, gt=0.0)
     device: str = "cpu"
     seed: int = 2026
+    valid_size: float = Field(default=0.2, ge=0.0, le=1.0)
 
 
 class TrailsConfig(BaseModel):

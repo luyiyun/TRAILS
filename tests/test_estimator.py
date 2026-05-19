@@ -14,7 +14,10 @@ from trails.config import (
 )
 from trails.data import ClinicalTimeSeriesDataset, make_clinical_sample
 from trails.estimator import TrailsEstimator
-from trails_simulate import generate_clinical_time_series_dataset
+from trails_simulate import (
+    ClinicalTimeSeriesDatasetGenerator,
+    ClinicalTimeSeriesDatasetGeneratorConfig,
+)
 
 
 def tiny_config(n_features: int) -> TrailsConfig:
@@ -29,7 +32,13 @@ def tiny_config(n_features: int) -> TrailsConfig:
             ),
             decoder=DecoderConfig(hidden_dim=8),
         ),
-        trainer=TrainerConfig(max_epochs=1, warmup_epochs=1, batch_size=4, gmm_init_iters=2),
+        trainer=TrainerConfig(
+            max_epochs=1,
+            warmup_epochs=1,
+            batch_size=4,
+            gmm_init_iters=2,
+            valid_size=0.0,
+        ),
         seed=13,
     )
 
@@ -53,17 +62,21 @@ def strip_cluster_labels(data: ClinicalTimeSeriesDataset) -> ClinicalTimeSeriesD
     )
 
 
-def test_estimator_fit_predict_test() -> None:
-    data = generate_clinical_time_series_dataset(
-        n_patients=8,
+def simulate_dataset(seed: int) -> ClinicalTimeSeriesDataset:
+    config = ClinicalTimeSeriesDatasetGeneratorConfig(
+        patients=8,
         n_clusters=2,
         min_visits=3,
         max_visits=5,
         hidden_size=12,
         latent_dim=4,
         attention_layers=2,
-        seed=13,
     )
+    return ClinicalTimeSeriesDatasetGenerator(config).simulate(seed=seed)
+
+
+def test_estimator_fit_predict_test() -> None:
+    data = simulate_dataset(seed=13)
     estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data)
     predictions = estimator.predict(data)
     probabilities = estimator.predict_proba(data)
@@ -82,16 +95,7 @@ def test_estimator_fit_predict_test() -> None:
 
 
 def test_estimator_latent_diagnostics_exports_labels_and_embeddings() -> None:
-    data = generate_clinical_time_series_dataset(
-        n_patients=8,
-        n_clusters=2,
-        min_visits=3,
-        max_visits=5,
-        hidden_size=12,
-        latent_dim=4,
-        attention_layers=2,
-        seed=23,
-    )
+    data = simulate_dataset(seed=23)
     estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data)
     diagnostics = estimator.latent_diagnostics(data)
 
@@ -109,58 +113,26 @@ def test_estimator_latent_diagnostics_exports_labels_and_embeddings() -> None:
     )
 
 
-def test_estimator_fit_with_validation_reports_validation_cluster_metrics() -> None:
-    data = generate_clinical_time_series_dataset(
-        n_patients=8,
-        n_clusters=2,
-        min_visits=3,
-        max_visits=5,
-        hidden_size=12,
-        latent_dim=4,
-        attention_layers=2,
-        seed=31,
-    )
-    estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data, validation_data=data)
+def test_estimator_fit_without_internal_validation_skips_validation_metrics() -> None:
+    data = simulate_dataset(seed=31)
+    estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data)
 
-    assert "valid" in estimator.history[-1]
-    assert "loss" in estimator.history[-1]["valid"]
-    assert "ari" in estimator.history[-1]["valid"]
-    assert "nmi" in estimator.history[-1]["valid"]
+    assert "valid" not in estimator.history[-1]
 
 
 def test_unlabeled_data_skips_cluster_metrics() -> None:
-    labeled = generate_clinical_time_series_dataset(
-        n_patients=8,
-        n_clusters=2,
-        min_visits=3,
-        max_visits=5,
-        hidden_size=12,
-        latent_dim=4,
-        attention_layers=2,
-        seed=37,
-    )
+    labeled = simulate_dataset(seed=37)
     data = strip_cluster_labels(labeled)
-    estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data, validation_data=data)
+    estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data)
     metrics = estimator.test(data)
 
     assert "ari" not in metrics
     assert "nmi" not in metrics
-    assert "valid" in estimator.history[-1]
-    assert "ari" not in estimator.history[-1]["valid"]
-    assert "nmi" not in estimator.history[-1]["valid"]
+    assert "valid" not in estimator.history[-1]
 
 
 def test_estimator_save_load(tmp_path: Path) -> None:
-    data = generate_clinical_time_series_dataset(
-        n_patients=8,
-        n_clusters=2,
-        min_visits=3,
-        max_visits=5,
-        hidden_size=12,
-        latent_dim=4,
-        attention_layers=2,
-        seed=17,
-    )
+    data = simulate_dataset(seed=17)
     estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data)
     path = tmp_path / "trails.pt"
     estimator.save(path)

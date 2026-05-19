@@ -1,0 +1,12 @@
+max_epochs: 5
+batch_size: 16
+learning_rate: 1.0e-3
+reconstruction_weight: 1.0
+survival_weight: 0.2
+cluster_weight: 0.05
+warmup_epochs: 1
+gmm_init_iters: 20
+gradient_clip_norm: 5.0
+device: cpu
+seed: 2026
+valid_size: 0.2

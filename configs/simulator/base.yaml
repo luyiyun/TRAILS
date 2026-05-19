@@ -1,0 +1,14 @@
+patients: ${experiment.train_size}
+n_clusters: 3
+min_visits: 4
+max_visits: 8
+hidden_size: 100
+latent_dim: 5
+attention_layers: 3
+attention_heads: null
+censoring_rate: 0.3
+weibull_shape: 1.0
+x_low: -10.0
+x_high: 10.0
+beta_low: -2.5
+beta_high: 2.5

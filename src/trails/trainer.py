@@ -76,13 +76,14 @@ class TrailsTrainer:
     def fit(
         self,
         data: ClinicalTimeSeriesDataset,
-        validation_data: ClinicalTimeSeriesDataset | None = None,
         history_callback: HistoryCallback | None = None,
     ) -> list[HistoryEntry]:
         loader = make_data_loader(data, self.config, shuffle=True)
-        if validation_data is not None:
+        if self.config.valid_size > 0:
+            data, validation_data = data.split([1 - self.config.valid_size, self.config.valid_size])
             valid_loader = make_data_loader(validation_data, self.config, shuffle=False)
         else:
+            validation_data = None
             valid_loader = None
 
         history: list[HistoryEntry] = []

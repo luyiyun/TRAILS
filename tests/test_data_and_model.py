@@ -14,7 +14,10 @@ from trails.config import (
 )
 from trails.data import ClinicalTimeSeriesDataset, clinical_collate_fn, make_clinical_sample
 from trails.model import SequencePool, TrailsSurvVaderModel
-from trails_simulate import generate_clinical_time_series_dataset
+from trails_simulate import (
+    ClinicalTimeSeriesDatasetGenerator,
+    ClinicalTimeSeriesDatasetGeneratorConfig,
+)
 
 EncoderInputKind = Literal["grud", "mtan"]
 EncoderMappingKind = Literal["gru", "lstm", "transformer"]
@@ -22,9 +25,34 @@ DecoderKind = Literal["gru", "lstm", "transformer"]
 DecoderConditioning = Literal["initial_state", "concat_time"]
 
 
+def simulate_dataset(
+    *,
+    patients: int,
+    n_clusters: int,
+    min_visits: int,
+    max_visits: int,
+    hidden_size: int,
+    latent_dim: int,
+    attention_layers: int,
+    seed: int,
+    censoring_rate: float = 0.3,
+) -> ClinicalTimeSeriesDataset:
+    config = ClinicalTimeSeriesDatasetGeneratorConfig(
+        patients=patients,
+        n_clusters=n_clusters,
+        min_visits=min_visits,
+        max_visits=max_visits,
+        hidden_size=hidden_size,
+        latent_dim=latent_dim,
+        attention_layers=attention_layers,
+        censoring_rate=censoring_rate,
+    )
+    return ClinicalTimeSeriesDatasetGenerator(config).simulate(seed=seed)
+
+
 def test_clinical_dataset_and_collate_shapes() -> None:
-    dataset = generate_clinical_time_series_dataset(
-        n_patients=6,
+    dataset = simulate_dataset(
+        patients=6,
         n_clusters=2,
         min_visits=3,
         max_visits=5,
@@ -50,8 +78,8 @@ def test_clinical_dataset_and_collate_shapes() -> None:
 
 
 def test_unlabeled_dataset_collates_without_cluster_labels() -> None:
-    labeled = generate_clinical_time_series_dataset(
-        n_patients=4,
+    labeled = simulate_dataset(
+        patients=4,
         n_clusters=2,
         min_visits=3,
         max_visits=4,
@@ -79,8 +107,8 @@ def test_unlabeled_dataset_collates_without_cluster_labels() -> None:
 
 
 def test_dataset_rejects_mixed_cluster_label_availability() -> None:
-    labeled = generate_clinical_time_series_dataset(
-        n_patients=4,
+    labeled = simulate_dataset(
+        patients=4,
         n_clusters=2,
         min_visits=3,
         max_visits=4,
@@ -106,8 +134,8 @@ def test_dataset_rejects_mixed_cluster_label_availability() -> None:
 
 
 def test_simulation_has_asynchronous_masks_and_valid_delta_time() -> None:
-    dataset = generate_clinical_time_series_dataset(
-        n_patients=64,
+    dataset = simulate_dataset(
+        patients=64,
         n_clusters=2,
         min_visits=4,
         max_visits=5,
@@ -193,8 +221,8 @@ def make_architecture_config(
 
 
 def assert_model_forward_shapes(model_config: ModelConfig) -> None:
-    dataset = generate_clinical_time_series_dataset(
-        n_patients=4,
+    dataset = simulate_dataset(
+        patients=4,
         n_clusters=2,
         min_visits=3,
         max_visits=4,

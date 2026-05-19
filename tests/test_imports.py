@@ -10,7 +10,8 @@ def test_imports() -> None:
     assert trails_case.__doc__
     assert trails_simulate.__all__ == [
         "DEFAULT_FEATURE_NAMES",
-        "generate_clinical_time_series_dataset",
+        "ClinicalTimeSeriesDatasetGenerator",
+        "ClinicalTimeSeriesDatasetGeneratorConfig",
     ]
 
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
@@ -108,6 +109,32 @@ class ClinicalTimeSeriesDataset(Dataset[ClinicalSample]):
             description=str(payload.get("description", "")),
             metadata=dict(payload.get("metadata", {})),
         )
+
+    def split(self, fraction: list[float], seed: int = 0) -> list[ClinicalTimeSeriesDataset]:
+        assert sum(fraction) == 1, "Split fractions must sum to 1."
+
+        if len(fraction) == 1:
+            return [self]
+
+        rng = np.random.default_rng(seed)
+        n_samples = len(self.samples)
+        indices = np.arange(n_samples)
+        rng.shuffle(indices)
+        split_indices = np.cumsum(np.array(fraction) * n_samples).astype(int).tolist()
+
+        res = []
+        for i, (start, end) in enumerate(zip([0] + split_indices[:-1], split_indices, strict=True)):
+            samples_i = [self.samples[i] for i in indices[start:end]]
+            res.append(
+                ClinicalTimeSeriesDataset(
+                    samples_i,
+                    feature_names=self.feature_names,
+                    description=f"{self.description} (split {i + 1}/{len(fraction)})",
+                    metadata={**self.metadata, "split_fraction": fraction[i]},
+                )
+            )
+
+        return res
 
 
 def make_clinical_sample(

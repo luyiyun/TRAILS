@@ -28,6 +28,7 @@ dev = [
     "pyright>=1.1.409",
     "pytest>=9.0.3",
     "ruff>=0.15.13",
+    "seaborn>=0.13.2",
     "umap-learn>=0.5.12",
 ]
 

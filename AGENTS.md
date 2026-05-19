@@ -62,6 +62,8 @@ clean reusable method library.
   `trails`.
 - 在复杂研究逻辑处使用简洁中文注释，尤其是模拟机制、模型结构和损失函数；
   不要给显而易见的赋值或样板代码写流水账式注释。
+- 如果一段代码只在局部流程中使用一次，不需要为了形式拆成额外函数；在相关
+  内容附近添加简洁中文注释说明意图即可。
 - Avoid `try/except` unless the code can recover or add useful diagnostics.
 - Add or update tests for every substantial behavior change.
 - Update this file when architecture decisions change.
