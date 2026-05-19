@@ -77,6 +77,30 @@ def test_clinical_dataset_and_collate_shapes() -> None:
     )
 
 
+def test_dataset_split_counts_preserves_sizes_and_metadata() -> None:
+    dataset = simulate_dataset(
+        patients=7,
+        n_clusters=2,
+        min_visits=3,
+        max_visits=5,
+        hidden_size=12,
+        latent_dim=4,
+        attention_layers=2,
+        seed=17,
+    )
+
+    train, test = dataset.split_counts([5, 2], seed=23)
+
+    assert len(train) == 5
+    assert len(test) == 2
+    assert train.metadata["latent_z"].shape[0] == 5
+    assert test.metadata["latent_z"].shape[0] == 2
+    assert train.metadata["sequence_lengths"].shape[0] == 5
+    assert test.metadata["sequence_lengths"].shape[0] == 2
+    assert torch.allclose(train.metadata["cluster_means"], dataset.metadata["cluster_means"])
+    assert torch.allclose(test.metadata["cluster_means"], dataset.metadata["cluster_means"])
+
+
 def test_unlabeled_dataset_collates_without_cluster_labels() -> None:
     labeled = simulate_dataset(
         patients=4,

@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from pydantic import ValidationError
@@ -28,7 +29,6 @@ def test_scenario_configs_validate() -> None:
         assert app_config.experiment.name
         assert app_config.experiment.train_size > 0
         assert app_config.experiment.test_size > 0
-        assert app_config.simulator.patients == app_config.experiment.train_size
         assert app_config.diagnostics.latent_embeddings.enabled == (scenario == "debug")
         assert "seed_stride" not in payload["experiment"]
         assert "val_data" not in payload["paths"]
@@ -60,11 +60,10 @@ def test_quick_config_uses_small_experiment_sizes() -> None:
 
     assert app_config.experiment.train_size == 64
     assert app_config.experiment.test_size == 24
-    assert app_config.simulator.patients == 64
     assert app_config.trainer.valid_size == 0.2
 
 
-def test_experiment_size_overrides_drive_simulator_patient_count() -> None:
+def test_experiment_size_overrides_are_validated() -> None:
     from trails_simulate.config import ApplicationConfig
 
     app_config = ApplicationConfig.model_validate(
@@ -77,7 +76,48 @@ def test_experiment_size_overrides_drive_simulator_patient_count() -> None:
 
     assert app_config.experiment.train_size == 10
     assert app_config.experiment.test_size == 5
-    assert app_config.simulator.patients == 10
+
+
+def test_experiment_generates_one_source_dataset_then_splits(monkeypatch, tmp_path: Path) -> None:
+    from trails.data import ClinicalTimeSeriesDataset
+    from trails_simulate import workflow
+    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.training import TrainResult
+
+    app_config = ApplicationConfig.model_validate(
+        compose_payload(
+            "scenario=quick",
+            "experiment.train_size=6",
+            "experiment.test_size=4",
+            "artifacts.names=[none]",
+            "swanlab.enabled=false",
+        )
+    )
+
+    def fake_fit_training_run(*args: Any, **kwargs: Any) -> TrainResult:
+        train_paths = kwargs["train_paths"]
+        train_data = ClinicalTimeSeriesDataset.load(train_paths.data)
+        test_data = ClinicalTimeSeriesDataset.load(train_paths.test_data)
+        assert len(train_data) == 6
+        assert len(test_data) == 4
+        assert torch.allclose(
+            train_data.metadata["cluster_means"], test_data.metadata["cluster_means"]
+        )
+        return TrainResult(history=[], metrics={"loss": 1.0}, run_dir=None)
+
+    monkeypatch.setattr(workflow, "fit_training_run", fake_fit_training_run)
+
+    result = workflow.run_experiment_command(app_config, tmp_path, ROOT)
+    data_dir = tmp_path / "repeat_000" / "data"
+    train_data = ClinicalTimeSeriesDataset.load(data_dir / "train.pt")
+    test_data = ClinicalTimeSeriesDataset.load(data_dir / "test.pt")
+
+    assert len(train_data) == 6
+    assert len(test_data) == 4
+    assert not (data_dir / "val.pt").exists()
+    assert result["repeats"][0]["seed"] == app_config.experiment.seed
+    assert result["repeats"][0]["source_size"] == 10
+    assert torch.allclose(train_data.metadata["cluster_means"], test_data.metadata["cluster_means"])
 
 
 def test_paths_reject_removed_validation_data_field() -> None:

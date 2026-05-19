@@ -51,7 +51,7 @@ uv run main.py scenario=formal_5x
 
 ```bash
 uv run main.py scenario=formal_5x experiment.repeats=10
-uv run main.py scenario=quick 'simulator.split_patients=[128,32,32]' trainer.max_epochs=10
+uv run main.py scenario=quick experiment.train_size=128 experiment.test_size=32 trainer.max_epochs=10
 ```
 
 单独生成模拟数据：
@@ -60,7 +60,7 @@ uv run main.py scenario=quick 'simulator.split_patients=[128,32,32]' trainer.max
 uv run main.py command=simulate scenario=quick paths.data_root=data/simulated/quick
 ```
 
-训练已有的 train/val/test split：
+训练已有的 train/test split：
 
 ```bash
 uv run main.py command=train scenario=quick paths.data_root=data/simulated/quick
@@ -74,7 +74,9 @@ uv run main.py command=train scenario=quick paths.data=data/simulated/demo.pt
 
 每次 Hydra run 默认保存到 `outputs/<scenario>/<timestamp>/`。`command=experiment`
 会在 run 目录下创建 `repeat_000/`、`repeat_001/` 等子目录；每个 repeat
-内部包含 `data/train.pt`、`data/val.pt`、`data/test.pt` 和训练 artifacts。
+先生成一个同一 DGP 下的 source dataset，再切分保存为 `data/train.pt` 和
+`data/test.pt`；validation 由 trainer 从 `train.pt` 内部按 `trainer.valid_size`
+切出，不单独落盘。每个 repeat 还会保存训练 artifacts。
 run 根目录会额外保存 `experiment_summary.json`、`test_metrics.csv` 和
 `test_metrics_summary.json`。
 

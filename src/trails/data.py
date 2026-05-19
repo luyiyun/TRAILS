@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 from .config import DataConfig, TrainerConfig
 
 Batch = dict[str, Tensor]
+PATIENT_LEVEL_METADATA_KEYS = frozenset({"latent_z", "sequence_lengths"})
 
 
 @dataclass(frozen=True)
@@ -111,30 +112,103 @@ class ClinicalTimeSeriesDataset(Dataset[ClinicalSample]):
         )
 
     def split(self, fraction: list[float], seed: int = 0) -> list[ClinicalTimeSeriesDataset]:
-        assert sum(fraction) == 1, "Split fractions must sum to 1."
+        if not np.isclose(float(sum(fraction)), 1.0):
+            raise ValueError("Split fractions must sum to 1.")
 
         if len(fraction) == 1:
             return [self]
 
-        rng = np.random.default_rng(seed)
         n_samples = len(self.samples)
-        indices = np.arange(n_samples)
-        rng.shuffle(indices)
         split_indices = np.cumsum(np.array(fraction) * n_samples).astype(int).tolist()
+        counts = [
+            end - start for start, end in zip([0] + split_indices[:-1], split_indices, strict=True)
+        ]
+        return self.split_counts(counts, seed=seed, split_fractions=fraction)
 
+    def split_counts(
+        self,
+        counts: list[int],
+        seed: int = 0,
+        *,
+        split_fractions: list[float] | None = None,
+    ) -> list[ClinicalTimeSeriesDataset]:
+        if not counts:
+            raise ValueError("Split counts must contain at least one split.")
+        if any(count <= 0 for count in counts):
+            raise ValueError("Split counts must be positive.")
+        if sum(counts) != len(self.samples):
+            raise ValueError("Split counts must sum to dataset length.")
+        if len(counts) == 1:
+            return [self]
+
+        rng = np.random.default_rng(seed)
+        indices = np.arange(len(self.samples))
+        rng.shuffle(indices)
+        split_indices = np.cumsum(np.array(counts)).astype(int).tolist()
         res = []
-        for i, (start, end) in enumerate(zip([0] + split_indices[:-1], split_indices, strict=True)):
-            samples_i = [self.samples[i] for i in indices[start:end]]
+        for split_index, (start, end) in enumerate(
+            zip([0] + split_indices[:-1], split_indices, strict=True)
+        ):
+            split_sample_indices = indices[start:end]
+            samples_i = [self.samples[int(i)] for i in split_sample_indices]
             res.append(
                 ClinicalTimeSeriesDataset(
                     samples_i,
                     feature_names=self.feature_names,
-                    description=f"{self.description} (split {i + 1}/{len(fraction)})",
-                    metadata={**self.metadata, "split_fraction": fraction[i]},
+                    description=f"{self.description} (split {split_index + 1}/{len(counts)})",
+                    metadata=self._split_metadata(
+                        split_sample_indices,
+                        split_index=split_index,
+                        split_count=len(counts),
+                        split_fraction=(
+                            None if split_fractions is None else split_fractions[split_index]
+                        ),
+                    ),
                 )
             )
 
         return res
+
+    def _split_metadata(
+        self,
+        indices: np.ndarray,
+        *,
+        split_index: int,
+        split_count: int,
+        split_fraction: float | None,
+    ) -> dict[str, Any]:
+        metadata = dict(self.metadata)
+        for key in PATIENT_LEVEL_METADATA_KEYS:
+            if key in metadata:
+                metadata[key] = _slice_patient_metadata(
+                    metadata[key],
+                    indices,
+                    source_count=len(self.samples),
+                )
+        metadata.update(
+            {
+                "source_patient_count": len(self.samples),
+                "split_index": split_index,
+                "split_count": split_count,
+                "split_patient_count": int(indices.shape[0]),
+            }
+        )
+        if split_fraction is not None:
+            metadata["split_fraction"] = split_fraction
+        return metadata
+
+
+def _slice_patient_metadata(value: Any, indices: np.ndarray, *, source_count: int) -> Any:
+    if isinstance(value, torch.Tensor) and value.ndim > 0 and int(value.shape[0]) == source_count:
+        tensor_indices = torch.as_tensor(indices, dtype=torch.long)
+        return value[tensor_indices]
+    if isinstance(value, np.ndarray) and value.ndim > 0 and int(value.shape[0]) == source_count:
+        return value[indices]
+    if isinstance(value, list) and len(value) == source_count:
+        return [value[int(index)] for index in indices]
+    if isinstance(value, tuple) and len(value) == source_count:
+        return tuple(value[int(index)] for index in indices)
+    return value
 
 
 def make_clinical_sample(

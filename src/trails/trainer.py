@@ -14,6 +14,7 @@ from .config import TrainerConfig
 from .data import Batch, ClinicalTimeSeriesDataset, make_data_loader
 from .metrics import (
     Cindex,
+    cluster_assignment_diagnostics,
     masked_mse,
     vade_kl_loss,
     weibull_mixture_negative_log_likelihood,
@@ -78,13 +79,14 @@ class TrailsTrainer:
         data: ClinicalTimeSeriesDataset,
         history_callback: HistoryCallback | None = None,
     ) -> list[HistoryEntry]:
-        loader = make_data_loader(data, self.config, shuffle=True)
         if self.config.valid_size > 0:
             data, validation_data = data.split([1 - self.config.valid_size, self.config.valid_size])
             valid_loader = make_data_loader(validation_data, self.config, shuffle=False)
         else:
             validation_data = None
             valid_loader = None
+
+        loader = make_data_loader(data, self.config, shuffle=True)
 
         history: list[HistoryEntry] = []
 
@@ -176,8 +178,13 @@ class TrailsTrainer:
             survival_metrics=survival_metrics,
             cluster_metrics=cluster_metrics,
         )
+        outputs, _batch = self._collect_outputs(data)
+        cluster_scores = cluster_assignment_diagnostics(
+            torch.argmax(outputs.cluster_probabilities, dim=-1),
+            n_clusters=self.model.model_config.n_clusters,
+        )
 
-        return {**losses, **scores}
+        return {**losses, **scores, **cluster_scores}
 
     def initialize_mixture_from_data(self, data: ClinicalTimeSeriesDataset) -> None:
         latent_means = self._collect_latent_means(data)
@@ -263,37 +270,6 @@ class TrailsTrainer:
             ),
         }
 
-    # def _train_epoch(
-    #     self,
-    #     loader: torch.utils.data.DataLoader[Batch],
-    #     *,
-    #     include_vade_kl: bool,
-    # ) -> dict[str, float]:
-    #     self.losses.reset()
-    #
-    #     self.model.train()
-    #     for batch in tqdm(loader, desc="Batch", leave=False):
-    #         device_batch = self._move_batch(batch)
-    #         output = self.model(
-    #             times=device_batch["times"],
-    #             x=device_batch["x"],
-    #             mask=device_batch["mask"],
-    #             delta_time=device_batch["delta_time"],
-    #             sequence_lengths=device_batch["sequence_lengths"],
-    #         )
-    #         loss = self._compute_loss(output, device_batch, include_vade_kl=include_vade_kl)
-    #         self.optimizer.zero_grad()
-    #         loss.loss.backward()
-    #         if self.config.gradient_clip_norm is not None:
-    #             torch.nn.utils.clip_grad_norm_(
-    #                 self.model.parameters(),
-    #                 self.config.gradient_clip_norm,
-    #             )
-    #         self.optimizer.step()
-    #         self.losses.update(device_batch["x"].size(0), loss)
-    #
-    #     return self.losses.compute()
-
     def _compute_loss(
         self,
         output: TrailsModelOutput,
@@ -332,59 +308,6 @@ class TrailsTrainer:
             survival_loss=survival,
             vade_kl_loss=vade_kl,
         )
-
-    # def _evaluate(
-    #     self,
-    #     loader: torch.utils.data.DataLoader[Batch],
-    #     *,
-    #     include_vade_kl: bool,
-    #     cal_cluster_metrics: bool = False,
-    # ) -> dict[str, float]:
-    #     self.losses.reset()
-    #     if cal_cluster_metrics:
-    #         self.metrics.reset()
-    #
-    #     risk_scores: list[Tensor] = []
-    #     survival_times: list[Tensor] = []
-    #     events: list[Tensor] = []
-    #
-    #     self.model.eval()
-    #     with torch.no_grad():
-    #         for batch in tqdm(loader, desc="Eval", leave=False):
-    #             device_batch = self._move_batch(batch)
-    #             output = self.model(
-    #                 times=device_batch["times"],
-    #                 x=device_batch["x"],
-    #                 mask=device_batch["mask"],
-    #                 delta_time=device_batch["delta_time"],
-    #                 sequence_lengths=device_batch["sequence_lengths"],
-    #             )
-    #             loss = self._compute_loss(
-    #                 output,
-    #                 device_batch,
-    #                 include_vade_kl=include_vade_kl,
-    #             )
-    #             self.losses.update(device_batch["x"].size(0), loss)
-    #
-    #             risk_scores.append(self._risk_score(output).cpu())
-    #             survival_times.append(device_batch["survival_time"].cpu())
-    #             events.append(device_batch["event"].cpu())
-    #
-    #             if cal_cluster_metrics:
-    #                 self.metrics.update(
-    #                     torch.argmax(output.cluster_probabilities, dim=-1),
-    #                     device_batch["cluster_label"],
-    #                 )
-    #
-    #     scores = self.losses.compute()
-    #     scores["c_index"] = concordance_index(
-    #         torch.cat(risk_scores),
-    #         torch.cat(survival_times),
-    #         torch.cat(events),
-    #     )
-    #     if cal_cluster_metrics:
-    #         scores.update(self.metrics.compute())
-    #     return scores
 
     def _collect_outputs(self, data: ClinicalTimeSeriesDataset) -> tuple[TrailsModelOutput, Batch]:
         loader = make_data_loader(data, self.config, shuffle=False)

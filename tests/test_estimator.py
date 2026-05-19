@@ -92,6 +92,11 @@ def test_estimator_fit_predict_test() -> None:
     assert "ari" in metrics
     assert "nmi" in metrics
     assert "vade_kl_loss" in metrics
+    assert "cluster_empty_count" in metrics
+    assert "cluster_min_fraction" in metrics
+    assert "cluster_max_fraction" in metrics
+    assert "cluster_entropy" in metrics
+    assert 0.0 <= metrics["cluster_entropy"] <= 1.0
 
 
 def test_estimator_latent_diagnostics_exports_labels_and_embeddings() -> None:
@@ -128,6 +133,8 @@ def test_unlabeled_data_skips_cluster_metrics() -> None:
 
     assert "ari" not in metrics
     assert "nmi" not in metrics
+    assert "cluster_empty_count" in metrics
+    assert "cluster_entropy" in metrics
     assert "valid" not in estimator.history[-1]
 
 

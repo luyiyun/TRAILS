@@ -84,6 +84,22 @@ def concordance_index(risk_score: Tensor, survival_time: Tensor, event: Tensor) 
     return concordant / comparable
 
 
+def cluster_assignment_diagnostics(pred_cluster: Tensor, *, n_clusters: int) -> dict[str, float]:
+    assignments = pred_cluster.detach().cpu().long()
+    counts = torch.bincount(assignments, minlength=n_clusters).float()
+    fractions = counts / counts.sum().clamp_min(1.0)
+    nonzero_fractions = fractions[fractions > 0]
+    entropy = -torch.sum(nonzero_fractions * torch.log(nonzero_fractions))
+    max_entropy = torch.log(torch.tensor(float(n_clusters))).clamp_min(1e-8)
+    normalized_entropy = torch.clamp(entropy / max_entropy, min=0.0, max=1.0)
+    return {
+        "cluster_empty_count": float(torch.sum(counts == 0).item()),
+        "cluster_min_fraction": float(fractions.min().item()),
+        "cluster_max_fraction": float(fractions.max().item()),
+        "cluster_entropy": float(normalized_entropy.item()),
+    }
+
+
 class Cindex(Metric):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

@@ -122,7 +122,8 @@ def run_experiment_command(
 
     repeats: list[dict[str, Any]] = []
     for index in range(config.experiment.repeats):
-        # paired repeat: 同一个 repeat seed 同时驱动该轮 split 生成和模型训练。
+        # paired repeat: 单一 DGP 先生成完整队列，再切 train/test 以保证标签语义一致。
+        repeat_seed = config.experiment.seed + index
         repeat_name = f"repeat_{index:03d}"
         repeat_dir = hydra_run_dir / repeat_name
         data_dir = repeat_dir / "data"
@@ -130,10 +131,15 @@ def run_experiment_command(
 
         data_dir.mkdir(parents=True, exist_ok=True)
 
-        generator = ClinicalTimeSeriesDatasetGenerator(config.simulator)
-        for i, split in enumerate(["train", "val", "test"]):
-            data_i = generator.simulate(config.experiment.seed + i)
-            data_i.save(data_dir / f"{split}.pt")
+        total_patients = config.experiment.train_size + config.experiment.test_size
+        simulator_config = config.simulator.model_copy(update={"patients": total_patients})
+        source_dataset = ClinicalTimeSeriesDatasetGenerator(simulator_config).simulate(repeat_seed)
+        train_dataset, test_dataset = source_dataset.split_counts(
+            [config.experiment.train_size, config.experiment.test_size],
+            seed=repeat_seed,
+        )
+        train_dataset.save(data_dir / "train.pt")
+        test_dataset.save(data_dir / "test.pt")
 
         train_paths = TrainPaths(
             data=data_dir / "train.pt",
@@ -144,7 +150,7 @@ def run_experiment_command(
         train_result = fit_training_run(
             config,
             train_paths=train_paths,
-            seed=config.experiment.seed,
+            seed=repeat_seed,
             swanlab_repeat_label=f"r{index:03d}",
         )
         repeats.append(
@@ -153,7 +159,8 @@ def run_experiment_command(
                 "index": index,
                 "metrics": train_result.metrics,
                 "repeat": repeat_name,
-                "seed": config.experiment.seed,
+                "seed": repeat_seed,
+                "source_size": total_patients,
                 "train_run_dir": None
                 if train_result.run_dir is None
                 else str(train_result.run_dir),

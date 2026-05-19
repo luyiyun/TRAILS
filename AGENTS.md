@@ -76,10 +76,12 @@ clean reusable method library.
   simulation data and trains once per repeat.
 - Common scenarios live under `configs/scenario/`: `quick`,
   `debug`, and `formal_5x`.
-- `experiment.repeats` means paired repeats: each repeat generates its own
-  train/validation/test splits and trains on those splits.
-- Repeat seeds use `experiment.seed + repeat_index * experiment.seed_stride`;
-  split seeds use repeat seed plus 0/1/2 for train/val/test.
+- `experiment.repeats` means paired repeats: each repeat generates one source
+  simulation dataset, splits it into train/test, and trains on that pair.
+- Repeat seeds use `experiment.seed + repeat_index`; the same repeat seed drives
+  source simulation, train/test split shuffling, and model training.
+- Validation data is cut internally from `train.pt` by `trainer.valid_size` and
+  is not saved as a separate `val.pt` by `command=experiment`.
 - Hydra outputs go under `outputs/` by default and are ignored by git.
 - Simulation uses a VaDeSC-EHR-style latent-cluster generator adapted to
   continuous asynchronous clinical measurements.
@@ -101,7 +103,7 @@ clean reusable method library.
   weights are the VaDE posterior cluster probabilities, with a configurable
   number of latent-width hidden layers before the Weibull output.
 - Validation and test metrics include ARI/NMI only when true cluster labels are
-  available.
+  available; test metrics also report predicted-cluster occupancy diagnostics.
 
 ## Verification
 
