@@ -1,9 +1,6 @@
 max_epochs: 100
 batch_size: 256
 learning_rate: 3.0e-4
-reconstruction_weight: 1.0
-survival_weight: 0.2
-cluster_weight: 0.1
 warmup_epochs: 20
 gmm_init_iters: 20
 gradient_clip_norm: null

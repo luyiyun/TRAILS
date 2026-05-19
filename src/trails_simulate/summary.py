@@ -129,8 +129,6 @@ def format_optim_params(params: Mapping[str, Any]) -> str:
         "hidden_dim",
         "latent_dim",
         "learning_rate",
-        "survival_weight",
-        "cluster_weight",
     ]
     chunks = [
         f"{name}={format_optim_param_value(params[name])}" for name in selected if name in params

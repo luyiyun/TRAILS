@@ -10,10 +10,16 @@ from trails.config import (
     EncoderConfig,
     EncoderInputConfig,
     EncoderMappingConfig,
+    LossConfig,
     ModelConfig,
 )
-from trails.data import ClinicalTimeSeriesDataset, clinical_collate_fn, make_clinical_sample
-from trails.model import SequencePool, TrailsSurvVaderModel
+from trails.data import Batch, ClinicalTimeSeriesDataset, clinical_collate_fn, make_clinical_sample
+from trails.metrics import (
+    masked_mse,
+    vade_kl_loss,
+    weibull_mixture_negative_log_likelihood,
+)
+from trails.model import SequencePool, TrailsModelOutput, TrailsSurvVaderModel
 from trails_simulate import (
     ClinicalTimeSeriesDatasetGenerator,
     ClinicalTimeSeriesDatasetGeneratorConfig,
@@ -281,6 +287,151 @@ def assert_model_forward_shapes(model_config: ModelConfig) -> None:
     assert torch.all(output.weibull_scale > 0)
     assert model.mixture_means.shape == (2, 4)
     assert model.mixture_log_variances.shape == (2, 4)
+
+
+def make_loss_test_state(
+    model_config: ModelConfig,
+) -> tuple[TrailsSurvVaderModel, TrailsModelOutput, Batch]:
+    dataset = simulate_dataset(
+        patients=4,
+        n_clusters=2,
+        min_visits=3,
+        max_visits=4,
+        hidden_size=12,
+        latent_dim=4,
+        attention_layers=2,
+        seed=31,
+    )
+    batch = clinical_collate_fn([dataset[0], dataset[1], dataset[2], dataset[3]])
+    model = TrailsSurvVaderModel(
+        DataConfig(n_features=dataset.n_features),
+        model_config,
+    )
+    model.set_feature_means(dataset.feature_means)
+    output = model(
+        times=batch["times"],
+        x=batch["x"],
+        mask=batch["mask"],
+        delta_time=batch["delta_time"],
+        sequence_lengths=batch["sequence_lengths"],
+    )
+    return model, output, batch
+
+
+def test_fixed_loss_matches_legacy_weighted_sum() -> None:
+    loss_config = LossConfig(
+        weighting="fixed",
+        reconstruction_weight=1.3,
+        survival_weight=0.4,
+        cluster_weight=0.07,
+    )
+    model_config = make_architecture_config().model_copy(update={"loss": loss_config})
+    model, output, batch = make_loss_test_state(model_config)
+
+    loss = model.compute_loss(output, batch, include_vade_kl=True)
+    reconstruction = masked_mse(output.reconstruction, batch["x"], batch["mask"])
+    survival = weibull_mixture_negative_log_likelihood(
+        output.cluster_logits,
+        output.weibull_shape,
+        output.weibull_scale,
+        batch["survival_time"],
+        batch["event"],
+    )
+    cluster = vade_kl_loss(
+        output.latent,
+        output.latent_mean,
+        output.latent_log_variance,
+        output.cluster_logits,
+        model.mixture_logits,
+        model.mixture_means,
+        model.mixture_log_variances,
+    )
+    expected = (
+        loss_config.reconstruction_weight * reconstruction
+        + loss_config.survival_weight * survival
+        + loss_config.cluster_weight * cluster
+    )
+
+    assert torch.allclose(loss.loss, expected)
+    assert torch.allclose(loss.reconstruction_loss, reconstruction)
+    assert torch.allclose(loss.survival_loss, survival)
+    assert torch.allclose(loss.vade_kl_loss, cluster)
+    assert "reconstruction_log_variance" not in dict(loss.items())
+
+
+def test_uncertainty_loss_trains_log_variance_parameters() -> None:
+    model_config = make_architecture_config().model_copy(
+        update={
+            "loss": LossConfig(
+                weighting="uncertainty",
+                reconstruction_weight=1.0,
+                survival_weight=0.2,
+                cluster_weight=0.05,
+            )
+        }
+    )
+    model, output, batch = make_loss_test_state(model_config)
+
+    loss = model.compute_loss(output, batch, include_vade_kl=True)
+    loss.loss.backward()
+
+    assert set(model.loss_log_variances.keys()) == {"reconstruction", "survival", "vade_kl"}
+    assert model.loss_log_variances["reconstruction"].grad is not None
+    assert model.loss_log_variances["survival"].grad is not None
+    assert model.loss_log_variances["vade_kl"].grad is not None
+    assert {"reconstruction_log_variance", "survival_log_variance", "vade_kl_log_variance"} <= set(
+        dict(loss.items())
+    )
+
+
+def test_uncertainty_warmup_skips_vade_kl_term_and_log_variance() -> None:
+    model_config = make_architecture_config().model_copy(
+        update={
+            "loss": LossConfig(
+                weighting="uncertainty",
+                reconstruction_weight=1.0,
+                survival_weight=0.2,
+                cluster_weight=0.05,
+            )
+        }
+    )
+    model, output, batch = make_loss_test_state(model_config)
+
+    loss = model.compute_loss(output, batch, include_vade_kl=False)
+    reconstruction_log_variance = model.loss_log_variances["reconstruction"]
+    survival_log_variance = model.loss_log_variances["survival"]
+    reconstruction = masked_mse(output.reconstruction, batch["x"], batch["mask"])
+    survival = weibull_mixture_negative_log_likelihood(
+        output.cluster_logits,
+        output.weibull_shape,
+        output.weibull_scale,
+        batch["survival_time"],
+        batch["event"],
+    )
+    expected = (
+        0.5 * torch.exp(-reconstruction_log_variance) * reconstruction
+        + 0.5 * reconstruction_log_variance
+        + 0.5 * torch.exp(-survival_log_variance) * survival
+        + 0.5 * survival_log_variance
+    )
+
+    assert torch.allclose(loss.loss, expected)
+    assert torch.allclose(loss.vade_kl_loss, torch.zeros_like(loss.vade_kl_loss))
+
+    loss.loss.backward()
+    assert model.loss_log_variances["reconstruction"].grad is not None
+    assert model.loss_log_variances["survival"].grad is not None
+    assert model.loss_log_variances["vade_kl"].grad is None
+
+
+def test_uncertainty_loss_requires_positive_initial_weights() -> None:
+    with pytest.raises(ValidationError, match="requires all initial weights > 0"):
+        LossConfig(weighting="uncertainty", survival_weight=0.0)
+
+    fixed = LossConfig(weighting="fixed", survival_weight=0.0, cluster_weight=0.0)
+
+    assert fixed.survival_weight == 0.0
+    assert fixed.cluster_weight == 0.0
 
 
 @pytest.mark.parametrize("survival_head_hidden_layers", [0, 2])

@@ -2,6 +2,11 @@ latent_dim: 32
 n_clusters: 4
 dropout: 0.0
 survival_head_hidden_layers: 2
+loss:
+  weighting: uncertainty
+  reconstruction_weight: 1.0
+  survival_weight: 0.2
+  cluster_weight: 0.1
 encoder:
   input:
     kind: grud

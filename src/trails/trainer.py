@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict
 
 import torch
@@ -15,11 +14,8 @@ from .data import Batch, ClinicalTimeSeriesDataset, make_data_loader
 from .metrics import (
     Cindex,
     cluster_assignment_diagnostics,
-    masked_mse,
-    vade_kl_loss,
-    weibull_mixture_negative_log_likelihood,
 )
-from .model import TrailsModelOutput, TrailsSurvVaderModel
+from .model import TrailsLossBreakdown, TrailsModelOutput, TrailsSurvVaderModel
 
 
 class HistoryEntry(TypedDict):
@@ -33,22 +29,6 @@ class HistoryEntry(TypedDict):
 HistoryCallback = Callable[[HistoryEntry], None]
 
 
-@dataclass(frozen=True)
-class LossBreakdown:
-    loss: Tensor
-    reconstruction_loss: Tensor
-    survival_loss: Tensor
-    vade_kl_loss: Tensor
-
-    def items(self) -> tuple[tuple[str, Tensor], ...]:
-        return (
-            ("loss", self.loss),
-            ("reconstruction_loss", self.reconstruction_loss),
-            ("survival_loss", self.survival_loss),
-            ("vade_kl_loss", self.vade_kl_loss),
-        )
-
-
 class LossAccumulator:
     def __init__(self) -> None:
         self.reset()
@@ -57,7 +37,7 @@ class LossAccumulator:
         self.total: dict[str, float] = {}
         self.count: int = 0
 
-    def update(self, batch_size: int, batch_loss: LossBreakdown) -> None:
+    def update(self, batch_size: int, batch_loss: TrailsLossBreakdown) -> None:
         self.count += batch_size
         for k, v in batch_loss.items():
             self.total[k] = self.total.get(k, 0.0) + v.item() * batch_size
@@ -229,7 +209,11 @@ class TrailsTrainer:
                     delta_time=device_batch["delta_time"],
                     sequence_lengths=device_batch["sequence_lengths"],
                 )
-                loss = self._compute_loss(output, device_batch, include_vade_kl=include_vade_kl)
+                loss = self.model.compute_loss(
+                    output,
+                    device_batch,
+                    include_vade_kl=include_vade_kl,
+                )
 
                 if phase == "train":
                     self.optimizer.zero_grad()
@@ -269,45 +253,6 @@ class TrailsTrainer:
                 else {k: m.compute().item() for k, m in cluster_metrics.items()}
             ),
         }
-
-    def _compute_loss(
-        self,
-        output: TrailsModelOutput,
-        batch: Batch,
-        *,
-        include_vade_kl: bool,
-    ) -> LossBreakdown:
-        reconstruction = masked_mse(output.reconstruction, batch["x"], batch["mask"])
-        survival = weibull_mixture_negative_log_likelihood(
-            output.cluster_logits,
-            output.weibull_shape,
-            output.weibull_scale,
-            batch["survival_time"],
-            batch["event"],
-        )
-        if include_vade_kl:
-            vade_kl = vade_kl_loss(
-                output.latent,
-                output.latent_mean,
-                output.latent_log_variance,
-                output.cluster_logits,
-                self.model.mixture_logits,
-                self.model.mixture_means,
-                self.model.mixture_log_variances,
-            )
-        else:
-            vade_kl = reconstruction.new_zeros(())
-        total = (
-            self.config.reconstruction_weight * reconstruction
-            + self.config.survival_weight * survival
-            + self.config.cluster_weight * vade_kl
-        )
-        return LossBreakdown(
-            loss=total,
-            reconstruction_loss=reconstruction,
-            survival_loss=survival,
-            vade_kl_loss=vade_kl,
-        )
 
     def _collect_outputs(self, data: ClinicalTimeSeriesDataset) -> tuple[TrailsModelOutput, Batch]:
         loader = make_data_loader(data, self.config, shuffle=False)

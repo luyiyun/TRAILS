@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import cast
 
@@ -8,6 +9,12 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .config import DataConfig, DecoderConfig, EncoderConfig, EncoderMappingConfig, ModelConfig
+from .data import Batch
+from .metrics import (
+    masked_mse,
+    vade_kl_loss,
+    weibull_mixture_negative_log_likelihood,
+)
 
 
 @dataclass(frozen=True)
@@ -20,6 +27,35 @@ class TrailsModelOutput:
     cluster_probabilities: Tensor
     weibull_shape: Tensor
     weibull_scale: Tensor
+
+
+@dataclass(frozen=True)
+class TrailsLossBreakdown:
+    loss: Tensor
+    reconstruction_loss: Tensor
+    survival_loss: Tensor
+    vade_kl_loss: Tensor
+    reconstruction_loss_weight: Tensor
+    survival_loss_weight: Tensor
+    vade_kl_loss_weight: Tensor
+    # reconstruction_log_variance: Tensor | None = None
+    # survival_log_variance: Tensor | None = None
+    # vade_kl_log_variance: Tensor | None = None
+
+    def items(self) -> tuple[tuple[str, Tensor], ...]:
+        values: list[tuple[str, Tensor]] = [
+            ("loss", self.loss),
+            ("reconstruction_loss", self.reconstruction_loss),
+            ("survival_loss", self.survival_loss),
+            ("vade_kl_loss", self.vade_kl_loss),
+            ("reconstruction_loss_weight", self.reconstruction_loss_weight),
+            ("survival_loss_weight", self.survival_loss_weight),
+            ("vade_kl_loss_weight", self.vade_kl_loss_weight),
+            # ("reconstruction_log_variance", self.reconstruction_log_variance),
+            # ("survival_log_variance", self.survival_log_variance),
+            # ("vade_kl_log_variance", self.vade_kl_log_variance),
+        ]
+        return tuple((name, value) for name, value in values if value is not None)
 
 
 class GRUDCell(nn.Module):
@@ -508,6 +544,17 @@ class TrailsSurvVaderModel(nn.Module):
             torch.zeros(model_config.n_clusters, model_config.latent_dim)
         )
         self.survival_head = build_survival_head(model_config)
+        self.loss_log_variances = nn.ParameterDict()
+        if model_config.loss.weighting == "uncertainty":
+            for name, initial_weight in {
+                "reconstruction": model_config.loss.reconstruction_weight,
+                "survival": model_config.loss.survival_weight,
+                "vade_kl": model_config.loss.cluster_weight,
+            }.items():
+                initial_log_variance = -math.log(2.0 * initial_weight)
+                self.loss_log_variances[name] = nn.Parameter(
+                    torch.tensor(initial_log_variance, dtype=torch.float32)
+                )
 
     def set_feature_means(self, feature_means: Tensor) -> None:
         if feature_means.shape != self.feature_means.shape:
@@ -588,11 +635,111 @@ class TrailsSurvVaderModel(nn.Module):
             weibull_scale=weibull_params[..., 1],
         )
 
+    def compute_loss(
+        self,
+        output: TrailsModelOutput,
+        batch: Batch,
+        *,
+        include_vade_kl: bool,
+    ) -> TrailsLossBreakdown:
+        reconstruction = masked_mse(output.reconstruction, batch["x"], batch["mask"])
+        survival = weibull_mixture_negative_log_likelihood(
+            output.cluster_logits,
+            output.weibull_shape,
+            output.weibull_scale,
+            batch["survival_time"],
+            batch["event"],
+        )
+        if include_vade_kl:
+            vade_kl = vade_kl_loss(
+                output.latent,
+                output.latent_mean,
+                output.latent_log_variance,
+                output.cluster_logits,
+                self.mixture_logits,
+                self.mixture_means,
+                self.mixture_log_variances,
+            )
+        else:
+            vade_kl = reconstruction.new_zeros(())
+
+        if self.model_config.loss.weighting == "fixed":
+            return self._compute_fixed_loss_breakdown(
+                reconstruction=reconstruction,
+                survival=survival,
+                vade_kl=vade_kl,
+            )
+
+        return self._compute_uncertainty_loss_breakdown(
+            reconstruction=reconstruction,
+            survival=survival,
+            vade_kl=vade_kl,
+            include_vade_kl=include_vade_kl,
+        )
+
     def _sample_latent(self, mean: Tensor, log_variance: Tensor) -> Tensor:
         if not self.training:
             return mean
         noise = torch.randn_like(mean)
         return mean + noise * torch.exp(0.5 * log_variance)
+
+    def _compute_fixed_loss_breakdown(
+        self,
+        *,
+        reconstruction: Tensor,
+        survival: Tensor,
+        vade_kl: Tensor,
+    ) -> TrailsLossBreakdown:
+        config = self.model_config.loss
+        reconstruction_weight = reconstruction.new_tensor(config.reconstruction_weight)
+        survival_weight = reconstruction.new_tensor(config.survival_weight)
+        vade_kl_weight = reconstruction.new_tensor(config.cluster_weight)
+        total = (
+            reconstruction_weight * reconstruction
+            + survival_weight * survival
+            + vade_kl_weight * vade_kl
+        )
+        return TrailsLossBreakdown(
+            loss=total,
+            reconstruction_loss=reconstruction,
+            survival_loss=survival,
+            vade_kl_loss=vade_kl,
+            reconstruction_loss_weight=reconstruction_weight,
+            survival_loss_weight=survival_weight,
+            vade_kl_loss_weight=vade_kl_weight,
+        )
+
+    def _compute_uncertainty_loss_breakdown(
+        self,
+        *,
+        reconstruction: Tensor,
+        survival: Tensor,
+        vade_kl: Tensor,
+        include_vade_kl: bool,
+    ) -> TrailsLossBreakdown:
+        # 多任务不确定性加权：s=log(sigma^2)，用可学习噪声自动调节各 loss 贡献。
+        reconstruction_term = self._uncertainty_weighted_loss("reconstruction", reconstruction)
+        survival_term = self._uncertainty_weighted_loss("survival", survival)
+        total = reconstruction_term + survival_term
+        if include_vade_kl:
+            total = total + self._uncertainty_weighted_loss("vade_kl", vade_kl)
+
+        reconstruction_weight = 0.5 * torch.exp(-self.loss_log_variances["reconstruction"])
+        survival_weight = 0.5 * torch.exp(-self.loss_log_variances["survival"])
+        vade_kl_weight = 0.5 * torch.exp(-self.loss_log_variances["vade_kl"])
+        return TrailsLossBreakdown(
+            loss=total,
+            reconstruction_loss=reconstruction,
+            survival_loss=survival,
+            vade_kl_loss=vade_kl,
+            reconstruction_loss_weight=reconstruction_weight,
+            survival_loss_weight=survival_weight,
+            vade_kl_loss_weight=vade_kl_weight,
+        )
+
+    def _uncertainty_weighted_loss(self, name: str, loss: Tensor) -> Tensor:
+        log_variance = self.loss_log_variances[name]
+        return 0.5 * torch.exp(-log_variance) * loss + 0.5 * log_variance
 
     def _cluster_logits(self, latent: Tensor) -> Tensor:
         log_prior = torch.log_softmax(self.mixture_logits, dim=-1)

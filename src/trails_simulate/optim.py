@@ -198,16 +198,10 @@ def optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationConf
     trainer_config = config.trainer.model_copy(
         update={
             "batch_size": int(trial.suggest_categorical("batch_size", list(search.batch_size))),
-            "cluster_weight": suggest_float_range(trial, "cluster_weight", search.cluster_weight),
             "gmm_init_iters": int(
                 trial.suggest_categorical("gmm_init_iters", list(search.gmm_init_iters))
             ),
             "learning_rate": suggest_float_range(trial, "learning_rate", search.learning_rate),
-            "survival_weight": suggest_float_range(
-                trial,
-                "survival_weight",
-                search.survival_weight,
-            ),
             "warmup_epochs": int(
                 trial.suggest_int(
                     "warmup_epochs",

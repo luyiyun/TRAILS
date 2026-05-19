@@ -23,8 +23,6 @@ OPTIM_PARAM_NAMES = (
     "survival_head_hidden_layers",
     "learning_rate",
     "batch_size",
-    "survival_weight",
-    "cluster_weight",
     "warmup_epochs",
     "gmm_init_iters",
 )
@@ -135,15 +133,9 @@ class OptimSearchSpaceConfig(BaseModel):
     )
     survival_head_hidden_layers: tuple[int, ...] = Field(default=(0, 1, 2), min_length=1)
     batch_size: tuple[int, ...] = Field(default=(128, 256, 512), min_length=1)
-    cluster_weight: FloatSearchRangeConfig = Field(
-        default_factory=lambda: FloatSearchRangeConfig(low=0.005, high=0.5, log=True)
-    )
     gmm_init_iters: tuple[int, ...] = Field(default=(10, 20, 50), min_length=1)
     learning_rate: FloatSearchRangeConfig = Field(
         default_factory=lambda: FloatSearchRangeConfig(low=1e-4, high=3e-2, log=True)
-    )
-    survival_weight: FloatSearchRangeConfig = Field(
-        default_factory=lambda: FloatSearchRangeConfig(low=0.05, high=1.0, log=True)
     )
     warmup_epochs: IntSearchRangeConfig = Field(
         default_factory=lambda: IntSearchRangeConfig(low=0, high=5)

@@ -65,6 +65,25 @@ class DecoderConfig(BaseModel):
         return self
 
 
+class LossConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    weighting: Literal["uncertainty", "fixed"] = "uncertainty"
+    reconstruction_weight: float = Field(default=1.0, ge=0.0)
+    survival_weight: float = Field(default=0.2, ge=0.0)
+    cluster_weight: float = Field(default=0.05, ge=0.0)
+
+    @model_validator(mode="after")
+    def validate_uncertainty_initial_weights(self) -> LossConfig:
+        if self.weighting == "uncertainty" and (
+            self.reconstruction_weight <= 0.0
+            or self.survival_weight <= 0.0
+            or self.cluster_weight <= 0.0
+        ):
+            raise ValueError("Uncertainty loss weighting requires all initial weights > 0.")
+        return self
+
+
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -72,6 +91,7 @@ class ModelConfig(BaseModel):
     n_clusters: int = Field(default=3, gt=1)
     dropout: float = Field(default=0.0, ge=0.0, lt=1.0)
     survival_head_hidden_layers: int = Field(default=0, ge=0)
+    loss: LossConfig = Field(default_factory=LossConfig)
     encoder: EncoderConfig = Field(default_factory=EncoderConfig)
     decoder: DecoderConfig = Field(default_factory=DecoderConfig)
 
@@ -82,9 +102,6 @@ class TrainerConfig(BaseModel):
     max_epochs: int = Field(default=10, gt=0)
     batch_size: int = Field(default=16, gt=0)
     learning_rate: float = Field(default=1e-3, gt=0.0)
-    reconstruction_weight: float = Field(default=1.0, ge=0.0)
-    survival_weight: float = Field(default=0.2, ge=0.0)
-    cluster_weight: float = Field(default=0.05, ge=0.0)
     warmup_epochs: int = Field(default=1, ge=0)
     gmm_init_iters: int = Field(default=20, ge=0)
     gradient_clip_norm: float | None = Field(default=5.0, gt=0.0)
