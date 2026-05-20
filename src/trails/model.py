@@ -38,12 +38,12 @@ class TrailsLossBreakdown:
     reconstruction_loss_weight: Tensor
     survival_loss_weight: Tensor
     vade_kl_loss_weight: Tensor
-    # reconstruction_log_variance: Tensor | None = None
-    # survival_log_variance: Tensor | None = None
-    # vade_kl_log_variance: Tensor | None = None
+    reconstruction_log_variance: Tensor | None = None
+    survival_log_variance: Tensor | None = None
+    vade_kl_log_variance: Tensor | None = None
 
     def items(self) -> tuple[tuple[str, Tensor], ...]:
-        values: list[tuple[str, Tensor]] = [
+        values: list[tuple[str, Tensor | None]] = [
             ("loss", self.loss),
             ("reconstruction_loss", self.reconstruction_loss),
             ("survival_loss", self.survival_loss),
@@ -51,9 +51,9 @@ class TrailsLossBreakdown:
             ("reconstruction_loss_weight", self.reconstruction_loss_weight),
             ("survival_loss_weight", self.survival_loss_weight),
             ("vade_kl_loss_weight", self.vade_kl_loss_weight),
-            # ("reconstruction_log_variance", self.reconstruction_log_variance),
-            # ("survival_log_variance", self.survival_log_variance),
-            # ("vade_kl_log_variance", self.vade_kl_log_variance),
+            ("reconstruction_log_variance", self.reconstruction_log_variance),
+            ("survival_log_variance", self.survival_log_variance),
+            ("vade_kl_log_variance", self.vade_kl_log_variance),
         ]
         return tuple((name, value) for name, value in values if value is not None)
 
@@ -735,6 +735,9 @@ class TrailsSurvVaderModel(nn.Module):
             reconstruction_loss_weight=reconstruction_weight,
             survival_loss_weight=survival_weight,
             vade_kl_loss_weight=vade_kl_weight,
+            reconstruction_log_variance=self.loss_log_variances["reconstruction"],
+            survival_log_variance=self.loss_log_variances["survival"],
+            vade_kl_log_variance=(self.loss_log_variances["vade_kl"] if include_vade_kl else None),
         )
 
     def _uncertainty_weighted_loss(self, name: str, loss: Tensor) -> Tensor:

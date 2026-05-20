@@ -143,6 +143,10 @@ class TrailsTrainer:
         outputs, _batch = self._collect_outputs(data)
         return outputs.cluster_probabilities.cpu()
 
+    def predict_risk(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        outputs, _batch = self._collect_outputs(data)
+        return self._risk_score(outputs).cpu()
+
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
         loader = make_data_loader(data, self.config, shuffle=False)
         survival_metrics: dict[str, Metric] = {"cindex": Cindex()}

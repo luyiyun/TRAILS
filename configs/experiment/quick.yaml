@@ -1,5 +1,0 @@
-name: quick
-repeats: 1
-train_size: 64
-test_size: 24
-seed: 20260517

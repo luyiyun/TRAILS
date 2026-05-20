@@ -14,7 +14,7 @@ items.
 ## Layout
 
 - `main.py`: all CLI commands. Use `uv run main.py ...`.
-- `configs/`: Hydra experiment configuration and reusable scenarios.
+- `configs/`: Hydra simulation/training configuration and reusable scenarios.
 - `src/trails/`: reusable core code: data, model, trainer, estimator, metrics.
 - `src/trails_simulate/`: synthetic clinical data generation; imports `trails`.
 - `src/trails_case/`: future real-data/case-study utilities; imports `trails`.
@@ -40,11 +40,12 @@ clean reusable method library.
 
 ## Commands
 
-- Quick end-to-end experiment: `uv run main.py scenario=quick`
-- Normal SwanLab tuning run: `uv run main.py scenario=debug trainer.max_epochs=5 swanlab.mode=disabled`
-- Formal repeated experiment: `uv run main.py scenario=formal_5x`
+- Quick simulation split generation: `uv run main.py scenario=quick`
+- Normal SwanLab tuning run: `uv run main.py command=train scenario=debug paths.data_root=data/simulated/debug training.trainer.max_epochs=5 training.swanlab.mode=disabled`
+- Formal repeated simulation: `uv run main.py scenario=formal_5x`
 - Simulate only: `uv run main.py command=simulate scenario=quick paths.data_root=data/simulated/quick`
 - Train existing splits: `uv run main.py command=train scenario=quick paths.data_root=data/simulated/quick`
+- Run lightweight baselines on existing splits: `uv run main.py command=baseline scenario=quick paths.data_root=data/simulated/quick`
 - Format: `uv run ruff format`
 - Lint: `uv run ruff check --fix`
 - Type check: `UV_CACHE_DIR=/tmp/uv-cache uv run pyright`
@@ -53,7 +54,7 @@ clean reusable method library.
 ## Coding Rules
 
 - Use Python and uv.
-- Use Hydra YAML plus CLI overrides for experiment parameters; do not reintroduce
+- Use Hydra YAML plus CLI overrides for simulation parameters; do not reintroduce
   Makefile experiment wrappers.
 - All new Python code must have type annotations.
 - `pyright` uses `standard` mode.
@@ -72,16 +73,22 @@ clean reusable method library.
 
 - Package name: `trails`.
 - CLI lives only in root `main.py`; no package console script is configured.
-- `main.py` is a Hydra app. Default `command=experiment` generates split
-  simulation data and trains once per repeat.
+- `main.py` is a Hydra app. Default `command=simulate` generates train/test
+  split simulation data. Training and baseline comparison are separate commands.
 - Common scenarios live under `configs/scenario/`: `quick`,
   `debug`, and `formal_5x`.
-- `experiment.repeats` means paired repeats: each repeat generates one source
-  simulation dataset, splits it into train/test, and trains on that pair.
-- Repeat seeds use `experiment.seed + repeat_index`; the same repeat seed drives
-  source simulation, train/test split shuffling, and model training.
-- Validation data is cut internally from `train.pt` by `trainer.valid_size` and
-  is not saved as a separate `val.pt` by `command=experiment`.
+- Command-level config namespaces are `simulation`, `training`, `baseline`,
+  `optim`, and shared `paths`; generator parameters live under
+  `simulation.generator`, while TRAILS model/trainer/artifacts/diagnostics/SwanLab
+  parameters live under `training`.
+- `simulation.repeats` means paired split repeats: each repeat generates one
+  source simulation dataset and splits it into train/test.
+- Generator instantiation fixes DGP mechanism parameters using
+  `simulation.mechanism_seed` when set, otherwise `simulation.seed`; repeat sample
+  seeds use `simulation.seed + repeat_index` for patient draws, train/test split
+  shuffling, and downstream model training.
+- Validation data is cut internally from `train.pt` by `training.trainer.valid_size` and
+  is not saved as a separate `val.pt`.
 - Hydra outputs go under `outputs/` by default and are ignored by git.
 - Simulation uses a VaDeSC-EHR-style latent-cluster generator adapted to
   continuous asynchronous clinical measurements.
@@ -104,6 +111,12 @@ clean reusable method library.
   number of latent-width hidden layers before the Weibull output.
 - Validation and test metrics include ARI/NMI only when true cluster labels are
   available; test metrics also report predicted-cluster occupancy diagnostics.
+- Train and baseline commands save unified prediction payloads under
+  `predictions/<run_id>/`, plus command-level metrics CSV and summary JSON.
+- `command=baseline` lives in `trails_simulate` and runs lightweight simulation
+  comparators on existing train/test splits: summary-feature k-means and
+  risk-stratified summary-feature k-means. It writes baseline summary JSON and
+  metrics CSV under the Hydra run directory.
 
 ## Verification
 

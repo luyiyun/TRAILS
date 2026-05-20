@@ -1,0 +1,7 @@
+methods:
+  - summary_kmeans
+  - risk_stratified_kmeans
+n_clusters: null
+kmeans_iters: 50
+ridge_alpha: 1.0
+risk_feature_weight: 1.0

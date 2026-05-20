@@ -64,7 +64,6 @@ def strip_cluster_labels(data: ClinicalTimeSeriesDataset) -> ClinicalTimeSeriesD
 
 def simulate_dataset(seed: int) -> ClinicalTimeSeriesDataset:
     config = ClinicalTimeSeriesDatasetGeneratorConfig(
-        patients=8,
         n_clusters=2,
         min_visits=3,
         max_visits=5,
@@ -72,7 +71,10 @@ def simulate_dataset(seed: int) -> ClinicalTimeSeriesDataset:
         latent_dim=4,
         attention_layers=2,
     )
-    return ClinicalTimeSeriesDatasetGenerator(config).simulate(seed=seed)
+    return ClinicalTimeSeriesDatasetGenerator(config, mechanism_seed=seed).simulate(
+        n_patients=8,
+        seed=seed,
+    )
 
 
 def test_estimator_fit_predict_test() -> None:

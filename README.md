@@ -33,7 +33,7 @@ Dataset 的 `metadata` 会保留 `latent_z`、`cluster_means`、`cluster_covaria
 
 ## 命令
 
-实验入口使用 Hydra 配置。默认命令是从模拟到训练的一体化重复实验：
+实验入口使用 Hydra 配置。默认命令是生成模拟 train/test split：
 
 ```bash
 uv run main.py scenario=quick
@@ -43,16 +43,21 @@ uv run main.py scenario=quick
 
 ```bash
 uv run main.py scenario=quick
-uv run main.py scenario=debug trainer.max_epochs=5 swanlab.mode=disabled
+uv run main.py scenario=debug training.trainer.max_epochs=5 training.swanlab.mode=disabled
 uv run main.py scenario=formal_5x
 ```
 
 所有参数都可以通过 Hydra 覆盖，例如：
 
 ```bash
-uv run main.py scenario=formal_5x experiment.repeats=10
-uv run main.py scenario=quick experiment.train_size=128 experiment.test_size=32 trainer.max_epochs=10
+uv run main.py scenario=formal_5x simulation.repeats=10
+uv run main.py scenario=quick simulation.train_size=128 simulation.test_size=32
+uv run main.py scenario=quick simulation.generator.n_clusters=4 training.model.n_clusters=4
 ```
+
+`simulation.generator` 控制数据生成机制；`simulation.mechanism_seed` 不设置时默认使用
+`simulation.seed`。同一个 simulate run 的多组 repeat 会复用同一个生成器机制，只用
+`simulation.seed + repeat_index` 改变患者样本抽样。
 
 单独生成模拟数据：
 
@@ -66,35 +71,44 @@ uv run main.py command=simulate scenario=quick paths.data_root=data/simulated/qu
 uv run main.py command=train scenario=quick paths.data_root=data/simulated/quick
 ```
 
-训练单个 `.pt` 数据集：
+训练显式指定的 train/test `.pt` 数据：
 
 ```bash
-uv run main.py command=train scenario=quick paths.data=data/simulated/demo.pt
+uv run main.py command=train scenario=quick paths.data=data/simulated/train.pt paths.test_data=data/simulated/test.pt
 ```
 
-每次 Hydra run 默认保存到 `outputs/<scenario>/<timestamp>/`。`command=experiment`
-会在 run 目录下创建 `repeat_000/`、`repeat_001/` 等子目录；每个 repeat
-先生成一个同一 DGP 下的 source dataset，再切分保存为 `data/train.pt` 和
-`data/test.pt`；validation 由 trainer 从 `train.pt` 内部按 `trainer.valid_size`
-切出，不单独落盘。每个 repeat 还会保存训练 artifacts。
-run 根目录会额外保存 `experiment_summary.json`、`test_metrics.csv` 和
-`test_metrics_summary.json`。
+对已有 train/test split 运行轻量基线方法：
+
+```bash
+uv run main.py command=baseline scenario=quick paths.data_root=data/simulated/quick
+```
+
+每次 Hydra run 默认保存到 `outputs/<scenario>/<timestamp>/`。`command=simulate`
+会在 `paths.data_root` 下保存 `train.pt` 和 `test.pt`；当 `simulation.repeats > 1`
+时，会保存为 `repeat_000/train.pt`、`repeat_000/test.pt` 等成组 split。validation
+仍由 trainer 从 `train.pt` 内部按 `training.trainer.valid_size` 切出，不单独落盘。
+
+`command=train` 会在 Hydra run 目录下保存 `train_summary.json`、`train_metrics.csv`
+和 `predictions/<run_id>/trails.pt`。`command=baseline` 会保存
+`baseline_summary.json`、`baseline_metrics.csv` 和
+`predictions/<run_id>/<method>.pt`，用于比较 summary-feature KMeans 与
+risk-stratified summary-feature KMeans 两个轻量模拟基线。
 
 命令结束时 stdout 会打印精简的可读 summary；完整机器可读结果保存在上述
 JSON/CSV artifacts 中。
 
-可以用 `artifacts.names` 控制训练保存内容：
+可以用 `training.artifacts.names` 控制训练保存内容：
 
 ```bash
-uv run main.py scenario=quick 'artifacts.names=[config,history,test,plot]'
-uv run main.py scenario=quick 'artifacts.names=[none]'
+uv run main.py command=train scenario=quick paths.data_root=data/simulated/quick 'training.artifacts.names=[config,history,test,plot]'
+uv run main.py command=train scenario=quick paths.data_root=data/simulated/quick 'training.artifacts.names=[none]'
 ```
 
-SwanLab 由配置控制，重复实验会自动在实验名后追加 `-r000`、`-r001`：
+SwanLab 由配置控制，多组 split 训练会自动在实验名后追加 run id：
 
 ```bash
-uv run main.py scenario=debug swanlab.mode=disabled
-uv run main.py scenario=formal_5x swanlab.enabled=true swanlab.experiment=formal-debug
+uv run main.py command=train scenario=debug paths.data_root=data/simulated/debug training.swanlab.mode=disabled
+uv run main.py command=train scenario=formal_5x paths.data_root=data/simulated/formal training.swanlab.enabled=true training.swanlab.experiment=formal-debug
 ```
 
 目前所有命令行都集中在根目录 `main.py`。`trails` 主包只包含核心方法代码；

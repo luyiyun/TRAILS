@@ -1,13 +1,8 @@
 # @package _global_
 
 defaults:
-  - override /experiment: optim
-  - override /simulator: debug
-  - override /model: debug
-  - override /trainer: debug
-  - override /artifacts: none
-  - override /diagnostics: disabled
-  - override /swanlab: optim
+  - override /simulation: optim
+  - override /training: optim
   - override /optim: formal
 
 command: optim

@@ -12,6 +12,14 @@ class TrainPaths:
     save: Path | None
 
 
+@dataclass(frozen=True)
+class DatasetRunPaths:
+    run_id: str
+    data_root: Path
+    train_data: Path
+    test_data: Path
+
+
 def optional_split_path(
     explicit_path: Path | None,
     data_root_path: Path | None,
@@ -62,14 +70,32 @@ def repeat_checkpoint_path(
     project_root: Path,
     index: int,
 ) -> Path | None:
-    if config.artifacts.save is None:
+    if config.training.artifacts.save is None:
         return None
-    configured = resolve_path(config.artifacts.save, project_root)
-    if config.experiment.repeats == 1:
+    configured = resolve_path(config.training.artifacts.save, project_root)
+    if config.simulation.repeats == 1:
         return configured
     suffix = configured.suffix
     stem = configured.stem if suffix else configured.name
     return repeat_dir / "train" / f"{stem}-r{index:03d}{suffix}"
+
+
+def checkpoint_path_for_run(
+    config: ApplicationConfig,
+    *,
+    hydra_run_dir: Path,
+    project_root: Path,
+    run_id: str,
+    n_runs: int,
+) -> Path | None:
+    if config.training.artifacts.save is None:
+        return None
+    configured = resolve_path(config.training.artifacts.save, project_root)
+    if n_runs == 1:
+        return configured
+    suffix = configured.suffix
+    stem = configured.stem if suffix else configured.name
+    return hydra_run_dir / "train" / run_id / f"{stem}{suffix}"
 
 
 def resolve_path(path: Path, project_root: Path) -> Path:
@@ -101,11 +127,62 @@ def train_paths_from_config(
     test_data = optional_split_path(config.paths.test_data, data_root_path, "test", project_root)
     train_root_path = train_root(config, hydra_run_dir, project_root)
     save = None
-    if config.artifacts.save is not None:
-        save = resolve_path(config.artifacts.save, project_root)
+    if config.training.artifacts.save is not None:
+        save = resolve_path(config.training.artifacts.save, project_root)
     return TrainPaths(
         data=data_path,
         test_data=test_data,
         train_root=train_root_path,
         save=save,
     )
+
+
+def discover_dataset_runs(
+    config: ApplicationConfig,
+    hydra_run_dir: Path,
+    project_root: Path,
+) -> list[DatasetRunPaths]:
+    if config.paths.data is not None:
+        if config.paths.test_data is None:
+            raise ValueError("Split commands require paths.test_data=... when paths.data is set.")
+        data_path = resolve_path(config.paths.data, project_root)
+        test_path = resolve_path(config.paths.test_data, project_root)
+        return [
+            DatasetRunPaths(
+                run_id="single",
+                data_root=data_path.parent,
+                train_data=data_path,
+                test_data=test_path,
+            )
+        ]
+
+    root = data_root(config, hydra_run_dir, project_root)
+    single_train = root / "train.pt"
+    single_test = root / "test.pt"
+    if single_train.exists() and single_test.exists():
+        return [
+            DatasetRunPaths(
+                run_id="single",
+                data_root=root,
+                train_data=single_train,
+                test_data=single_test,
+            )
+        ]
+
+    repeat_roots = sorted(path for path in root.glob("repeat_*") if path.is_dir())
+    runs = [
+        DatasetRunPaths(
+            run_id=repeat_root.name,
+            data_root=repeat_root,
+            train_data=repeat_root / "train.pt",
+            test_data=repeat_root / "test.pt",
+        )
+        for repeat_root in repeat_roots
+        if (repeat_root / "train.pt").exists() and (repeat_root / "test.pt").exists()
+    ]
+    if not runs:
+        raise ValueError(
+            "Could not find train/test split data. Expected train.pt and test.pt under "
+            f"{root} or under repeat_* subdirectories."
+        )
+    return runs

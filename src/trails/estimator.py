@@ -46,6 +46,10 @@ class TrailsEstimator:
         self._validate_data_config(data)
         return self.trainer.predict_proba(data)
 
+    def predict_risk(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        self._validate_data_config(data)
+        return self.trainer.predict_risk(data)
+
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
         self._validate_data_config(data)
         return self.trainer.test(data)

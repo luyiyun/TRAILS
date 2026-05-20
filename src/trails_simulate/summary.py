@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping, Sequence
-from pathlib import Path
 from typing import Any
 
 
@@ -12,75 +11,58 @@ def format_run_summary(result: Mapping[str, Any]) -> str:
         return format_simulate_summary(result)
     if command == "train":
         return format_train_summary(result)
-    if command == "experiment":
-        return format_experiment_summary(result)
     if command == "optim":
         return format_optim_summary(result)
+    if command == "baseline":
+        return format_baseline_summary(result)
     raise ValueError(f"Unsupported command summary: {command}")
 
 
 def format_simulate_summary(result: Mapping[str, Any]) -> str:
-    lines = ["TRAILS simulate complete", f"Hydra run: {result['hydra_run_dir']}"]
-    if "splits" in result:
-        lines.append(f"Data root: {result['out_dir']}")
+    repeats = [dict(repeat) for repeat in result["repeats"]]
+    outputs = dict(result["outputs"])
+    lines = [
+        "TRAILS simulate complete",
+        f"Hydra run: {result['hydra_run_dir']}",
+        f"Data root: {result['data_root']}",
+        f"Runs: {len(repeats)}",
+        f"Seeds: {format_seed_list([int(repeat['seed']) for repeat in repeats])}",
+        "",
+        "Saved summaries:",
+        f"  summary: {outputs['summary']}",
+    ]
+    if repeats:
         lines.append("")
-        lines.append("Splits:")
-        splits = dict(result["splits"])
-        for name in ("train", "val", "test"):
-            if name not in splits:
-                continue
-            split = dict(splits[name])
+        lines.append("Generated splits:")
+        for repeat in repeats:
+            splits = dict(repeat["splits"])
+            train_split = dict(splits["train"])
+            test_split = dict(splits["test"])
             lines.append(
                 "  "
-                f"{name:<5} patients={split['n_patients']} "
-                f"seed={split['seed']} "
-                f"censoring={format_float(split['censoring_rate'])} "
-                f"path={split['out']}"
+                f"{repeat['run_id']:<10} "
+                f"train={train_split['n_patients']} "
+                f"test={test_split['n_patients']} "
+                f"seed={repeat['seed']} "
+                f"data_root={repeat['data_root']}"
             )
-    else:
-        lines.extend(
-            [
-                f"Dataset: {result['out']}",
-                f"Patients: {result['n_patients']}",
-                f"Clusters: {result['clusters']}",
-                f"Features: {result['n_features']}",
-                f"Seed: {result['seed']}",
-                f"Censoring rate: {format_float(result['censoring_rate'])}",
-            ]
-        )
     return "\n".join(lines)
 
 
 def format_train_summary(result: Mapping[str, Any]) -> str:
-    paths = dict(result["paths"])
+    outputs = dict(result["outputs"])
+    runs = [dict(run) for run in result["runs"]]
     lines = [
         "TRAILS train complete",
         f"Hydra run: {result['hydra_run_dir']}",
-        f"Seed: {result['seed']}",
-        f"Train data: {paths['data']}",
-    ]
-    lines.append(f"Test data: {paths['test_data'] or paths['data']}")
-    lines.append(f"Artifacts: {result['run_dir'] or 'not saved'}")
-    lines.extend(format_metrics_block("Test metrics", dict(result["test"])))
-    return "\n".join(lines)
-
-
-def format_experiment_summary(result: Mapping[str, Any]) -> str:
-    run_dir = Path(str(result["hydra_run_dir"]))
-    repeats = [dict(repeat) for repeat in result["repeats"]]
-    lines = [
-        "TRAILS experiment complete",
-        f"Hydra run: {run_dir}",
-        f"Repeats: {len(repeats)}",
-        f"Seeds: {format_seed_list([int(repeat['seed']) for repeat in repeats])}",
+        f"Runs: {len(runs)}",
         "",
         "Saved summaries:",
-        f"  experiment: {run_dir / 'experiment_summary.json'}",
-        f"  metrics csv: {run_dir / 'test_metrics.csv'}",
-        f"  metrics summary: {run_dir / 'test_metrics_summary.json'}",
+        f"  summary: {outputs['summary']}",
+        f"  metrics csv: {outputs['metrics_csv']}",
     ]
     lines.extend(format_metric_summary_block(dict(result["metrics_summary"])))
-    lines.extend(format_repeat_block(repeats))
+    lines.extend(format_run_results_block(runs))
     return "\n".join(lines)
 
 
@@ -111,6 +93,33 @@ def format_optim_summary(result: Mapping[str, Any]) -> str:
             metric_text = format_optim_objectives(values)
             param_text = format_optim_params(params)
             lines.append(f"  trial {trial['number']:<4} {metric_text} {param_text}")
+    return "\n".join(lines)
+
+
+def format_baseline_summary(result: Mapping[str, Any]) -> str:
+    outputs = dict(result["outputs"])
+    baseline = dict(result["baseline"])
+    runs = [dict(run) for run in result["runs"]]
+    lines = [
+        "TRAILS baseline complete",
+        f"Hydra run: {result['hydra_run_dir']}",
+        f"Runs: {len(runs)}",
+        f"Clusters: {baseline['n_clusters_resolved']}",
+        "",
+        "Saved summaries:",
+        f"  summary: {outputs['summary']}",
+        f"  metrics csv: {outputs['metrics_csv']}",
+    ]
+    lines.extend(format_metric_summary_block(dict(result["metrics_summary"])))
+    if runs:
+        lines.append("")
+        lines.append("Baseline results:")
+        for run in runs:
+            for method in list(run["methods"]):
+                method_result = dict(method)
+                metrics = dict(method_result["metrics"])
+                metric_text = format_inline_metrics(metrics)
+                lines.append(f"  {run['run_id']:<10} {method_result['method']:<24} {metric_text}")
     return "\n".join(lines)
 
 
@@ -177,24 +186,28 @@ def format_metric_summary_block(summary: Mapping[str, Any]) -> list[str]:
     return lines
 
 
-def format_repeat_block(repeats: Sequence[Mapping[str, Any]]) -> list[str]:
-    if not repeats:
+def format_run_results_block(runs: Sequence[Mapping[str, Any]]) -> list[str]:
+    if not runs:
         return []
-    lines = ["", "Repeat results:"]
-    for repeat in repeats:
-        metrics = dict(repeat["metrics"])
-        metric_text = ", ".join(
-            f"{name}={format_float(metrics[name])}"
-            for name in ordered_metric_names(metrics.keys())[:4]
-            if isinstance(metrics.get(name), int | float)
-        )
+    lines = ["", "Run results:"]
+    for run in runs:
+        metrics = dict(run["metrics"])
+        metric_text = format_inline_metrics(metrics)
         lines.append(
             "  "
-            f"{repeat['repeat']} seed={repeat['seed']} "
+            f"{run['run_id']} seed={run['seed']} "
             f"{metric_text} "
-            f"artifacts={repeat['train_run_dir'] or 'not saved'}"
+            f"prediction={run['prediction_path']}"
         )
     return lines
+
+
+def format_inline_metrics(metrics: Mapping[str, Any]) -> str:
+    return ", ".join(
+        f"{name}={format_float(metrics[name])}"
+        for name in ordered_metric_names(metrics.keys())[:4]
+        if isinstance(metrics.get(name), int | float)
+    )
 
 
 def ordered_metric_names(names: Iterable[str]) -> list[str]:

@@ -44,7 +44,6 @@ def simulate_dataset(
     censoring_rate: float = 0.3,
 ) -> ClinicalTimeSeriesDataset:
     config = ClinicalTimeSeriesDatasetGeneratorConfig(
-        patients=patients,
         n_clusters=n_clusters,
         min_visits=min_visits,
         max_visits=max_visits,
@@ -53,7 +52,10 @@ def simulate_dataset(
         attention_layers=attention_layers,
         censoring_rate=censoring_rate,
     )
-    return ClinicalTimeSeriesDatasetGenerator(config).simulate(seed=seed)
+    return ClinicalTimeSeriesDatasetGenerator(config, mechanism_seed=seed).simulate(
+        n_patients=patients,
+        seed=seed,
+    )
 
 
 def test_clinical_dataset_and_collate_shapes() -> None:
@@ -105,6 +107,98 @@ def test_dataset_split_counts_preserves_sizes_and_metadata() -> None:
     assert test.metadata["sequence_lengths"].shape[0] == 2
     assert torch.allclose(train.metadata["cluster_means"], dataset.metadata["cluster_means"])
     assert torch.allclose(test.metadata["cluster_means"], dataset.metadata["cluster_means"])
+
+
+def test_generator_reuses_mechanism_across_sample_seeds() -> None:
+    config = ClinicalTimeSeriesDatasetGeneratorConfig(
+        n_clusters=2,
+        min_visits=3,
+        max_visits=5,
+        hidden_size=12,
+        latent_dim=4,
+        attention_layers=1,
+    )
+    generator = ClinicalTimeSeriesDatasetGenerator(config, mechanism_seed=101)
+
+    first = generator.simulate(n_patients=8, seed=201)
+    second = generator.simulate(n_patients=8, seed=202)
+
+    assert torch.allclose(first.metadata["cluster_means"], second.metadata["cluster_means"])
+    assert torch.allclose(
+        first.metadata["survival_coefficients"],
+        second.metadata["survival_coefficients"],
+    )
+    assert first.metadata["generation_params"]["sample_seed"] == 201
+    assert second.metadata["generation_params"]["sample_seed"] == 202
+    assert not torch.allclose(first.metadata["latent_z"], second.metadata["latent_z"])
+
+
+def test_generator_is_reproducible_with_same_mechanism_and_sample_seed() -> None:
+    config = ClinicalTimeSeriesDatasetGeneratorConfig(
+        n_clusters=2,
+        min_visits=3,
+        max_visits=5,
+        hidden_size=12,
+        latent_dim=4,
+        attention_layers=1,
+    )
+
+    first = ClinicalTimeSeriesDatasetGenerator(config, mechanism_seed=101).simulate(
+        n_patients=8,
+        seed=201,
+    )
+    second = ClinicalTimeSeriesDatasetGenerator(config, mechanism_seed=101).simulate(
+        n_patients=8,
+        seed=201,
+    )
+
+    assert torch.allclose(first.metadata["cluster_means"], second.metadata["cluster_means"])
+    assert torch.allclose(first.metadata["latent_z"], second.metadata["latent_z"])
+    for index in range(len(first)):
+        first_sample = first[index]
+        second_sample = second[index]
+        assert torch.allclose(first_sample.times, second_sample.times)
+        assert torch.allclose(first_sample.x, second_sample.x)
+        assert torch.allclose(first_sample.mask, second_sample.mask)
+        assert torch.allclose(first_sample.survival_time, second_sample.survival_time)
+        assert torch.allclose(first_sample.event, second_sample.event)
+
+
+def test_generator_mechanism_seed_changes_mechanism_parameters() -> None:
+    config = ClinicalTimeSeriesDatasetGeneratorConfig(
+        n_clusters=2,
+        min_visits=3,
+        max_visits=5,
+        hidden_size=12,
+        latent_dim=4,
+        attention_layers=1,
+    )
+
+    first = ClinicalTimeSeriesDatasetGenerator(config, mechanism_seed=101).simulate(
+        n_patients=8,
+        seed=201,
+    )
+    second = ClinicalTimeSeriesDatasetGenerator(config, mechanism_seed=102).simulate(
+        n_patients=8,
+        seed=201,
+    )
+
+    assert not torch.allclose(first.metadata["cluster_means"], second.metadata["cluster_means"])
+
+
+def test_generator_rejects_patient_count_not_exceeding_clusters() -> None:
+    config = ClinicalTimeSeriesDatasetGeneratorConfig(
+        n_clusters=3,
+        min_visits=3,
+        max_visits=5,
+        hidden_size=12,
+        latent_dim=4,
+        attention_layers=1,
+    )
+    generator = ClinicalTimeSeriesDatasetGenerator(config, mechanism_seed=101)
+
+    with pytest.raises(ValueError, match="n_patients must be greater than n_clusters"):
+        generator.simulate(n_patients=3, seed=201)
 
 
 def test_unlabeled_dataset_collates_without_cluster_labels() -> None:

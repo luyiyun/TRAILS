@@ -1,12 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /experiment: formal_5x
-  - override /simulator: debug
-  - override /model: formal_5x
-  - override /trainer: formal_5x
-  - override /artifacts: all
-  - override /diagnostics: disabled
-  - override /swanlab: formal_5x
+  - override /simulation: formal_5x
+  - override /training: formal_5x
 
-command: experiment
+command: simulate

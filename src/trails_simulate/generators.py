@@ -11,7 +11,6 @@ from trails.data import ClinicalSample, ClinicalTimeSeriesDataset, make_clinical
 
 from .utils import (
     _low_rank_matrix,
-    _random_nonlin_map,
     _random_spd_matrix,
     _sample_latent_profiles,
     _sequence_mask,
@@ -36,7 +35,6 @@ DEFAULT_FEATURE_NAMES = [
 class ClinicalTimeSeriesDatasetGeneratorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    patients: int = 128
     n_clusters: int = Field(default=3, gt=1)
     min_visits: int = Field(default=4, gt=0)
     max_visits: int = Field(default=8, gt=0)
@@ -51,11 +49,10 @@ class ClinicalTimeSeriesDatasetGeneratorConfig(BaseModel):
     beta_low: float = -2.5
     beta_high: float = 2.5
     feature_names: list[str] = Field(default_factory=lambda: list(DEFAULT_FEATURE_NAMES))
+    mechanism_seed: int = 20260517
 
     @model_validator(mode="after")
     def check_config(self) -> Self:
-        if self.patients <= self.n_clusters:
-            raise ValueError("each patients value must be greater than n_clusters.")
         if self.max_visits < self.min_visits:
             raise ValueError("max_visits must be greater than or equal to min_visits.")
         if self.attention_heads is not None and (
@@ -71,106 +68,144 @@ class ClinicalTimeSeriesDatasetGeneratorConfig(BaseModel):
 class ClinicalTimeSeriesDatasetGenerator:
     def __init__(self, config: ClinicalTimeSeriesDatasetGeneratorConfig):
         self.config = config
+        self.mechanism_seed = self.config.mechanism_seed
+        mechanism_generator = torch.Generator().manual_seed(self.mechanism_seed)
+        self.resolved_attention_heads = config.attention_heads or _default_attention_heads(
+            config.hidden_size
+        )
+        n_features = len(config.feature_names)
 
-    def simulate(self, seed: int = 2026) -> ClinicalTimeSeriesDataset:
+        # 机制参数在实例化时固定；simulate 只改变样本抽样随机性。
+        self.cluster_prior = torch.ones(config.n_clusters, dtype=torch.float32) / config.n_clusters
+        self.cluster_means = _uniform(
+            (config.n_clusters, config.latent_dim),
+            config.x_low,
+            config.x_high,
+            mechanism_generator,
+        )
+        self.cluster_covariances = torch.stack(
+            [
+                _random_spd_matrix(config.latent_dim, mechanism_generator)
+                for _cluster in range(config.n_clusters)
+            ]
+        )
+        self.survival_coefficients = _uniform(
+            (config.n_clusters, config.latent_dim),
+            config.beta_low,
+            config.beta_high,
+            mechanism_generator,
+        )
+        self.survival_intercepts = _uniform(
+            (config.n_clusters,),
+            config.beta_low,
+            config.beta_high,
+            mechanism_generator,
+        )
+        self.profile_weight = _low_rank_matrix(
+            config.latent_dim,
+            config.hidden_size * config.max_visits,
+            mechanism_generator,
+        )
+        self.attention_weights = [
+            (
+                _low_rank_matrix(config.hidden_size, config.hidden_size, mechanism_generator),
+                _low_rank_matrix(config.hidden_size, config.hidden_size, mechanism_generator),
+                _low_rank_matrix(config.hidden_size, config.hidden_size, mechanism_generator),
+            )
+            for _layer in range(config.attention_layers)
+        ]
+        decoder_intermediate_size = max(config.hidden_size // 2, n_features)
+        self.decoder_weight_1 = _low_rank_matrix(
+            config.hidden_size,
+            decoder_intermediate_size,
+            mechanism_generator,
+        )
+        self.decoder_weight_2 = _low_rank_matrix(
+            decoder_intermediate_size,
+            n_features,
+            mechanism_generator,
+        )
+        self.feature_location = torch.linspace(-0.8, 0.8, n_features)
+        self.feature_scale = torch.linspace(0.6, 1.6, n_features)
+
+    def simulate(
+        self,
+        n_patients: int,
+        seed: int = 2026,
+    ) -> ClinicalTimeSeriesDataset:
+        if n_patients <= self.config.n_clusters:
+            raise ValueError("n_patients must be greater than n_clusters.")
+
         generator = torch.Generator().manual_seed(seed)
-
         names = self.config.feature_names
-        n_features = len(names)
-        resolved_attention_heads = self.config.attention_heads or _default_attention_heads(
-            self.config.hidden_size
-        )
 
-        # 1. VaDeSC-EHR 风格的均匀 cluster prior 与 cluster-specific latent profile。
-        cluster_prior = (
-            torch.ones(self.config.n_clusters, dtype=torch.float32) / self.config.n_clusters
-        )
+        # 1. 固定机制参数下抽取本批患者的 cluster 与 latent profile。
         cluster_labels = torch.multinomial(
-            cluster_prior,
-            num_samples=self.config.patients,
+            self.cluster_prior,
+            num_samples=n_patients,
             replacement=True,
             generator=generator,
         )
-        cluster_means = _uniform(
-            (self.config.n_clusters, self.config.latent_dim),
-            self.config.x_low,
-            self.config.x_high,
-            generator,
-        )
-        cluster_covariances = torch.stack(
-            [
-                _random_spd_matrix(self.config.latent_dim, generator)
-                for _cluster in range(self.config.n_clusters)
-            ]
-        )
-
         latent_z = _sample_latent_profiles(
             cluster_labels=cluster_labels,
-            cluster_means=cluster_means,
-            cluster_covariances=cluster_covariances,
+            cluster_means=self.cluster_means,
+            cluster_covariances=self.cluster_covariances,
             generator=generator,
         )
 
-        # 2. 生存变量模拟
-        survival_coefficients = _uniform(
-            (self.config.n_clusters, self.config.latent_dim),
-            self.config.beta_low,
-            self.config.beta_high,
-            generator,
-        )
-        survival_intercepts = _uniform(
-            (self.config.n_clusters,), self.config.beta_low, self.config.beta_high, generator
-        )
+        # 2. 生存变量模拟只使用本次样本 seed；风险机制由 __init__ 固定。
         event_times, events = _sample_survival_times(
             latent_z=latent_z,
             cluster_labels=cluster_labels,
-            survival_coefficients=survival_coefficients,
-            survival_intercepts=survival_intercepts,
+            survival_coefficients=self.survival_coefficients,
+            survival_intercepts=self.survival_intercepts,
             weibull_shape=self.config.weibull_shape,
             censoring_rate=self.config.censoring_rate,
             generator=generator,
         )
 
-        # 3. 随机非线性 profile generator：对应原实现中 Z -> max_pos * hidden_size。
-        hidden_profile = _random_nonlin_map(
-            latent_z,
-            self.config.hidden_size * self.config.max_visits,
-            generator=generator,
-        ).reshape(self.config.patients, self.config.max_visits, self.config.hidden_size)
+        # 3. Z -> patient-level hidden trajectory，映射矩阵固定，患者 latent 抽样变化。
+        hidden_profile = torch.relu(latent_z @ self.profile_weight).reshape(
+            n_patients,
+            self.config.max_visits,
+            self.config.hidden_size,
+        )
         hidden_profile = _standardize_active_profile(hidden_profile)
-
-        # 上面我们模拟得到的是patient-level hidden variable，但是每个patient都是一个
-        # sequence，所以现在我们需要模拟每个patient的sequence length
         sequence_lengths = torch.randint(
             self.config.min_visits,
             self.config.max_visits + 1,
-            size=(self.config.patients,),
+            size=(n_patients,),
             generator=generator,
         )
         visit_mask = _sequence_mask(sequence_lengths, self.config.max_visits)
         hidden_profile = hidden_profile * visit_mask.unsqueeze(-1)
 
-        # 4. 多层 pseudo attention：保留原模拟器“随机注意力层 + 残差”的结构。
-        for _layer in range(self.config.attention_layers):
+        # 4. pseudo-attention 的权重固定，保留原模拟器的非线性轨迹扰动。
+        for query_weight, key_weight, value_weight in self.attention_weights:
             attention_output = _pseudo_attention(
                 hidden_profile,
                 visit_mask,
                 hidden_size=self.config.hidden_size,
-                attention_heads=resolved_attention_heads,
-                generator=generator,
+                attention_heads=self.resolved_attention_heads,
+                query_weight=query_weight,
+                key_weight=key_weight,
+                value_weight=value_weight,
             )
             hidden_profile = (hidden_profile + attention_output) * visit_mask.unsqueeze(-1)
 
-        # 5. 连续临床变量 decoder：替换 ICD softmax/argmax，输出多变量检查值。
+        # 5. 连续临床变量 decoder 固定；测量噪声仍由样本 seed 控制。
         true_values = _decode_continuous_clinical_values(
             hidden_profile,
-            n_features=n_features,
+            weight_1=self.decoder_weight_1,
+            weight_2=self.decoder_weight_2,
+            feature_location=self.feature_location,
+            feature_scale=self.feature_scale,
             generator=generator,
         )
 
         # 6. 非同步采样
         samples: list[ClinicalSample] = []
-        for patient_index in range(self.config.patients):
+        for patient_index in range(n_patients):
             seq_len = int(sequence_lengths[patient_index])
             # 检查记录只能发生在患者实际观测终点之前；否则会出现事件/删失后仍有检查的矛盾。
             times = _sample_visit_times(seq_len, event_times[patient_index], generator)
@@ -197,29 +232,31 @@ class ClinicalTimeSeriesDatasetGenerator:
 
         metadata = {
             "generation_params": {
-                "patients": self.config.patients,
+                "n_patients": n_patients,
                 "n_clusters": self.config.n_clusters,
                 "min_visits": self.config.min_visits,
                 "max_visits": self.config.max_visits,
                 "latent_dim": self.config.latent_dim,
                 "hidden_size": self.config.hidden_size,
                 "attention_layers": self.config.attention_layers,
-                "attention_heads": resolved_attention_heads,
+                "attention_heads": self.resolved_attention_heads,
                 "censoring_rate": self.config.censoring_rate,
                 "weibull_shape": self.config.weibull_shape,
                 "x_low": self.config.x_low,
                 "x_high": self.config.x_high,
                 "beta_low": self.config.beta_low,
                 "beta_high": self.config.beta_high,
-                "seed": seed,
+                "mechanism_seed": self.mechanism_seed,
+                "sample_seed": seed,
             },
-            "cluster_prior": cluster_prior,
-            "cluster_means": cluster_means,
-            "cluster_covariances": cluster_covariances,
+            "cluster_prior": self.cluster_prior,
+            "cluster_means": self.cluster_means,
+            "cluster_covariances": self.cluster_covariances,
             "latent_z": latent_z,
-            "survival_coefficients": survival_coefficients,
-            "survival_intercepts": survival_intercepts,
+            "mechanism_parameters": self.mechanism_parameters(),
             "sequence_lengths": sequence_lengths,
+            "survival_coefficients": self.survival_coefficients,
+            "survival_intercepts": self.survival_intercepts,
         }
         return ClinicalTimeSeriesDataset(
             samples,
@@ -231,6 +268,23 @@ class ClinicalTimeSeriesDatasetGenerator:
             metadata=metadata,
         )
 
+    def mechanism_parameters(self) -> dict[str, object]:
+        return {
+            "attention_weights": [
+                {
+                    "key": key_weight,
+                    "query": query_weight,
+                    "value": value_weight,
+                }
+                for query_weight, key_weight, value_weight in self.attention_weights
+            ],
+            "decoder_weight_1": self.decoder_weight_1,
+            "decoder_weight_2": self.decoder_weight_2,
+            "feature_location": self.feature_location,
+            "feature_scale": self.feature_scale,
+            "profile_weight": self.profile_weight,
+        }
+
 
 def _pseudo_attention(
     inputs: Tensor,
@@ -238,13 +292,11 @@ def _pseudo_attention(
     *,
     hidden_size: int,
     attention_heads: int,
-    generator: torch.Generator,
+    query_weight: Tensor,
+    key_weight: Tensor,
+    value_weight: Tensor,
 ) -> Tensor:
     head_size = hidden_size // attention_heads
-    query_weight = _low_rank_matrix(hidden_size, hidden_size, generator)
-    key_weight = _low_rank_matrix(hidden_size, hidden_size, generator)
-    value_weight = _low_rank_matrix(hidden_size, hidden_size, generator)
-
     query = (inputs @ query_weight).reshape(
         inputs.shape[0], inputs.shape[1], attention_heads, head_size
     )
@@ -269,15 +321,12 @@ def _pseudo_attention(
 def _decode_continuous_clinical_values(
     hidden_profile: Tensor,
     *,
-    n_features: int,
+    weight_1: Tensor,
+    weight_2: Tensor,
+    feature_location: Tensor,
+    feature_scale: Tensor,
     generator: torch.Generator,
 ) -> Tensor:
-    hidden_size = int(hidden_profile.shape[-1])
-    intermediate_size = max(hidden_size // 2, n_features)
-    weight_1 = _low_rank_matrix(hidden_size, intermediate_size, generator)
-    weight_2 = _low_rank_matrix(intermediate_size, n_features, generator)
-    feature_location = torch.linspace(-0.8, 0.8, n_features)
-    feature_scale = torch.linspace(0.6, 1.6, n_features)
     raw_values = torch.relu(hidden_profile @ weight_1) @ weight_2
     noise = 0.08 * torch.randn(*raw_values.shape, generator=generator)
     return feature_location + feature_scale * torch.tanh(raw_values) + noise

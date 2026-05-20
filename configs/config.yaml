@@ -1,16 +1,12 @@
 defaults:
   - _self_
-  - experiment: base
-  - simulator: base
-  - model: base
-  - trainer: base
-  - artifacts: all
-  - diagnostics: disabled
-  - swanlab: disabled
+  - simulation: base
+  - training: base
+  - baseline: default
   - optim: default
   - scenario: quick
 
-command: experiment
+command: simulate
 
 paths:
   data_root: null
@@ -22,7 +18,7 @@ hydra:
   job:
     chdir: false
   run:
-    dir: outputs/${experiment.name}/${now:%Y%m%d-%H%M%S-%f}
+    dir: outputs/${simulation.name}/${now:%Y%m%d-%H%M%S-%f}
   sweep:
-    dir: multirun/${experiment.name}/${now:%Y%m%d-%H%M%S-%f}
+    dir: multirun/${simulation.name}/${now:%Y%m%d-%H%M%S-%f}
     subdir: ${hydra.job.num}

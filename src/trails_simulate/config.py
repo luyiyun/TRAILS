@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -9,7 +9,8 @@ from trails.config import ModelConfig, TrainerConfig
 
 from .generators import ClinicalTimeSeriesDatasetGeneratorConfig
 
-Command = Literal["experiment", "simulate", "train", "optim"]
+Command = Literal["baseline", "simulate", "train", "optim"]
+BaselineMethod = Literal["summary_kmeans", "risk_stratified_kmeans"]
 
 OPTIM_PARAM_NAMES = (
     "encoder_input_kind",
@@ -28,7 +29,7 @@ OPTIM_PARAM_NAMES = (
 )
 
 
-class ExperimentConfig(BaseModel):
+class SimulationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = "quick"
@@ -36,6 +37,9 @@ class ExperimentConfig(BaseModel):
     train_size: int = 128
     test_size: int = 64
     seed: int = 20260517
+    generator: ClinicalTimeSeriesDatasetGeneratorConfig = Field(
+        default_factory=ClinicalTimeSeriesDatasetGeneratorConfig
+    )
 
 
 class PathsConfig(BaseModel):
@@ -75,6 +79,35 @@ class SwanLabConfig(BaseModel):
     project: str = "TRAILS"
     experiment: str | None = None
     mode: str | None = None
+
+
+class TrainingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    trainer: TrainerConfig = Field(default_factory=TrainerConfig)
+    artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
+    diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
+    swanlab: SwanLabConfig = Field(default_factory=SwanLabConfig)
+
+
+class BaselineConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    methods: tuple[BaselineMethod, ...] = Field(
+        default=("summary_kmeans", "risk_stratified_kmeans"),
+        min_length=1,
+    )
+    n_clusters: int | None = Field(default=None, gt=1)
+    kmeans_iters: int = Field(default=50, ge=0)
+    ridge_alpha: float = Field(default=1.0, ge=0.0)
+    risk_feature_weight: float = Field(default=1.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def validate_unique_methods(self) -> BaselineConfig:
+        if len(set(self.methods)) != len(self.methods):
+            raise ValueError("baseline.methods cannot contain duplicates.")
+        return self
 
 
 class FloatSearchRangeConfig(BaseModel):
@@ -164,15 +197,9 @@ class OptimConfig(BaseModel):
 class ApplicationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    command: Command = "experiment"
-    experiment: ExperimentConfig = Field(default_factory=ExperimentConfig)
+    command: Command = "simulate"
+    simulation: SimulationConfig = Field(default_factory=SimulationConfig)
+    training: TrainingConfig = Field(default_factory=TrainingConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
-    simulator: ClinicalTimeSeriesDatasetGeneratorConfig = Field(
-        default_factory=ClinicalTimeSeriesDatasetGeneratorConfig
-    )
-    model: ModelConfig = Field(default_factory=ModelConfig)
-    trainer: TrainerConfig = Field(default_factory=TrainerConfig)
-    artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
-    diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
-    swanlab: SwanLabConfig = Field(default_factory=SwanLabConfig)
+    baseline: BaselineConfig = Field(default_factory=BaselineConfig)
     optim: OptimConfig = Field(default_factory=OptimConfig)

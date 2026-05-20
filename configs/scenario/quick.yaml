@@ -1,12 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /experiment: quick
-  - override /simulator: quick
-  - override /model: quick
-  - override /trainer: quick
-  - override /artifacts: quick
-  - override /diagnostics: disabled
-  - override /swanlab: quick
+  - override /simulation: quick
+  - override /training: quick
 
-command: experiment
+command: simulate

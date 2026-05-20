@@ -13,7 +13,6 @@ from trails.data import ClinicalTimeSeriesDataset
 from .config import (
     OPTIM_PARAM_NAMES,
     ApplicationConfig,
-    ArtifactsConfig,
     FloatSearchRangeConfig,
 )
 from .generators import ClinicalTimeSeriesDatasetGenerator
@@ -42,7 +41,7 @@ def run_optim_command(
     validate_optim_test_data(optim_data.test_data)
 
     storage_url = optim_storage_url(config.optim.storage, optim_root, project_root)
-    sampler = optuna.samplers.TPESampler(seed=config.experiment.seed)
+    sampler = optuna.samplers.TPESampler(seed=config.simulation.seed)
     study = optuna.create_study(
         directions=["maximize", "maximize"],
         load_if_exists=True,
@@ -114,7 +113,7 @@ def run_optim_trial(
     train_data: Path,
     test_data: Path,
 ) -> tuple[float, float]:
-    trial_seed = config.experiment.seed + trial.number
+    trial_seed = config.simulation.seed + trial.number
     trial_config = optim_trial_config(config, trial)
     train_paths = TrainPaths(
         data=train_data,
@@ -133,8 +132,8 @@ def run_optim_trial(
 
     trial.set_user_attr("seed", trial_seed)
     trial.set_user_attr("metrics", json_safe_metrics(result.metrics))
-    trial.set_user_attr("model_config", trial_config.model.model_dump(mode="json"))
-    trial.set_user_attr("trainer_config", trial_config.trainer.model_dump(mode="json"))
+    trial.set_user_attr("model_config", trial_config.training.model.model_dump(mode="json"))
+    trial.set_user_attr("trainer_config", trial_config.training.trainer.model_dump(mode="json"))
     return cindex, ari
 
 
@@ -159,12 +158,14 @@ def optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationConf
     set_trial_user_attr(trial, "decoder_conditioning", decoder_conditioning)
     hidden_dim = int(trial.suggest_categorical("hidden_dim", list(search.hidden_dim)))
     n_layers = int(trial.suggest_categorical("n_layers", list(search.n_layers)))
-    encoder_config = config.model.encoder.model_copy(
+    model = config.training.model
+    trainer = config.training.trainer
+    encoder_config = model.encoder.model_copy(
         update={
-            "input": config.model.encoder.input.model_copy(
+            "input": model.encoder.input.model_copy(
                 update={"kind": encoder_input_kind, "hidden_dim": hidden_dim}
             ),
-            "mapping": config.model.encoder.mapping.model_copy(
+            "mapping": model.encoder.mapping.model_copy(
                 update={
                     "kind": encoder_mapping_kind,
                     "hidden_dim": hidden_dim,
@@ -173,7 +174,7 @@ def optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationConf
             ),
         }
     )
-    decoder_config = config.model.decoder.model_copy(
+    decoder_config = model.decoder.model_copy(
         update={
             "kind": decoder_kind,
             "conditioning": decoder_conditioning,
@@ -181,7 +182,7 @@ def optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationConf
             "n_layers": n_layers,
         }
     )
-    model_config = config.model.model_copy(
+    model_config = model.model_copy(
         update={
             "dropout": suggest_float_range(trial, "dropout", search.dropout),
             "encoder": encoder_config,
@@ -195,7 +196,7 @@ def optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationConf
             ),
         }
     )
-    trainer_config = config.trainer.model_copy(
+    trainer_config = trainer.model_copy(
         update={
             "batch_size": int(trial.suggest_categorical("batch_size", list(search.batch_size))),
             "gmm_init_iters": int(
@@ -213,20 +214,27 @@ def optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationConf
     )
 
     # optim 只保留 Optuna bookkeeping，训练过程中的模型、图和诊断产物全部关闭。
-    diagnostics_config = config.diagnostics.model_copy(
+    diagnostics_config = config.training.diagnostics.model_copy(
         update={
-            "latent_embeddings": config.diagnostics.latent_embeddings.model_copy(
+            "latent_embeddings": config.training.diagnostics.latent_embeddings.model_copy(
                 update={"enabled": False}
             )
         }
     )
-    return config.model_copy(
+    training_config = config.training.model_copy(
         update={
-            "artifacts": ArtifactsConfig(names=("none",), save=None),
+            "artifacts": config.training.artifacts.model_copy(
+                update={"names": ("none",), "save": None}
+            ),
             "diagnostics": diagnostics_config,
             "model": model_config,
-            "swanlab": config.swanlab.model_copy(update={"enabled": False}),
+            "swanlab": config.training.swanlab.model_copy(update={"enabled": False}),
             "trainer": trainer_config,
+        }
+    )
+    return config.model_copy(
+        update={
+            "training": training_config,
         }
     )
 
@@ -301,13 +309,13 @@ def optim_data_paths(
             config,
             out=train_data,
             patient_count=train_patients,
-            seed=config.experiment.seed,
+            seed=config.simulation.seed,
         ),
         "test": optim_cached_or_generate_split(
             config,
             out=test_data,
             patient_count=test_patients,
-            seed=config.experiment.seed + 1,
+            seed=config.simulation.seed + 1,
         ),
     }
     return OptimDataPaths(
@@ -326,12 +334,12 @@ def optim_existing_split_summaries(
     return {
         "train": existing_dataset_summary(
             train_data,
-            clusters=config.simulator.n_clusters,
+            clusters=config.simulation.generator.n_clusters,
             default_seed=0,
         ),
         "test": existing_dataset_summary(
             test_data,
-            clusters=config.simulator.n_clusters,
+            clusters=config.simulation.generator.n_clusters,
             default_seed=0,
         ),
     }
@@ -347,7 +355,7 @@ def optim_cached_or_generate_split(
     if out.exists():
         return existing_dataset_summary(
             out,
-            clusters=config.simulator.n_clusters,
+            clusters=config.simulation.generator.n_clusters,
             default_seed=seed,
         )
     return simulate_one_dataset(
@@ -359,7 +367,7 @@ def optim_cached_or_generate_split(
 
 
 def optim_patient_counts(config: ApplicationConfig) -> tuple[int, int]:
-    return config.experiment.train_size, config.experiment.test_size
+    return config.simulation.train_size, config.simulation.test_size
 
 
 def existing_dataset_summary(
@@ -371,7 +379,7 @@ def existing_dataset_summary(
     dataset = ClinicalTimeSeriesDataset.load(path)
     metadata_params = dataset.metadata.get("generation_params")
     if isinstance(metadata_params, Mapping):
-        seed = int(metadata_params.get("seed", default_seed))
+        seed = int(metadata_params.get("sample_seed", metadata_params.get("seed", default_seed)))
         clusters = int(metadata_params.get("n_clusters", clusters))
     else:
         seed = default_seed
@@ -385,12 +393,19 @@ def simulate_one_dataset(
     patient_count: int,
     seed: int,
 ) -> dict[str, Any]:
-    simulator = config.simulator.model_copy(update={"patients": patient_count})
-    dataset = ClinicalTimeSeriesDatasetGenerator(simulator).simulate(seed=seed)
+    mechanism_seed = (
+        config.simulation.seed
+        if config.simulation.mechanism_seed is None
+        else config.simulation.mechanism_seed
+    )
+    dataset = ClinicalTimeSeriesDatasetGenerator(
+        config.simulation.generator,
+        mechanism_seed=mechanism_seed,
+    ).simulate(n_patients=patient_count, seed=seed)
     dataset.save(out)
     return simulation_summary(
         dataset,
-        clusters=simulator.n_clusters,
+        clusters=config.simulation.generator.n_clusters,
         out=out,
         seed=seed,
     )

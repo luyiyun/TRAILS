@@ -1,5 +1,0 @@
-name: optim
-repeats: 1
-train_size: 3000
-test_size: 1000
-seed: 20260517
