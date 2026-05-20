@@ -536,7 +536,7 @@ class TrailsSurvVaderModel(nn.Module):
             dropout=model_config.dropout,
         )
         # VaDE 聚类先验：c ~ Cat(pi), z | c ~ Normal(mu_c, var_c)。
-        self.mixture_logits = nn.Parameter(torch.zeros(model_config.n_clusters))
+        self.mixture_logits = nn.Buffer(torch.zeros(model_config.n_clusters))
         self.mixture_means = nn.Parameter(
             torch.randn(model_config.n_clusters, model_config.latent_dim) * 0.01
         )
@@ -617,7 +617,7 @@ class TrailsSurvVaderModel(nn.Module):
             feature_means=self.feature_means,
         )
         latent_mean = self.latent_mean(hidden)
-        latent_log_variance = self.latent_log_variance(hidden).clamp(min=-8.0, max=8.0)
+        latent_log_variance = self.latent_log_variance(hidden)
         latent = self._sample_latent(latent_mean, latent_log_variance)
         reconstruction = self.decoder(latent, times, sequence_lengths)
         cluster_logits = self._cluster_logits(latent)
@@ -750,7 +750,7 @@ class TrailsSurvVaderModel(nn.Module):
 
     def _component_log_prob(self, latent: Tensor) -> Tensor:
         centered = latent.unsqueeze(1) - self.mixture_means.unsqueeze(0)
-        log_variance = self.mixture_log_variances.unsqueeze(0).clamp(min=-12.0, max=12.0)
+        log_variance = self.mixture_log_variances.unsqueeze(0)
         variance = torch.exp(log_variance)
         log_density = -0.5 * (
             torch.log(torch.tensor(2.0 * torch.pi, device=latent.device, dtype=latent.dtype))

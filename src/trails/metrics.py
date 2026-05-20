@@ -39,7 +39,7 @@ def vade_kl_loss(
 
 
 def gaussian_log_prob(value: Tensor, mean: Tensor, log_variance: Tensor) -> Tensor:
-    clamped_log_variance = log_variance.clamp(min=-12.0, max=12.0)
+    clamped_log_variance = log_variance
     variance = torch.exp(clamped_log_variance)
     log_two_pi = torch.tensor(math.log(2.0 * math.pi), device=value.device, dtype=value.dtype)
     return -0.5 * (log_two_pi + clamped_log_variance + (value - mean).pow(2) / variance)
