@@ -8,7 +8,10 @@ from torchmetrics import Metric
 
 
 def masked_mse(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
-    observed = mask.sum().clamp_min(1.0)
+    # NOTE: 严格按照ELBO的计算公式，后面的部分是x的对数联合似然函数，其实就是单个
+    # x的似然函数之和
+    observed = prediction.shape[0]
+    # observed = mask.sum().clamp_min(1.0)
     return torch.sum(((prediction - target) ** 2) * mask) / observed
 
 
