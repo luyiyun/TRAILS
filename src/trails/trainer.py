@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from itertools import chain
 from typing import Literal, NotRequired, TypedDict
 
 import torch
@@ -96,11 +97,12 @@ class TrailsTrainer:
             self.initialize_mixture_from_data(data)
 
         survival_metrics: dict[str, Metric] = {"cindex": Cindex()}
-        cluster_metrics: dict[str, Metric] = (
-            {"nmi": NormalizedMutualInfoScore(), "ari": AdjustedRandScore()}
-            if validation_data is not None and validation_data.has_cluster_labels
-            else {}
-        )
+        cluster_metrics: dict[str, Metric] = {
+            "nmi": NormalizedMutualInfoScore(),
+            "ari": AdjustedRandScore(),
+        }
+        for v in chain(survival_metrics.values(), cluster_metrics.values()):
+            v.to(self.config.device)
 
         for epoch in tqdm(range(self.config.max_epochs), desc="Epoch"):
             losses, scores = self._epoch_loop(
@@ -108,7 +110,7 @@ class TrailsTrainer:
                 phase="train",
                 include_vade_kl=True,
                 survival_metrics=survival_metrics,
-                cluster_metrics=cluster_metrics,
+                cluster_metrics=cluster_metrics if data.has_cluster_labels else {},
             )
             entry: HistoryEntry = {
                 "epoch": epoch + 1,
@@ -126,7 +128,9 @@ class TrailsTrainer:
                     phase="valid",
                     include_vade_kl=True,
                     survival_metrics=survival_metrics,
-                    cluster_metrics=cluster_metrics,
+                    cluster_metrics=cluster_metrics
+                    if validation_data is not None and validation_data.has_cluster_labels
+                    else {},
                 )
                 entry["valid"] = {**losses, **scores}
 
