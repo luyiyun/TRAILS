@@ -8,13 +8,14 @@ from typing import Literal, NotRequired, TypedDict
 import torch
 from torch import Tensor
 from torchmetrics import Metric
-from torchmetrics.clustering import AdjustedRandScore, ClusterAccuracy, NormalizedMutualInfoScore
+from torchmetrics.clustering import AdjustedRandScore, NormalizedMutualInfoScore
 from tqdm import tqdm
 
 from .config import TrainerConfig
 from .data import Batch, ClinicalTimeSeriesDataset, make_data_loader
 from .metrics import (
     Cindex,
+    ClusteringAccuracy,
     cluster_assignment_diagnostics,
 )
 from .model import TrailsLossBreakdown, TrailsModelOutput, TrailsSurvVaderModel
@@ -164,7 +165,7 @@ class TrailsTrainer:
 
         survival_metrics: dict[str, Metric] = {"cindex": Cindex()}
         cluster_metrics: dict[str, Metric] = {
-            "acc": ClusterAccuracy(self.model.model_config.n_clusters),
+            "acc": ClusteringAccuracy(),
             "nmi": NormalizedMutualInfoScore(),
             "ari": AdjustedRandScore(),
         }
@@ -251,7 +252,7 @@ class TrailsTrainer:
         survival_metrics: dict[str, Metric] = {"cindex": Cindex()}
         cluster_metrics: dict[str, Metric] = (
             {
-                "acc": ClusterAccuracy(self.model.model_config.n_clusters),
+                "acc": ClusteringAccuracy(),
                 "nmi": NormalizedMutualInfoScore(),
                 "ari": AdjustedRandScore(),
             }

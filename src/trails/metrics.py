@@ -136,33 +136,35 @@ class Cindex(Metric):
         return (concordant.sum() + 0.5 * tied.sum()) / comparable.sum().clamp_min(1.0)
 
 
-#
-#
-# class ClusteringAccuracy(Metric):
-#     def __init__(self, **kwargs):
-#         super().__init__(**kwargs)
-#         self.add_state("pred_cluster", default=[], dist_reduce_fx="cat")
-#         self.add_state("true_cluster", default=[], dist_reduce_fx="cat")
-#
-#         self.pred_cluster: list
-#         self.true_cluster: list
-#
-#     def update(self, pred_cluster: Tensor, true_cluster: Tensor) -> None:
-#         self.pred_cluster.append(pred_cluster.detach())
-#         self.true_cluster.append(true_cluster.detach())
-#
-#     def compute(self) -> Tensor:
-#         pred_cluster = torch.cat(self.pred_cluster, dim=0)
-#         true_cluster = torch.cat(self.true_cluster, dim=0)
-#
-#         prediction = pred_cluster.detach().cpu().long().reshape(-1).numpy()
-#         target = true_cluster.detach().cpu().long().reshape(-1).numpy()
-#         n_samples = prediction.shape[0]
-#         if n_samples == 0:
-#             return pred_cluster.new_tensor(0.0, dtype=torch.float32)
-#
-#         contingency: np.ndarray = crosstab(prediction, target).count  # type: ignore
-#         r, c = linear_sum_assignment(contingency, maximize=True)
-#         return pred_cluster.new_tensor(
-#             contingency[r, c].sum() / float(n_samples), dtype=torch.float32
-#         )
+def cluster_accuracy(pred_cluster: Tensor, true_cluster: Tensor) -> float:
+    prediction = pred_cluster.detach().cpu().long().reshape(-1).numpy()
+    target = true_cluster.detach().cpu().long().reshape(-1).numpy()
+    n_samples = prediction.shape[0]
+    if n_samples == 0:
+        return 0.0
+
+    contingency: np.ndarray = crosstab(prediction, target).count  # type: ignore
+    r, c = linear_sum_assignment(contingency, maximize=True)
+    return contingency[r, c].sum() / float(n_samples)
+
+
+class ClusteringAccuracy(Metric):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.add_state("pred_cluster", default=[], dist_reduce_fx="cat")
+        self.add_state("true_cluster", default=[], dist_reduce_fx="cat")
+
+        self.pred_cluster: list
+        self.true_cluster: list
+
+    def update(self, pred_cluster: Tensor, true_cluster: Tensor) -> None:
+        self.pred_cluster.append(pred_cluster.detach())
+        self.true_cluster.append(true_cluster.detach())
+
+    def compute(self) -> Tensor:
+        pred_cluster = torch.cat(self.pred_cluster, dim=0)
+        true_cluster = torch.cat(self.true_cluster, dim=0)
+
+        return pred_cluster.new_tensor(
+            cluster_accuracy(pred_cluster, true_cluster), dtype=torch.float32
+        )
