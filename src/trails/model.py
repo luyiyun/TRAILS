@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .config import DataConfig, DecoderConfig, EncoderConfig, EncoderMappingConfig, ModelConfig
+from .config import DataConfig, DecoderConfig, EncoderConfig, ModelConfig
 from .data import Batch
 from .metrics import (
     masked_mse,
@@ -319,11 +319,25 @@ class TrailsEncoder(nn.Module):
                 encoder_config.input.n_heads,
                 dropout,
             )
-        self.mapping = build_encoder_mapping(
-            encoder_config.mapping,
-            input_dim=encoder_config.input.hidden_dim,
-            dropout=dropout,
-        )
+
+        mapping_config = encoder_config.mapping
+        if mapping_config.kind in {"gru", "lstm"}:
+            self.mapping = RecurrentMappingLayer(
+                kind=mapping_config.kind,
+                input_dim=encoder_config.input.hidden_dim,
+                hidden_dim=mapping_config.hidden_dim,
+                n_layers=mapping_config.n_layers,
+                dropout=dropout,
+            )
+        else:
+            self.mapping = TransformerMappingLayer(
+                input_dim=encoder_config.input.hidden_dim,
+                hidden_dim=mapping_config.hidden_dim,
+                n_layers=mapping_config.n_layers,
+                n_heads=mapping_config.n_heads,
+                dropout=dropout,
+            )
+
         self.seq_pool = SequencePool(encoder_config.mapping.hidden_dim)
 
     def forward(
@@ -355,29 +369,6 @@ class TrailsEncoder(nn.Module):
             )
         mapped_sequence = self.mapping(input_sequence, times, sequence_lengths)
         return self.seq_pool(mapped_sequence, sequence_lengths)
-
-
-def build_encoder_mapping(
-    mapping_config: EncoderMappingConfig,
-    *,
-    input_dim: int,
-    dropout: float,
-) -> nn.Module:
-    if mapping_config.kind in {"gru", "lstm"}:
-        return RecurrentMappingLayer(
-            kind=mapping_config.kind,
-            input_dim=input_dim,
-            hidden_dim=mapping_config.hidden_dim,
-            n_layers=mapping_config.n_layers,
-            dropout=dropout,
-        )
-    return TransformerMappingLayer(
-        input_dim=input_dim,
-        hidden_dim=mapping_config.hidden_dim,
-        n_layers=mapping_config.n_layers,
-        n_heads=mapping_config.n_heads,
-        dropout=dropout,
-    )
 
 
 class RecurrentDecoder(nn.Module):
@@ -487,28 +478,6 @@ class TransformerDecoder(nn.Module):
         return self.reconstruction_head(decoded)
 
 
-def build_decoder(
-    *,
-    data_config: DataConfig,
-    decoder_config: DecoderConfig,
-    latent_dim: int,
-    dropout: float,
-) -> nn.Module:
-    if decoder_config.kind in {"gru", "lstm"}:
-        return RecurrentDecoder(
-            data_config=data_config,
-            decoder_config=decoder_config,
-            latent_dim=latent_dim,
-            dropout=dropout,
-        )
-    return TransformerDecoder(
-        data_config=data_config,
-        decoder_config=decoder_config,
-        latent_dim=latent_dim,
-        dropout=dropout,
-    )
-
-
 class TrailsSurvVaderModel(nn.Module):
     def __init__(self, data_config: DataConfig, model_config: ModelConfig) -> None:
         super().__init__()
@@ -529,14 +498,28 @@ class TrailsSurvVaderModel(nn.Module):
             model_config.encoder.mapping.hidden_dim,
             model_config.latent_dim,
         )
-        self.decoder = build_decoder(
-            data_config=data_config,
-            decoder_config=model_config.decoder,
-            latent_dim=model_config.latent_dim,
-            dropout=model_config.dropout,
-        )
+
+        decoder_config = model_config.decoder
+        if decoder_config.kind in {"gru", "lstm"}:
+            self.decoder = RecurrentDecoder(
+                data_config=data_config,
+                decoder_config=decoder_config,
+                latent_dim=model_config.latent_dim,
+                dropout=model_config.dropout,
+            )
+        else:
+            self.decoder = TransformerDecoder(
+                data_config=data_config,
+                decoder_config=decoder_config,
+                latent_dim=model_config.latent_dim,
+                dropout=model_config.dropout,
+            )
+
         # VaDE 聚类先验：c ~ Cat(pi), z | c ~ Normal(mu_c, var_c)。
-        self.mixture_logits = nn.Buffer(torch.zeros(model_config.n_clusters))
+        if model_config.mixture_logits_trained:
+            self.mixture_logits = nn.Parameter(torch.zeros(model_config.n_clusters))
+        else:
+            self.mixture_logits = nn.Buffer(torch.zeros(model_config.n_clusters))
         self.mixture_means = nn.Parameter(
             torch.randn(model_config.n_clusters, model_config.latent_dim) * 0.01
         )

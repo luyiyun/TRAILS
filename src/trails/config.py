@@ -94,6 +94,7 @@ class ModelConfig(BaseModel):
     loss: LossConfig = Field(default_factory=LossConfig)
     encoder: EncoderConfig = Field(default_factory=EncoderConfig)
     decoder: DecoderConfig = Field(default_factory=DecoderConfig)
+    mixture_logits_trained: bool = Field(default=False)
 
 
 class TrainerConfig(BaseModel):
