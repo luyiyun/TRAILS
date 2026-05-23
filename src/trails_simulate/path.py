@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +42,8 @@ def data_root(
 ) -> Path:
     if config.paths.data_root is not None:
         return resolve_path(config.paths.data_root, project_root)
+    if config.command == "simulate":
+        return hydra_run_dir
     return hydra_run_dir / "data"
 
 
@@ -95,7 +98,7 @@ def checkpoint_path_for_run(
         return configured
     suffix = configured.suffix
     stem = configured.stem if suffix else configured.name
-    return hydra_run_dir / "train" / run_id / f"{stem}{suffix}"
+    return hydra_run_dir / run_id / f"{stem}{suffix}"
 
 
 def resolve_path(path: Path, project_root: Path) -> Path:
@@ -149,20 +152,28 @@ def discover_dataset_runs(
         test_path = resolve_path(config.paths.test_data, project_root)
         return [
             DatasetRunPaths(
-                run_id="single",
+                run_id="0",
                 data_root=data_path.parent,
                 train_data=data_path,
                 test_data=test_path,
             )
         ]
 
-    root = data_root(config, hydra_run_dir, project_root)
+    root = (
+        latest_simulation_data_root(config, project_root)
+        if config.paths.data_root is None and config.command in {"train", "baseline"}
+        else data_root(config, hydra_run_dir, project_root)
+    )
+    numeric_runs = discover_numbered_dataset_runs(root)
+    if numeric_runs:
+        return numeric_runs
+
     single_train = root / "train.pt"
     single_test = root / "test.pt"
     if single_train.exists() and single_test.exists():
         return [
             DatasetRunPaths(
-                run_id="single",
+                run_id="0",
                 data_root=root,
                 train_data=single_train,
                 test_data=single_test,
@@ -183,6 +194,58 @@ def discover_dataset_runs(
     if not runs:
         raise ValueError(
             "Could not find train/test split data. Expected train.pt and test.pt under "
-            f"{root} or under repeat_* subdirectories."
+            f"{root}, numbered run directories, or repeat_* subdirectories."
         )
     return runs
+
+
+def discover_numbered_dataset_runs(root: Path) -> list[DatasetRunPaths]:
+    if not root.exists():
+        return []
+
+    def numeric_key(path: Path) -> int:
+        return int(path.name)
+
+    run_roots = sorted(
+        (path for path in root.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=numeric_key,
+    )
+    return [
+        DatasetRunPaths(
+            run_id=run_root.name,
+            data_root=run_root,
+            train_data=run_root / "train.pt",
+            test_data=run_root / "test.pt",
+        )
+        for run_root in run_roots
+        if (run_root / "train.pt").exists() and (run_root / "test.pt").exists()
+    ]
+
+
+def latest_simulation_data_root(config: ApplicationConfig, project_root: Path) -> Path:
+    outputs_root = project_root / "outputs"
+    candidates = list(
+        (outputs_root / config.simulation.name).glob("simulate-*/simulation_summary.json")
+    )
+    if not candidates:
+        candidates = list(outputs_root.glob("*/simulate-*/simulation_summary.json"))
+    if not candidates:
+        candidates = list(
+            (outputs_root / config.simulation.name).glob("*/data/simulation_summary.json")
+        )
+    if not candidates:
+        candidates = list(outputs_root.glob("*/*/data/simulation_summary.json"))
+    if not candidates:
+        raise ValueError(
+            "command=train requires paths.data=... or paths.data_root=... when no previous "
+            "simulation output can be found under outputs/*/simulate-*."
+        )
+    summary_path = max(candidates, key=lambda path: path.stat().st_mtime)
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return summary_path.parent
+    data_root_value = payload.get("data_root")
+    if isinstance(data_root_value, str) and data_root_value:
+        return resolve_path(Path(data_root_value), project_root)
+    return summary_path.parent

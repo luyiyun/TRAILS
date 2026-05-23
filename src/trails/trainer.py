@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable
 from itertools import chain
 from typing import Literal, NotRequired, TypedDict
@@ -7,7 +8,7 @@ from typing import Literal, NotRequired, TypedDict
 import torch
 from torch import Tensor
 from torchmetrics import Metric
-from torchmetrics.clustering import AdjustedRandScore, NormalizedMutualInfoScore
+from torchmetrics.clustering import AdjustedRandScore, ClusterAccuracy, NormalizedMutualInfoScore
 from tqdm import tqdm
 
 from .config import TrainerConfig
@@ -25,6 +26,10 @@ class HistoryEntry(TypedDict):
     stage: str
     train: dict[str, float]
     valid: NotRequired[dict[str, float]]
+    best_global_epoch: NotRequired[int]
+    best_monitor: NotRequired[str]
+    best_monitor_value: NotRequired[float]
+    early_stopped: NotRequired[bool]
 
 
 HistoryCallback = Callable[[HistoryEntry], None]
@@ -47,6 +52,63 @@ class LossAccumulator:
         return {name: value / max(1, self.count) for name, value in self.total.items()}
 
 
+class EarlyStopper:
+    def __init__(
+        self,
+        patience: int,
+        monitor: Literal["loss", "cindex"],
+        min_delta: float,
+        has_validation: bool = True,
+    ) -> None:
+        self.patience = patience
+        self.monitor = monitor
+        self.min_delta = min_delta
+        self.has_validation = has_validation
+        self.reset()
+
+    def reset(self):
+        self.best_state: dict[str, Tensor] | None = None
+        self.best_value: float | None = None
+        self.best_global_epoch: int | None = None
+        self.stale_epochs = 0
+
+    def update(self, entry: HistoryEntry, model: TrailsSurvVaderModel) -> bool:
+        monitor_value = self._monitor_value(entry)
+        if self._is_monitor_improved(monitor_value, self.best_value):
+            self.best_state = copy.deepcopy(model.state_dict())
+            self.best_value = monitor_value
+            self.best_global_epoch = entry["global_epoch"]
+            self.stale_epochs = 0
+        else:
+            self.stale_epochs += 1
+
+        if self.best_value is not None and self.best_global_epoch is not None:
+            entry["best_global_epoch"] = self.best_global_epoch
+            entry["best_monitor"] = self._monitor_name(self.has_validation)
+            entry["best_monitor_value"] = self.best_value
+
+        return self.stale_epochs >= self.patience
+
+    def _monitor_name(self, has_validation: bool) -> str:
+        split_name = "valid" if has_validation else "train"
+        return f"{split_name}/{self.monitor}"
+
+    def _monitor_value(self, entry: HistoryEntry) -> float:
+        metrics = entry["valid"] if "valid" in entry else entry["train"]
+        split_name = "valid" if "valid" in entry else "train"
+        name = self.monitor
+        if name not in metrics:
+            raise ValueError(f"Early stopping monitor '{split_name}/{name}' is unavailable.")
+        return float(metrics[name])
+
+    def _is_monitor_improved(self, value: float, best_value: float | None) -> bool:
+        if best_value is None:
+            return True
+        if self.monitor == "loss":
+            return value < best_value - self.min_delta
+        return value > best_value + self.min_delta
+
+
 class TrailsTrainer:
     def __init__(self, model: TrailsSurvVaderModel, config: TrainerConfig) -> None:
         self.model = model.to(config.device)
@@ -60,6 +122,10 @@ class TrailsTrainer:
         data: ClinicalTimeSeriesDataset,
         history_callback: HistoryCallback | None = None,
     ) -> list[HistoryEntry]:
+        # 根据我们使用的input调整数据格式
+        data = data.with_return_kind(
+            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
+        )
         if self.config.valid_size > 0:
             data, validation_data = data.split([1 - self.config.valid_size, self.config.valid_size])
             valid_loader = make_data_loader(validation_data, self.config, shuffle=False)
@@ -98,11 +164,22 @@ class TrailsTrainer:
 
         survival_metrics: dict[str, Metric] = {"cindex": Cindex()}
         cluster_metrics: dict[str, Metric] = {
+            "acc": ClusterAccuracy(self.model.model_config.n_clusters),
             "nmi": NormalizedMutualInfoScore(),
             "ari": AdjustedRandScore(),
         }
         for v in chain(survival_metrics.values(), cluster_metrics.values()):
             v.to(self.config.device)
+
+        if self.config.early_stop:
+            early_stopper = EarlyStopper(
+                self.config.early_stopping_patience,
+                self.config.early_stopping_monitor,
+                self.config.early_stopping_min_delta,
+                has_validation=validation_data is not None,
+            )
+        else:
+            early_stopper = None
 
         for epoch in tqdm(range(self.config.max_epochs), desc="Epoch"):
             losses, scores = self._epoch_loop(
@@ -137,25 +214,47 @@ class TrailsTrainer:
             history.append(entry)
             if history_callback is not None:
                 history_callback(entry)
+
+            if early_stopper is not None and early_stopper.update(entry, self.model):
+                break
+
+        if early_stopper is not None and early_stopper.best_state is not None:
+            self.model.load_state_dict(early_stopper.best_state)
         return history
 
     def predict(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        data = data.with_return_kind(
+            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
+        )
         outputs, _batch = self._collect_outputs(data)
         return torch.argmax(outputs.cluster_probabilities, dim=-1).cpu()
 
     def predict_proba(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        data = data.with_return_kind(
+            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
+        )
         outputs, _batch = self._collect_outputs(data)
         return outputs.cluster_probabilities.cpu()
 
     def predict_risk(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        data = data.with_return_kind(
+            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
+        )
         outputs, _batch = self._collect_outputs(data)
         return self._risk_score(outputs).cpu()
 
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
+        data = data.with_return_kind(
+            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
+        )
         loader = make_data_loader(data, self.config, shuffle=False)
         survival_metrics: dict[str, Metric] = {"cindex": Cindex()}
         cluster_metrics: dict[str, Metric] = (
-            {"nmi": NormalizedMutualInfoScore(), "ari": AdjustedRandScore()}
+            {
+                "acc": ClusterAccuracy(self.model.model_config.n_clusters),
+                "nmi": NormalizedMutualInfoScore(),
+                "ari": AdjustedRandScore(),
+            }
             if data.has_cluster_labels
             else {}
         )
@@ -210,13 +309,7 @@ class TrailsTrainer:
         with torch.set_grad_enabled(phase == "train"):
             for batch in tqdm(loader, desc=phase.capitalize(), leave=False):
                 device_batch = self._move_batch(batch)
-                output = self.model(
-                    times=device_batch["times"],
-                    x=device_batch["x"],
-                    mask=device_batch["mask"],
-                    delta_time=device_batch["delta_time"],
-                    sequence_lengths=device_batch["sequence_lengths"],
-                )
+                output = self._model_output(device_batch)
                 loss = self.model.compute_loss(
                     output,
                     device_batch,
@@ -263,6 +356,9 @@ class TrailsTrainer:
         }
 
     def _collect_outputs(self, data: ClinicalTimeSeriesDataset) -> tuple[TrailsModelOutput, Batch]:
+        data = data.with_return_kind(
+            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
+        )
         loader = make_data_loader(data, self.config, shuffle=False)
         outputs: list[TrailsModelOutput] = []
         batches: list[Batch] = []
@@ -270,15 +366,7 @@ class TrailsTrainer:
         with torch.no_grad():
             for batch in loader:
                 device_batch = self._move_batch(batch)
-                outputs.append(
-                    self.model(
-                        times=device_batch["times"],
-                        x=device_batch["x"],
-                        mask=device_batch["mask"],
-                        delta_time=device_batch["delta_time"],
-                        sequence_lengths=device_batch["sequence_lengths"],
-                    )
-                )
+                outputs.append(self._model_output(device_batch))
                 batches.append(device_batch)
         return concatenate_outputs(outputs), concatenate_batches(batches)
 
@@ -290,21 +378,36 @@ class TrailsTrainer:
         return -expected_scale
 
     def _collect_latent_means(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        data = data.with_return_kind(
+            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
+        )
         loader = make_data_loader(data, self.config, shuffle=False)
         latent_means: list[Tensor] = []
         self.model.eval()
         with torch.no_grad():
             for batch in loader:
                 device_batch = self._move_batch(batch)
-                output = self.model(
-                    times=device_batch["times"],
-                    x=device_batch["x"],
-                    mask=device_batch["mask"],
-                    delta_time=device_batch["delta_time"],
-                    sequence_lengths=device_batch["sequence_lengths"],
-                )
+                output = self._model_output(device_batch)
                 latent_means.append(output.latent_mean.detach().cpu())
         return torch.cat(latent_means, dim=0)
+
+    def _model_output(self, batch: Batch) -> TrailsModelOutput:
+        if "delta_time" in batch and "sequence_lengths" in batch:
+            return self.model(
+                times=batch["times"],
+                x=batch["x"],
+                mask=batch["mask"],
+                delta_time=batch["delta_time"],
+                sequence_lengths=batch["sequence_lengths"],
+            )
+        if "feature_lengths" in batch:
+            return self.model(
+                times=batch["times"],
+                x=batch["x"],
+                mask=batch["mask"],
+                feature_lengths=batch["feature_lengths"],
+            )
+        raise ValueError("Batch must contain either aligned or compact time-series fields.")
 
 
 def concatenate_batches(batches: list[Batch]) -> Batch:
@@ -313,14 +416,19 @@ def concatenate_batches(batches: list[Batch]) -> Batch:
         "times": torch.cat([pad_time_axis(batch["times"], max_length) for batch in batches], dim=0),
         "x": torch.cat([pad_time_axis(batch["x"], max_length) for batch in batches], dim=0),
         "mask": torch.cat([pad_time_axis(batch["mask"], max_length) for batch in batches], dim=0),
-        "delta_time": torch.cat(
-            [pad_time_axis(batch["delta_time"], max_length) for batch in batches],
-            dim=0,
-        ),
-        "sequence_lengths": torch.cat([batch["sequence_lengths"] for batch in batches], dim=0),
         "survival_time": torch.cat([batch["survival_time"] for batch in batches], dim=0),
         "event": torch.cat([batch["event"] for batch in batches], dim=0),
     }
+    if "delta_time" in batches[0]:
+        batch["delta_time"] = torch.cat(
+            [pad_time_axis(batch["delta_time"], max_length) for batch in batches],
+            dim=0,
+        )
+        batch["sequence_lengths"] = torch.cat(
+            [batch["sequence_lengths"] for batch in batches], dim=0
+        )
+    if "feature_lengths" in batches[0]:
+        batch["feature_lengths"] = torch.cat([batch["feature_lengths"] for batch in batches], dim=0)
     if "cluster_label" in batches[0]:
         batch["cluster_label"] = torch.cat([batch["cluster_label"] for batch in batches], dim=0)
     return batch

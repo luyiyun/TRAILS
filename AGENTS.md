@@ -87,19 +87,27 @@ clean reusable method library.
   `simulation.mechanism_seed` when set, otherwise `simulation.seed`; repeat sample
   seeds use `simulation.seed + repeat_index` for patient draws, train/test split
   shuffling, and downstream model training.
-- Validation data is cut internally from `train.pt` by `training.trainer.valid_size` and
-  is not saved as a separate `val.pt`.
-- Hydra outputs go under `outputs/` by default and are ignored by git.
+- Validation data is cut internally from `train.pt` by `training.trainer.valid_size`, is
+  not saved as a separate `val.pt`, and is used for early stopping; if no validation
+  split is requested, early stopping monitors the training metric instead.
+- Hydra outputs go under `outputs/` by default and are ignored by git. Command run
+  directories are named `command-<timestamp>`, with repeat outputs flattened under
+  numeric directories such as `0/`, `1/`, and `2/`.
 - Simulation uses a VaDeSC-EHR-style latent-cluster generator adapted to
   continuous asynchronous clinical measurements.
 - Simulation outputs a `ClinicalTimeSeriesDataset` saved via `torch.save`.
-- Each patient sample contains `times`, `x`, `mask`, `delta_time`,
-  `survival_time`, `event`, and optional `cluster_label`.
+- Canonical saved patient samples are aligned samples containing `times`, `x`, `mask`,
+  `delta_time`, `survival_time`, `event`, and optional `cluster_label`. At runtime,
+  `AlignedClinicalSample` and `CompactClinicalSample` convert between views through
+  dataclass methods, and `ClinicalTimeSeriesDataset(return_kind=...)` stores samples
+  in the requested view at initialization rather than converting in `__getitem__`.
+  Compact samples left-align per-feature observations and carry per-feature `times`,
+  `mask`, and `feature_lengths`.
 - Dataset metadata preserves latent profiles, cluster parameters, survival
   coefficients, and generation parameters for simulation-study evaluation.
-- The phase-one model uses a modular encoder: an asynchronous input layer
-  (`grud` or lightweight `mtan`) followed by a nonlinear mapping layer (`gru`,
-  `lstm`, or `transformer`) and SeqPool.
+- The phase-one model uses a modular encoder: an asynchronous input layer (`grud` or
+  standard mTAN-style multi-time attention) followed by a nonlinear mapping layer
+  (`gru`, `lstm`, or `transformer`) and SeqPool.
 - The reconstruction decoder is configurable as `gru`, `lstm`, or
   `transformer`; recurrent decoders support latent-initialized hidden state or
   repeated latent plus visit-time input, while transformer decoding only uses
@@ -109,10 +117,10 @@ clean reusable method library.
 - The survival head remains a cluster-specific Weibull mixture whose mixture
   weights are the VaDE posterior cluster probabilities, with a configurable
   number of latent-width hidden layers before the Weibull output.
-- Validation and test metrics include ARI/NMI only when true cluster labels are
+- Validation and test metrics include ACC/ARI/NMI only when true cluster labels are
   available; test metrics also report predicted-cluster occupancy diagnostics.
-- Train and baseline commands save unified prediction payloads under
-  `predictions/<run_id>/`, plus command-level metrics CSV and summary JSON.
+- Train and baseline commands save unified prediction payloads directly under each
+  numeric repeat directory, plus command-level metrics CSV and summary JSON.
 - `command=baseline` lives in `trails_simulate` and runs lightweight simulation
   comparators on existing train/test splits: summary-feature k-means and
   risk-stratified summary-feature k-means. It writes baseline summary JSON and

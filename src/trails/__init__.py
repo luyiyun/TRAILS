@@ -9,17 +9,21 @@ from .config import (
     TrainerConfig,
 )
 from .data import (
-    ClinicalSample,
+    AlignedClinicalSample,
     ClinicalTimeSeriesDataset,
+    CompactClinicalSample,
+    DatasetSample,
     clinical_collate_fn,
 )
 from .estimator import TrailsEstimator
 
 __all__ = [
-    "ClinicalSample",
+    "AlignedClinicalSample",
+    "CompactClinicalSample",
     "ClinicalTimeSeriesDataset",
     "DataConfig",
     "DecoderConfig",
+    "DatasetSample",
     "EncoderConfig",
     "EncoderInputConfig",
     "EncoderMappingConfig",

@@ -1,4 +1,5 @@
-from typing import Literal
+from pathlib import Path
+from typing import Literal, cast
 
 import pytest
 import torch
@@ -13,13 +14,27 @@ from trails.config import (
     LossConfig,
     ModelConfig,
 )
-from trails.data import Batch, ClinicalTimeSeriesDataset, clinical_collate_fn, make_clinical_sample
+from trails.data import (
+    AlignedClinicalSample,
+    Batch,
+    ClinicalTimeSeriesDataset,
+    CompactClinicalSample,
+    clinical_collate_fn,
+    make_clinical_sample,
+)
 from trails.metrics import (
+    ClusteringAccuracy,
     masked_mse,
     vade_kl_loss,
     weibull_mixture_negative_log_likelihood,
 )
-from trails.model import SequencePool, TrailsModelOutput, TrailsSurvVaderModel
+from trails.model import (
+    MultiTimeAttention,
+    SequencePool,
+    TimeEmbedding,
+    TrailsModelOutput,
+    TrailsSurvVaderModel,
+)
 from trails_simulate import (
     ClinicalTimeSeriesDatasetGenerator,
     ClinicalTimeSeriesDatasetGeneratorConfig,
@@ -69,7 +84,7 @@ def test_clinical_dataset_and_collate_shapes() -> None:
         attention_layers=2,
         seed=7,
     )
-    sample = dataset[0]
+    sample = dataset.samples[0].to_aligned()
     batch = clinical_collate_fn([dataset[0], dataset[1]])
 
     assert len(dataset) == 6
@@ -83,6 +98,118 @@ def test_clinical_dataset_and_collate_shapes() -> None:
     assert {"latent_z", "cluster_means", "survival_coefficients", "generation_params"} <= set(
         dataset.metadata
     )
+
+
+def test_compact_dataset_view_and_collate() -> None:
+    dataset = simulate_dataset(
+        patients=4,
+        n_clusters=2,
+        min_visits=3,
+        max_visits=5,
+        hidden_size=12,
+        latent_dim=4,
+        attention_layers=2,
+        seed=9,
+    )
+    compact_dataset = dataset.with_return_kind("compact")
+    aligned_sample = dataset.samples[0].to_aligned()
+    compact_sample = cast(CompactClinicalSample, compact_dataset[0])
+
+    assert compact_dataset.return_kind == "compact"
+    assert isinstance(compact_dataset.samples[0], CompactClinicalSample)
+    assert isinstance(compact_dataset[0], CompactClinicalSample)
+    assert compact_sample.x.shape == compact_sample.times.shape == compact_sample.mask.shape
+    assert torch.equal(compact_sample.feature_lengths, aligned_sample.mask.sum(dim=0).long())
+    for feature_index in range(dataset.n_features):
+        observed = aligned_sample.mask[:, feature_index] > 0
+        length = int(compact_sample.feature_lengths[feature_index])
+        assert torch.allclose(
+            compact_sample.times[:length, feature_index],
+            aligned_sample.times[observed],
+        )
+        assert torch.allclose(
+            compact_sample.x[:length, feature_index],
+            aligned_sample.x[observed, feature_index],
+        )
+        assert torch.all(compact_sample.mask[length:, feature_index] == 0)
+
+    batch = clinical_collate_fn([compact_dataset[0], compact_dataset[1]])
+    assert "feature_lengths" in batch
+    assert "delta_time" not in batch
+    assert batch["x"].shape[-1] == dataset.n_features
+
+    with pytest.raises(ValueError, match="cannot mix aligned and compact"):
+        clinical_collate_fn([dataset[0], compact_dataset[0]])
+
+
+def test_sample_view_conversion_methods_and_dataset_init(tmp_path: Path) -> None:
+    aligned_sample = make_clinical_sample(
+        times=torch.tensor([0.0, 1.0, 3.0]),
+        x=torch.tensor([[1.0, 0.0], [2.0, 3.0], [0.0, 4.0]]),
+        mask=torch.tensor([[1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]),
+        delta_time=torch.tensor([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]),
+        survival_time=5.0,
+        event=1.0,
+        cluster_label=0,
+    )
+
+    compact_sample = aligned_sample.to_compact()
+
+    assert isinstance(compact_sample, CompactClinicalSample)
+    assert torch.equal(compact_sample.feature_lengths, torch.tensor([2, 2]))
+    assert torch.allclose(
+        compact_sample.times,
+        torch.tensor([[0.0, 1.0], [1.0, 3.0]]),
+    )
+    assert torch.allclose(
+        compact_sample.x,
+        torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
+    )
+    assert torch.all(compact_sample.mask == 1)
+
+    roundtrip_sample = compact_sample.to_aligned()
+    assert isinstance(roundtrip_sample, AlignedClinicalSample)
+    assert torch.allclose(roundtrip_sample.times, aligned_sample.times)
+    assert torch.allclose(roundtrip_sample.x, aligned_sample.x)
+    assert torch.allclose(roundtrip_sample.mask, aligned_sample.mask)
+    assert torch.allclose(roundtrip_sample.delta_time, aligned_sample.delta_time)
+
+    compact_dataset = ClinicalTimeSeriesDataset(
+        [aligned_sample],
+        feature_names=["a", "b"],
+        return_kind="compact",
+    )
+    assert isinstance(compact_dataset.samples[0], CompactClinicalSample)
+    assert isinstance(compact_dataset[0], CompactClinicalSample)
+
+    aligned_dataset = ClinicalTimeSeriesDataset(
+        [compact_sample],
+        feature_names=["a", "b"],
+        return_kind="aligned",
+    )
+    assert isinstance(aligned_dataset.samples[0], AlignedClinicalSample)
+    assert torch.allclose(aligned_dataset.feature_means, torch.tensor([1.5, 3.5]))
+
+    save_path = tmp_path / "compact.pt"
+    compact_dataset.save(save_path)
+    loaded = ClinicalTimeSeriesDataset.load(save_path, return_kind="compact")
+    assert isinstance(loaded.samples[0], CompactClinicalSample)
+    assert torch.allclose(loaded.samples[0].x, compact_sample.x)
+
+
+def test_compact_to_aligned_rejects_duplicate_feature_times() -> None:
+    compact_sample = CompactClinicalSample(
+        times=torch.tensor([[0.0], [0.0]]),
+        x=torch.tensor([[1.0], [2.0]]),
+        mask=torch.tensor([[1.0], [1.0]]),
+        feature_lengths=torch.tensor([2]),
+        survival_time=torch.tensor(5.0),
+        event=torch.tensor(1.0),
+        cluster_label=torch.tensor(0),
+    )
+
+    with pytest.raises(ValueError, match="duplicate feature-time"):
+        compact_sample.to_aligned()
 
 
 def test_dataset_split_counts_preserves_sizes_and_metadata() -> None:
@@ -212,6 +339,7 @@ def test_unlabeled_dataset_collates_without_cluster_labels() -> None:
         attention_layers=2,
         seed=19,
     )
+    aligned_samples = [sample.to_aligned() for sample in labeled.samples]
     samples = [
         make_clinical_sample(
             times=sample.times,
@@ -221,7 +349,7 @@ def test_unlabeled_dataset_collates_without_cluster_labels() -> None:
             survival_time=sample.survival_time,
             event=sample.event,
         )
-        for sample in labeled
+        for sample in aligned_samples
     ]
     unlabeled = ClinicalTimeSeriesDataset(samples, feature_names=labeled.feature_names)
     batch = clinical_collate_fn([unlabeled[0], unlabeled[1]])
@@ -241,18 +369,19 @@ def test_dataset_rejects_mixed_cluster_label_availability() -> None:
         attention_layers=2,
         seed=23,
     )
+    labeled_sample = labeled.samples[1].to_aligned()
     unlabeled_sample = make_clinical_sample(
-        times=labeled[1].times,
-        x=labeled[1].x,
-        mask=labeled[1].mask,
-        delta_time=labeled[1].delta_time,
-        survival_time=labeled[1].survival_time,
-        event=labeled[1].event,
+        times=labeled_sample.times,
+        x=labeled_sample.x,
+        mask=labeled_sample.mask,
+        delta_time=labeled_sample.delta_time,
+        survival_time=labeled_sample.survival_time,
+        event=labeled_sample.event,
     )
 
     with pytest.raises(ValueError, match="cannot mix labeled and unlabeled"):
         ClinicalTimeSeriesDataset(
-            [labeled[0], unlabeled_sample],
+            [labeled.samples[0].to_aligned(), unlabeled_sample],
             feature_names=labeled.feature_names,
         )
 
@@ -269,18 +398,19 @@ def test_simulation_has_asynchronous_masks_and_valid_delta_time() -> None:
         censoring_rate=0.3,
         seed=11,
     )
-    sequence_lengths = {int(sample.times.shape[0]) for sample in dataset}
+    aligned_samples = [sample.to_aligned() for sample in dataset.samples]
+    sequence_lengths = {int(sample.times.shape[0]) for sample in aligned_samples}
     assert len(sequence_lengths) > 1
 
     partial_visit_exists = any(
         bool(
             torch.any((sample.mask.sum(dim=1) > 0) & (sample.mask.sum(dim=1) < dataset.n_features))
         )
-        for sample in dataset
+        for sample in aligned_samples
     )
     assert partial_visit_exists
 
-    for sample in dataset:
+    for sample in aligned_samples:
         assert sample.times.max() <= sample.survival_time
         assert torch.all(sample.delta_time >= 0)
         for step in range(1, int(sample.times.shape[0])):
@@ -290,11 +420,11 @@ def test_simulation_has_asynchronous_masks_and_valid_delta_time() -> None:
                 >= sample.delta_time[step - 1][missing_previously]
             )
 
-    observed_values = torch.cat([sample.x[sample.mask > 0] for sample in dataset])
+    observed_values = torch.cat([sample.x[sample.mask > 0] for sample in aligned_samples])
     assert observed_values.dtype.is_floating_point
     assert not torch.allclose(observed_values, observed_values.round())
 
-    event_rate = torch.stack([sample.event for sample in dataset]).float().mean()
+    event_rate = torch.stack([sample.event for sample in aligned_samples]).float().mean()
     assert 0.45 <= float(event_rate) <= 0.95
 
 
@@ -316,6 +446,37 @@ def test_sequence_pool_masks_padding_visits() -> None:
     assert torch.allclose(weights[1, 3:], torch.zeros(1))
     assert torch.allclose(pooled[0], hidden_sequence[0, :2].mean(dim=0))
     assert torch.allclose(pooled[1], hidden_sequence[1, :3].mean(dim=0))
+
+
+def test_mtan_time_embedding_and_attention_shapes_without_nan() -> None:
+    time_embedding = TimeEmbedding(embedding_dim=6, learn_embedding=False, frequency=10.0)
+    query = time_embedding(torch.linspace(0.0, 1.0, 4).unsqueeze(0))
+    key = time_embedding(torch.linspace(0.0, 1.0, 5).unsqueeze(0))
+    value = torch.randn(1, 5, 3)
+    attention = MultiTimeAttention(
+        input_dim=3,
+        hidden_dim=7,
+        time_embedding_dim=6,
+        n_heads=2,
+        dropout=0.0,
+    )
+
+    output = attention(
+        query=query,
+        key=key,
+        value=value,
+        mask=torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.bool),
+    )
+
+    assert output.shape == (1, 4, 7)
+    assert torch.isfinite(output).all()
+
+
+def test_clustering_accuracy_matches_permuted_labels() -> None:
+    metric = ClusteringAccuracy()
+    metric.update(torch.tensor([1, 1, 0, 0]), torch.tensor([0, 0, 1, 1]))
+
+    assert torch.allclose(metric.compute(), torch.tensor(1.0))
 
 
 def make_architecture_config(
@@ -355,19 +516,34 @@ def assert_model_forward_shapes(model_config: ModelConfig) -> None:
         attention_layers=2,
         seed=13,
     )
-    batch = clinical_collate_fn([dataset[0], dataset[1], dataset[2], dataset[3]])
+    model_dataset = (
+        dataset.with_return_kind("compact")
+        if model_config.encoder.input.kind == "mtan"
+        else dataset.with_return_kind("aligned")
+    )
+    batch = clinical_collate_fn(
+        [model_dataset[0], model_dataset[1], model_dataset[2], model_dataset[3]]
+    )
     model = TrailsSurvVaderModel(
         DataConfig(n_features=dataset.n_features),
         model_config,
     )
     model.set_feature_means(dataset.feature_means)
-    output = model(
-        times=batch["times"],
-        x=batch["x"],
-        mask=batch["mask"],
-        delta_time=batch["delta_time"],
-        sequence_lengths=batch["sequence_lengths"],
-    )
+    if "feature_lengths" in batch:
+        output = model(
+            times=batch["times"],
+            x=batch["x"],
+            mask=batch["mask"],
+            feature_lengths=batch["feature_lengths"],
+        )
+    else:
+        output = model(
+            times=batch["times"],
+            x=batch["x"],
+            mask=batch["mask"],
+            delta_time=batch["delta_time"],
+            sequence_lengths=batch["sequence_lengths"],
+        )
 
     assert output.reconstruction.shape == batch["x"].shape
     assert output.cluster_logits.shape == (4, 2)

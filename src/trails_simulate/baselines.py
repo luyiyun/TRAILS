@@ -13,7 +13,7 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from trails.data import ClinicalSample, ClinicalTimeSeriesDataset
+from trails.data import AlignedClinicalSample, ClinicalTimeSeriesDataset
 
 from .config import BaselineMethod
 from .evaluation import PredictionPayload, prediction_payload_from_dataset
@@ -90,10 +90,14 @@ class BaseBaseline(ABC):
         return features
 
     def extract_features(self, data: ClinicalTimeSeriesDataset) -> NDArray[np.float64]:
-        rows = [self.sample_features(data[index]) for index in range(len(data))]
+        aligned_data = data.with_return_kind("aligned")
+        rows = [
+            self.sample_features(aligned_data.samples[index].to_aligned())
+            for index in range(len(aligned_data))
+        ]
         return np.asarray(rows, dtype=np.float64)
 
-    def sample_features(self, sample: ClinicalSample) -> list[float]:
+    def sample_features(self, sample: AlignedClinicalSample) -> list[float]:
         times = sample.times.detach().cpu().numpy()
         values = sample.x.detach().cpu().numpy()
         mask = sample.mask.detach().cpu().numpy()

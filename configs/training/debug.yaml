@@ -27,13 +27,17 @@ model:
 trainer:
   max_epochs: 300
   batch_size: 256
-  learning_rate: 3.0e-4
+  learning_rate: 5.0e-4
   warmup_epochs: 20
   gmm_init_iters: 20
   gradient_clip_norm: null
   device: cuda:0
   seed: 20260517
-  valid_size: 0.0
+  valid_size: 0.2
+  early_stop: true
+  early_stopping_patience: 5
+  early_stopping_min_delta: 0.001
+  early_stopping_monitor: "loss"
 artifacts:
   names: [all]
   save: null

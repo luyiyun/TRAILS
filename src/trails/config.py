@@ -17,11 +17,20 @@ class EncoderInputConfig(BaseModel):
     kind: Literal["grud", "mtan"] = "grud"
     hidden_dim: int = Field(default=32, gt=0)
     n_heads: int = Field(default=2, gt=0)
+    num_ref_points: int = Field(default=16, gt=0)
+    learn_time_embedding: bool = True
+    time_embedding_dim: int | None = Field(default=None, gt=0)
+    time_embedding_frequency: float = Field(default=10.0, gt=0.0)
 
     @model_validator(mode="after")
     def validate_attention_heads(self) -> EncoderInputConfig:
         if self.kind == "mtan" and self.hidden_dim % self.n_heads != 0:
             raise ValueError("model.encoder.input.hidden_dim must be divisible by n_heads.")
+        resolved_time_dim = (
+            self.hidden_dim if self.time_embedding_dim is None else self.time_embedding_dim
+        )
+        if self.kind == "mtan" and resolved_time_dim % self.n_heads != 0:
+            raise ValueError("model.encoder.input.time_embedding_dim must be divisible by n_heads.")
         return self
 
 
@@ -109,6 +118,10 @@ class TrainerConfig(BaseModel):
     device: str = "cpu"
     seed: int = 2026
     valid_size: float = Field(default=0.2, ge=0.0, le=1.0)
+    early_stop: bool = Field(default=True)
+    early_stopping_patience: int = Field(default=10, gt=0)
+    early_stopping_min_delta: float = Field(default=0.0, ge=0.0)
+    early_stopping_monitor: Literal["loss", "cindex"] = "loss"
 
 
 class TrailsConfig(BaseModel):

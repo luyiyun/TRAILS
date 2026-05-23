@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -37,9 +37,16 @@ class SimulationConfig(BaseModel):
     train_size: int = 128
     test_size: int = 64
     seed: int = 20260517
+    mechanism_seed: int | None = None
     generator: ClinicalTimeSeriesDatasetGeneratorConfig = Field(
         default_factory=ClinicalTimeSeriesDatasetGeneratorConfig
     )
+
+    @model_validator(mode="after")
+    def resolve_mechanism_seed(self) -> SimulationConfig:
+        if self.mechanism_seed is None:
+            self.mechanism_seed = self.seed
+        return self
 
 
 class PathsConfig(BaseModel):

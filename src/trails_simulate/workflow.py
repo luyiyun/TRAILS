@@ -23,7 +23,6 @@ from .path import (
     checkpoint_path_for_run,
     data_root,
     discover_dataset_runs,
-    train_root,
 )
 from .training import fit_training_run
 
@@ -79,11 +78,14 @@ def run_simulate_command(
 
     out_root = data_root(config, hydra_run_dir, project_root)
     repeats: list[dict[str, Any]] = []
-    generator = ClinicalTimeSeriesDatasetGenerator(config.simulation.generator)
+    generator = ClinicalTimeSeriesDatasetGenerator(
+        config.simulation.generator,
+        mechanism_seed=config.simulation.mechanism_seed,
+    )
     for index in range(config.simulation.repeats):
         repeat_seed = config.simulation.seed + index
-        run_id = "single" if config.simulation.repeats == 1 else f"repeat_{index:03d}"
-        split_root = out_root if config.simulation.repeats == 1 else out_root / run_id
+        run_id = str(index)
+        split_root = out_root / run_id
         split_root.mkdir(parents=True, exist_ok=True)
 
         total_patients = config.simulation.train_size + config.simulation.test_size
@@ -147,7 +149,7 @@ def run_train_command(
         train_paths = TrainPaths(
             data=run_paths.train_data,
             test_data=run_paths.test_data,
-            train_root=train_root(config, hydra_run_dir, project_root) / run_paths.run_id,
+            train_root=hydra_run_dir / run_paths.run_id,
             save=checkpoint_path_for_run(
                 config,
                 hydra_run_dir=hydra_run_dir,
@@ -162,7 +164,7 @@ def run_train_command(
             seed=seed,
             swanlab_repeat_label=None if len(runs) == 1 else run_paths.run_id,
         )
-        prediction_path = hydra_run_dir / "predictions" / run_paths.run_id / "trails.pt"
+        prediction_path = hydra_run_dir / run_paths.run_id / "trails.pt"
         save_prediction_payload(prediction_path, train_result.prediction)
         row = metric_row(
             run_paths,
@@ -187,6 +189,7 @@ def run_train_command(
     summary = {
         "command": "train",
         "config": config.model_dump(mode="json"),
+        "data_source": dataset_source_payload(config, runs),
         "hydra_run_dir": str(hydra_run_dir),
         "metrics_summary": summarize_metric_rows(metric_rows),
         "outputs": {
@@ -228,7 +231,7 @@ def run_baseline_command(
             )
             prediction = baseline.fit(train_dataset).predict(test_dataset)
             metrics = evaluate_predictions(prediction, n_clusters=n_clusters)
-            prediction_path = hydra_run_dir / "predictions" / run_paths.run_id / f"{method}.pt"
+            prediction_path = hydra_run_dir / run_paths.run_id / f"{method}.pt"
             save_prediction_payload(prediction_path, prediction)
             metric_rows.append(
                 metric_row(
@@ -262,6 +265,7 @@ def run_baseline_command(
         },
         "command": "baseline",
         "config": config.model_dump(mode="json"),
+        "data_source": dataset_source_payload(config, runs),
         "hydra_run_dir": str(hydra_run_dir),
         "metrics_summary": summarize_metric_rows(metric_rows),
         "outputs": {
@@ -290,3 +294,27 @@ def metric_row(
         "run_id": run_paths.run_id,
         **metrics,
     }
+
+
+def dataset_source_payload(
+    config: ApplicationConfig,
+    runs: list[DatasetRunPaths],
+) -> dict[str, Any]:
+    if not runs:
+        return {"auto_selected": False, "data_root": None}
+    if config.paths.data is not None:
+        root = runs[0].data_root
+    elif config.paths.data_root is not None:
+        root = common_dataset_root(runs)
+    else:
+        root = common_dataset_root(runs)
+    return {
+        "auto_selected": config.paths.data is None and config.paths.data_root is None,
+        "data_root": str(root),
+    }
+
+
+def common_dataset_root(runs: list[DatasetRunPaths]) -> Path:
+    if runs[0].run_id.isdigit() and runs[0].data_root.name == runs[0].run_id:
+        return runs[0].data_root.parent
+    return runs[0].data_root if len(runs) == 1 else runs[0].data_root.parent

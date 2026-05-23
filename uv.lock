@@ -1999,6 +1999,16 @@ wheels = [
 ]
 
 [[package]]
+name = "torch-linear-assignment"
+version = "0.0.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "scipy" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/52/10/eafc7decdd2332430bd9039cd857c383af6876d7642f66944202387a5b2d/torch_linear_assignment-0.0.6.tar.gz", hash = "sha256:6aad76d3c976b40cf1572e81bed8aedbeafdacb817f290e137c7a76ad58fcd23", size = 12383, upload-time = "2026-04-15T06:07:44.39Z" }
+
+[[package]]
 name = "torchmetrics"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2011,6 +2021,11 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/81/34/39b8b749333db56c0585d7a11fa62a283c087bb1dfc897d69fb8cedbefb1/torchmetrics-1.9.0.tar.gz", hash = "sha256:a488609948600df52d3db4fcdab02e62aab2a85ef34da67037dc3e65b8512faa", size = 581765, upload-time = "2026-03-09T17:41:22.443Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c3/a2/c7f6ebf546f8f644edf0f999aa98ece106986a77a7b922316bf6414ff825/torchmetrics-1.9.0-py3-none-any.whl", hash = "sha256:bfdcbff3dd1d96b3374bb2496eb39f23c4b28b8a845b6a18c313688e0d2d9ca1", size = 983384, upload-time = "2026-03-09T17:41:19.756Z" },
+]
+
+[package.optional-dependencies]
+clustering = [
+    { name = "torch-linear-assignment" },
 ]
 
 [[package]]
@@ -2036,7 +2051,7 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "swanlab" },
     { name = "torch" },
-    { name = "torchmetrics" },
+    { name = "torchmetrics", extra = ["clustering"] },
     { name = "tqdm" },
 ]
 
@@ -2059,7 +2074,7 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.8.0" },
     { name = "swanlab", specifier = ">=0.7.18" },
     { name = "torch", specifier = ">=2.12.0" },
-    { name = "torchmetrics", specifier = ">=1.9.0" },
+    { name = "torchmetrics", extras = ["clustering"], specifier = ">=1.9.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]
 

@@ -9,6 +9,7 @@ from typing import Any, NotRequired, TypedDict
 import torch
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from torch import Tensor
+from torchmetrics.functional.clustering import cluster_accuracy
 
 from trails.data import ClinicalTimeSeriesDataset
 from trails.metrics import cluster_assignment_diagnostics, concordance_index
@@ -77,6 +78,9 @@ def evaluate_predictions(
     if true_cluster is not None:
         y_true = true_cluster.detach().cpu().numpy()
         y_pred = pred_cluster.numpy()
+        metrics["acc"] = cluster_accuracy(
+            pred_cluster, true_cluster, pred_cluster.unique().shape[0]
+        ).item()
         metrics["ari"] = float(adjusted_rand_score(y_true, y_pred))
         metrics["nmi"] = float(normalized_mutual_info_score(y_true, y_pred))
     return metrics

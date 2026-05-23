@@ -43,7 +43,7 @@ def test_scenario_configs_validate() -> None:
         assert app_config.simulation.generator.n_clusters > 1
         assert "patients" not in cast(dict[str, Any], payload["simulation"])["generator"]
         assert app_config.training.model.n_clusters > 1
-        assert app_config.training.trainer.valid_size == 0.2
+        assert app_config.training.trainer.valid_size == (0.0 if scenario == "debug" else 0.2)
         assert app_config.baseline.methods == ("summary_kmeans", "risk_stratified_kmeans")
         assert app_config.baseline.n_clusters is None
         assert app_config.baseline.kmeans_iters == 50
@@ -114,14 +114,14 @@ def test_simulate_command_writes_single_train_test_split(tmp_path: Path) -> None
 
     result = workflow.run_simulate_command(app_config, tmp_path / "run", ROOT)
     data_root = tmp_path / "data"
-    train_data = ClinicalTimeSeriesDataset.load(data_root / "train.pt")
-    test_data = ClinicalTimeSeriesDataset.load(data_root / "test.pt")
+    train_data = ClinicalTimeSeriesDataset.load(data_root / "0" / "train.pt")
+    test_data = ClinicalTimeSeriesDataset.load(data_root / "0" / "test.pt")
 
     assert result["command"] == "simulate"
     assert len(train_data) == 6
     assert len(test_data) == 4
     assert (data_root / "simulation_summary.json").exists()
-    assert result["repeats"][0]["run_id"] == "single"
+    assert result["repeats"][0]["run_id"] == "0"
     assert result["repeats"][0]["seed"] == app_config.simulation.seed
     assert train_data.metadata["generation_params"]["n_patients"] == 10
     assert train_data.metadata["generation_params"]["mechanism_seed"] == app_config.simulation.seed
@@ -146,13 +146,13 @@ def test_simulate_command_writes_repeat_train_test_splits(tmp_path: Path) -> Non
 
     result = workflow.run_simulate_command(app_config, tmp_path / "run", ROOT)
 
-    assert [repeat["run_id"] for repeat in result["repeats"]] == ["repeat_000", "repeat_001"]
+    assert [repeat["run_id"] for repeat in result["repeats"]] == ["0", "1"]
     assert [repeat["seed"] for repeat in result["repeats"]] == [
         app_config.simulation.seed,
         app_config.simulation.seed + 1,
     ]
     repeat_cluster_means = []
-    for repeat in ("repeat_000", "repeat_001"):
+    for repeat in ("0", "1"):
         train_data = ClinicalTimeSeriesDataset.load(tmp_path / "data" / repeat / "train.pt")
         test_data = ClinicalTimeSeriesDataset.load(tmp_path / "data" / repeat / "test.pt")
         assert len(train_data) == 5
@@ -226,8 +226,8 @@ def test_train_command_writes_summary_metrics_and_predictions(
     assert result["command"] == "train"
     assert (tmp_path / "run" / "train_summary.json").exists()
     assert (tmp_path / "run" / "train_metrics.csv").exists()
-    assert (tmp_path / "run" / "predictions" / "single" / "trails.pt").exists()
-    assert result["runs"][0]["run_id"] == "single"
+    assert (tmp_path / "run" / "0" / "trails.pt").exists()
+    assert result["runs"][0]["run_id"] == "0"
     assert result["runs"][0]["metrics"]["cindex"] == 1.0
 
 
@@ -272,9 +272,10 @@ def test_baseline_command_writes_summary_metrics_and_predictions(tmp_path: Path)
     methods = {method["method"]: method["metrics"] for method in result["runs"][0]["methods"]}
     assert set(methods) == {"summary_kmeans", "risk_stratified_kmeans"}
     for method in methods:
-        assert (tmp_path / "run" / "predictions" / "single" / f"{method}.pt").exists()
+        assert (tmp_path / "run" / "0" / f"{method}.pt").exists()
     for metrics in methods.values():
         assert "cindex" in metrics
+        assert "acc" in metrics
         assert "ari" in metrics
         assert "nmi" in metrics
         assert "cluster_entropy" in metrics

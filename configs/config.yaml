@@ -18,7 +18,7 @@ hydra:
   job:
     chdir: false
   run:
-    dir: outputs/${simulation.name}/${now:%Y%m%d-%H%M%S-%f}
+    dir: outputs/${simulation.name}/${command}-${now:%Y%m%d-%H%M%S-%f}
   sweep:
-    dir: multirun/${simulation.name}/${now:%Y%m%d-%H%M%S-%f}
+    dir: multirun/${simulation.name}/${command}-${now:%Y%m%d-%H%M%S-%f}
     subdir: ${hydra.job.num}

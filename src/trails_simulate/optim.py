@@ -118,7 +118,7 @@ def run_optim_trial(
     train_paths = TrainPaths(
         data=train_data,
         test_data=test_data,
-        train_root=optim_root / "train",
+        train_root=optim_root / str(trial.number),
         save=None,
     )
     result = fit_training_run(

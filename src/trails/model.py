@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .config import DataConfig, DecoderConfig, EncoderConfig, ModelConfig
+from .config import DataConfig, DecoderConfig, EncoderConfig, EncoderInputConfig, ModelConfig
 from .data import Batch
 from .metrics import (
     masked_mse,
@@ -178,24 +178,41 @@ class GRUDInputLayer(nn.Module):
 
 
 class MTANInputLayer(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, n_heads: int, dropout: float) -> None:
+    def __init__(
+        self,
+        input_size: int,
+        config: EncoderInputConfig,
+        dropout: float,
+    ) -> None:
         super().__init__()
-        self.value_projection = nn.Linear(input_size * 3, hidden_size)
-        self.time_projection = nn.Linear(4, hidden_size)
-        self.attention = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
+        self.input_size = input_size
+        self.hidden_size = config.hidden_dim
+        self.num_ref_points = config.num_ref_points
+        time_embedding_dim = config.time_embedding_dim or config.hidden_dim
+        self.feature_embedding = nn.Embedding(input_size, config.hidden_dim)
+        self.time_embedding = TimeEmbedding(
+            embedding_dim=time_embedding_dim,
+            learn_embedding=config.learn_time_embedding,
+            frequency=config.time_embedding_frequency,
         )
-        self.attention_norm = nn.LayerNorm(hidden_size)
+        self.attention = MultiTimeAttention(
+            input_dim=config.hidden_dim + 2,
+            hidden_dim=config.hidden_dim,
+            time_embedding_dim=time_embedding_dim,
+            n_heads=config.n_heads,
+            dropout=dropout,
+        )
+        self.attention_norm = nn.LayerNorm(config.hidden_dim)
         self.ffn = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 2),
+            nn.Linear(config.hidden_dim, config.hidden_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Linear(config.hidden_dim * 2, config.hidden_dim),
         )
-        self.ffn_norm = nn.LayerNorm(hidden_size)
+        self.ffn_norm = nn.LayerNorm(config.hidden_dim)
+        self.reference_times = nn.Buffer(
+            torch.linspace(0.0, 1.0, config.num_ref_points, dtype=torch.float32)
+        )
 
     def forward(
         self,
@@ -203,31 +220,175 @@ class MTANInputLayer(nn.Module):
         times: Tensor,
         x: Tensor,
         mask: Tensor,
-        delta_time: Tensor,
-        sequence_lengths: Tensor,
-        feature_means: Tensor,
-    ) -> Tensor:
-        mean = feature_means.view(1, 1, -1).expand_as(x)
-        imputed = mask * x + (1.0 - mask) * mean
-        values = self.value_projection(torch.cat([imputed, mask, delta_time], dim=-1))
-        time_embedding = self.time_projection(visit_time_features(times))
-        padding_mask = sequence_padding_mask(sequence_lengths, x.shape[1], x.device)
-        # mTAN-like 输入层：用观测值/缺失模式作 value，用真实访问时间构造 query/key。
-        attended, _weights = self.attention(
-            query=time_embedding,
-            key=time_embedding,
-            value=values,
-            key_padding_mask=padding_mask,
-            need_weights=False,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        batch_size, max_length, n_features = x.shape
+        if n_features != self.input_size:
+            raise ValueError(f"Expected {self.input_size} features, got {n_features}.")
+        if times.ndim == 2:
+            times = times.unsqueeze(-1).expand_as(x)
+
+        token_mask = mask.reshape(batch_size, max_length * n_features) > 0
+        max_observed_time = (times * mask).reshape(batch_size, -1).max(dim=1).values.clamp_min(1e-6)
+        normalized_times = times / max_observed_time.view(batch_size, 1, 1)
+        key_times = normalized_times.reshape(batch_size, max_length * n_features)
+        query_times = (
+            self.reference_times.to(device=x.device, dtype=x.dtype)
+            .unsqueeze(0)
+            .expand(
+                batch_size,
+                -1,
+            )
         )
-        attended = self.attention_norm(attended + values)
-        encoded = self.ffn_norm(attended + self.ffn(attended))
-        return encoded * active_sequence_mask(
-            sequence_lengths,
-            x.shape[1],
-            dtype=x.dtype,
+
+        feature_index = torch.arange(n_features, device=x.device).repeat(max_length)
+        feature_tokens = (
+            self.feature_embedding(feature_index).unsqueeze(0).expand(batch_size, -1, -1)
+        )
+        values = torch.cat(
+            [
+                x.reshape(batch_size, max_length * n_features, 1),
+                mask.reshape(batch_size, max_length * n_features, 1),
+                feature_tokens,
+            ],
+            dim=-1,
+        )
+        key_embedding = self.time_embedding(key_times)
+        query_embedding = self.time_embedding(query_times)
+        attended = self.attention(
+            query=query_embedding,
+            key=key_embedding,
+            value=values,
+            mask=token_mask,
+        )
+        encoded = self.attention_norm(attended)
+        encoded = self.ffn_norm(encoded + self.ffn(encoded))
+        sequence_lengths = torch.full(
+            (batch_size,),
+            self.num_ref_points,
+            dtype=torch.long,
             device=x.device,
         )
+        return encoded, query_times, sequence_lengths
+
+
+class TimeEmbedding(nn.Module):
+    def __init__(self, *, embedding_dim: int, learn_embedding: bool, frequency: float) -> None:
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.learn_embedding = learn_embedding
+        self.frequency = frequency
+        if learn_embedding:
+            self.linear = nn.Linear(1, 1)
+            self.periodic = nn.Linear(1, embedding_dim - 1) if embedding_dim > 1 else None
+        else:
+            self.linear = None
+            self.periodic = None
+
+    def forward(self, times: Tensor) -> Tensor:
+        if self.learn_embedding:
+            expanded = times.unsqueeze(-1)
+            linear = self._required_linear(expanded)
+            if self.embedding_dim == 1:
+                return linear
+            periodic = self._required_periodic(expanded)
+            return torch.cat([linear, torch.sin(periodic)], dim=-1)
+        return self.fixed_time_embedding(times)
+
+    def fixed_time_embedding(self, times: Tensor) -> Tensor:
+        position = 48.0 * times.unsqueeze(-1)
+        embedding = times.new_zeros(*times.shape, self.embedding_dim)
+        div_term = torch.exp(
+            torch.arange(0, self.embedding_dim, 2, device=times.device, dtype=times.dtype)
+            * -(math.log(self.frequency) / self.embedding_dim)
+        )
+        embedding[..., 0::2] = torch.sin(position * div_term)
+        if self.embedding_dim > 1:
+            embedding[..., 1::2] = torch.cos(position * div_term[: embedding[..., 1::2].shape[-1]])
+        return embedding
+
+    def _required_linear(self, times: Tensor) -> Tensor:
+        if self.linear is None:
+            raise RuntimeError("learned time embedding linear layer is not initialized.")
+        return self.linear(times)
+
+    def _required_periodic(self, times: Tensor) -> Tensor:
+        if self.periodic is None:
+            raise RuntimeError("learned time embedding periodic layer is not initialized.")
+        return self.periodic(times)
+
+
+class MultiTimeAttention(nn.Module):
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        hidden_dim: int,
+        time_embedding_dim: int,
+        n_heads: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if time_embedding_dim % n_heads != 0:
+            raise ValueError("time_embedding_dim must be divisible by n_heads.")
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.time_embedding_dim = time_embedding_dim
+        self.n_heads = n_heads
+        self.head_dim = time_embedding_dim // n_heads
+        self.query_projection = nn.Linear(time_embedding_dim, time_embedding_dim)
+        self.key_projection = nn.Linear(time_embedding_dim, time_embedding_dim)
+        self.output_projection = nn.Linear(input_dim * n_heads, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        *,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        mask: Tensor,
+    ) -> Tensor:
+        batch_size, query_length, _embed_dim = query.shape
+        key_length = int(key.shape[1])
+        query_heads = self.query_projection(query).view(
+            batch_size,
+            query_length,
+            self.n_heads,
+            self.head_dim,
+        )
+        key_heads = self.key_projection(key).view(
+            batch_size,
+            key_length,
+            self.n_heads,
+            self.head_dim,
+        )
+        query_heads = query_heads.transpose(1, 2)
+        key_heads = key_heads.transpose(1, 2)
+        scores = torch.matmul(query_heads, key_heads.transpose(-2, -1)) / math.sqrt(
+            float(self.head_dim)
+        )
+        attention = masked_softmax(scores, mask[:, None, None, :])
+        attention = self.dropout(attention)
+        value_heads = value.unsqueeze(1).expand(-1, self.n_heads, -1, -1)
+        attended = torch.matmul(attention, value_heads)
+        attended = (
+            attended.transpose(1, 2)
+            .contiguous()
+            .view(
+                batch_size,
+                query_length,
+                self.n_heads * self.input_dim,
+            )
+        )
+        return self.output_projection(attended)
+
+
+def masked_softmax(scores: Tensor, mask: Tensor) -> Tensor:
+    mask_float = mask.to(dtype=scores.dtype)
+    masked_scores = scores.masked_fill(~mask, -1e9)
+    shifted = masked_scores - masked_scores.amax(dim=-1, keepdim=True)
+    weights = torch.exp(shifted) * mask_float
+    return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
 
 class RecurrentMappingLayer(nn.Module):
@@ -315,8 +476,7 @@ class TrailsEncoder(nn.Module):
         else:
             self.input_layer = MTANInputLayer(
                 data_config.n_features,
-                encoder_config.input.hidden_dim,
-                encoder_config.input.n_heads,
+                encoder_config.input,
                 dropout,
             )
 
@@ -346,11 +506,13 @@ class TrailsEncoder(nn.Module):
         times: Tensor,
         x: Tensor,
         mask: Tensor,
-        delta_time: Tensor,
-        sequence_lengths: Tensor,
+        delta_time: Tensor | None,
+        sequence_lengths: Tensor | None,
         feature_means: Tensor,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         if self.encoder_config.input.kind == "grud":
+            if delta_time is None or sequence_lengths is None:
+                raise ValueError("GRUD encoder requires delta_time and sequence_lengths.")
             input_sequence = self.input_layer(
                 x=x,
                 mask=mask,
@@ -358,17 +520,16 @@ class TrailsEncoder(nn.Module):
                 sequence_lengths=sequence_lengths,
                 feature_means=feature_means,
             )
+            mapping_times = times
+            mapping_lengths = sequence_lengths
         else:
-            input_sequence = self.input_layer(
+            input_sequence, mapping_times, mapping_lengths = self.input_layer(
                 times=times,
                 x=x,
                 mask=mask,
-                delta_time=delta_time,
-                sequence_lengths=sequence_lengths,
-                feature_means=feature_means,
             )
-        mapped_sequence = self.mapping(input_sequence, times, sequence_lengths)
-        return self.seq_pool(mapped_sequence, sequence_lengths)
+        mapped_sequence = self.mapping(input_sequence, mapping_times, mapping_lengths)
+        return self.seq_pool(mapped_sequence, mapping_lengths), mapping_times, mapping_lengths
 
 
 class RecurrentDecoder(nn.Module):
@@ -588,10 +749,11 @@ class TrailsSurvVaderModel(nn.Module):
         times: Tensor,
         x: Tensor,
         mask: Tensor,
-        delta_time: Tensor,
-        sequence_lengths: Tensor,
+        delta_time: Tensor | None = None,
+        sequence_lengths: Tensor | None = None,
+        feature_lengths: Tensor | None = None,
     ) -> TrailsModelOutput:
-        hidden = self.encoder(
+        hidden, encoder_times, encoder_sequence_lengths = self.encoder(
             times=times,
             x=x,
             mask=mask,
@@ -602,7 +764,15 @@ class TrailsSurvVaderModel(nn.Module):
         latent_mean = self.latent_mean(hidden)
         latent_log_variance = self.latent_log_variance(hidden)
         latent = self._sample_latent(latent_mean, latent_log_variance)
-        reconstruction = self.decoder(latent, times, sequence_lengths)
+        reconstruction = self._decode_reconstruction(
+            latent,
+            batch_times=times,
+            batch_mask=mask,
+            aligned_sequence_lengths=sequence_lengths,
+            encoder_times=encoder_times,
+            encoder_sequence_lengths=encoder_sequence_lengths,
+            feature_lengths=feature_lengths,
+        )
         cluster_logits = self._cluster_logits(latent)
         cluster_probabilities = torch.softmax(cluster_logits, dim=-1)
         survival_raw = self.survival_head(latent).reshape(-1, self.model_config.n_clusters, 2)
@@ -616,6 +786,41 @@ class TrailsSurvVaderModel(nn.Module):
             cluster_probabilities=cluster_probabilities,
             weibull_shape=weibull_params[..., 0],
             weibull_scale=weibull_params[..., 1],
+        )
+
+    def _decode_reconstruction(
+        self,
+        latent: Tensor,
+        *,
+        batch_times: Tensor,
+        batch_mask: Tensor,
+        aligned_sequence_lengths: Tensor | None,
+        encoder_times: Tensor,
+        encoder_sequence_lengths: Tensor,
+        feature_lengths: Tensor | None,
+    ) -> Tensor:
+        if feature_lengths is None:
+            if aligned_sequence_lengths is None:
+                raise ValueError("Aligned reconstruction requires sequence_lengths.")
+            return self.decoder(latent, batch_times, aligned_sequence_lengths)
+
+        del encoder_times, encoder_sequence_lengths, feature_lengths
+        batch_size, max_length, n_features = batch_times.shape
+        flat_times = batch_times.reshape(batch_size, max_length * n_features)
+        flat_lengths = torch.full(
+            (batch_size,),
+            max_length * n_features,
+            dtype=torch.long,
+            device=batch_times.device,
+        )
+        flat_reconstruction = self.decoder(latent, flat_times, flat_lengths)
+        feature_index = torch.arange(n_features, device=batch_times.device).repeat(max_length)
+        gathered = flat_reconstruction.gather(
+            dim=-1,
+            index=feature_index.view(1, max_length * n_features, 1).expand(batch_size, -1, 1),
+        )
+        return gathered.reshape(batch_size, max_length, n_features) * (batch_mask > 0).to(
+            dtype=gathered.dtype
         )
 
     def compute_loss(

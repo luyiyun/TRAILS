@@ -7,7 +7,7 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor
 
-from trails.data import ClinicalSample, ClinicalTimeSeriesDataset, make_clinical_sample
+from trails.data import AlignedClinicalSample, ClinicalTimeSeriesDataset, make_clinical_sample
 
 from .utils import (
     _low_rank_matrix,
@@ -66,9 +66,15 @@ class ClinicalTimeSeriesDatasetGeneratorConfig(BaseModel):
 
 
 class ClinicalTimeSeriesDatasetGenerator:
-    def __init__(self, config: ClinicalTimeSeriesDatasetGeneratorConfig):
+    def __init__(
+        self,
+        config: ClinicalTimeSeriesDatasetGeneratorConfig,
+        mechanism_seed: int | None = None,
+    ):
         self.config = config
-        self.mechanism_seed = self.config.mechanism_seed
+        self.mechanism_seed = (
+            self.config.mechanism_seed if mechanism_seed is None else mechanism_seed
+        )
         mechanism_generator = torch.Generator().manual_seed(self.mechanism_seed)
         self.resolved_attention_heads = config.attention_heads or _default_attention_heads(
             config.hidden_size
@@ -204,7 +210,7 @@ class ClinicalTimeSeriesDatasetGenerator:
         )
 
         # 6. 非同步采样
-        samples: list[ClinicalSample] = []
+        samples: list[AlignedClinicalSample] = []
         for patient_index in range(n_patients):
             seq_len = int(sequence_lengths[patient_index])
             # 检查记录只能发生在患者实际观测终点之前；否则会出现事件/删失后仍有检查的矛盾。

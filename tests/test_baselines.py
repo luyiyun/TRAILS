@@ -35,7 +35,7 @@ def simulate_split() -> tuple[ClinicalTimeSeriesDataset, ClinicalTimeSeriesDatas
 def with_replaced_test_survival(data: ClinicalTimeSeriesDataset) -> ClinicalTimeSeriesDataset:
     samples = []
     for index in range(len(data)):
-        sample = data[index]
+        sample = data.samples[index].to_aligned()
         samples.append(
             make_clinical_sample(
                 times=sample.times,
@@ -66,7 +66,7 @@ def test_summary_baseline_class_api_and_sklearn_fit() -> None:
     assert fitted is baseline
     assert isinstance(baseline.cluster_model, KMeans)
     assert prediction["pred_cluster"].shape == (len(test_data),)
-    assert metrics.keys() >= {"cindex", "ari", "nmi", "cluster_entropy"}
+    assert metrics.keys() >= {"cindex", "acc", "ari", "nmi", "cluster_entropy"}
 
 
 def test_risk_stratified_baseline_class_api_and_sklearn_fit() -> None:

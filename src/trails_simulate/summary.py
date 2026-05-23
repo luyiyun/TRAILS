@@ -52,9 +52,15 @@ def format_simulate_summary(result: Mapping[str, Any]) -> str:
 def format_train_summary(result: Mapping[str, Any]) -> str:
     outputs = dict(result["outputs"])
     runs = [dict(run) for run in result["runs"]]
+    data_source = dict(result.get("data_source", {}))
+    data_source_label = (
+        "latest simulation" if data_source.get("auto_selected") else "configured path"
+    )
     lines = [
         "TRAILS train complete",
         f"Hydra run: {result['hydra_run_dir']}",
+        f"Data root: {data_source.get('data_root', 'unknown')}",
+        f"Data source: {data_source_label}",
         f"Runs: {len(runs)}",
         "",
         "Saved summaries:",
@@ -100,9 +106,15 @@ def format_baseline_summary(result: Mapping[str, Any]) -> str:
     outputs = dict(result["outputs"])
     baseline = dict(result["baseline"])
     runs = [dict(run) for run in result["runs"]]
+    data_source = dict(result.get("data_source", {}))
+    data_source_label = (
+        "latest simulation" if data_source.get("auto_selected") else "configured path"
+    )
     lines = [
         "TRAILS baseline complete",
         f"Hydra run: {result['hydra_run_dir']}",
+        f"Data root: {data_source.get('data_root', 'unknown')}",
+        f"Data source: {data_source_label}",
         f"Runs: {len(runs)}",
         f"Clusters: {baseline['n_clusters_resolved']}",
         "",
@@ -215,6 +227,7 @@ def ordered_metric_names(names: Iterable[str]) -> list[str]:
         "loss",
         "cindex",
         "c_index",
+        "acc",
         "ari",
         "nmi",
         "cluster_empty_count",

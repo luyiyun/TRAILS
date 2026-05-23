@@ -44,6 +44,7 @@ def tiny_config(n_features: int) -> TrailsConfig:
 
 
 def strip_cluster_labels(data: ClinicalTimeSeriesDataset) -> ClinicalTimeSeriesDataset:
+    aligned_samples = [sample.to_aligned() for sample in data.samples]
     return ClinicalTimeSeriesDataset(
         [
             make_clinical_sample(
@@ -54,7 +55,7 @@ def strip_cluster_labels(data: ClinicalTimeSeriesDataset) -> ClinicalTimeSeriesD
                 survival_time=sample.survival_time,
                 event=sample.event,
             )
-            for sample in data
+            for sample in aligned_samples
         ],
         feature_names=data.feature_names,
         description=data.description,
@@ -91,6 +92,7 @@ def test_estimator_fit_predict_test() -> None:
     assert not any(key.startswith("val_") for key in estimator.history[-1])
     assert metrics["loss"] > 0
     assert "cindex" in metrics
+    assert "acc" in metrics
     assert "ari" in metrics
     assert "nmi" in metrics
     assert "vade_kl_loss" in metrics
@@ -134,6 +136,7 @@ def test_unlabeled_data_skips_cluster_metrics() -> None:
     metrics = estimator.test(data)
 
     assert "ari" not in metrics
+    assert "acc" not in metrics
     assert "nmi" not in metrics
     assert "cluster_empty_count" in metrics
     assert "cluster_entropy" in metrics

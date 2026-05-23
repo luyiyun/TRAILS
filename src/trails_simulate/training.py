@@ -11,7 +11,6 @@ from typing import Any
 import swanlab
 
 from trails.artifacts import (
-    create_timestamped_run_dir,
     plot_history,
     resolve_artifact_names,
     save_history_csv,
@@ -129,7 +128,8 @@ def save_training_artifacts(
         return None
 
     created_at = datetime.now().astimezone()
-    run_dir = create_timestamped_run_dir(train_paths.train_root, created_at)
+    run_dir = train_paths.train_root
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     # artifacts.names 与 diagnostics 开关共同决定训练后落盘产物边界。
     if "config" in artifacts:
