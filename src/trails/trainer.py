@@ -216,7 +216,11 @@ class TrailsTrainer:
             if history_callback is not None:
                 history_callback(entry)
 
-            if early_stopper is not None and early_stopper.update(entry, self.model):
+            if (
+                (epoch + 1) >= self.config.min_epochs
+                and early_stopper is not None
+                and early_stopper.update(entry, self.model)
+            ):
                 break
 
         if early_stopper is not None and early_stopper.best_state is not None:

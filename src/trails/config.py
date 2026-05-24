@@ -126,6 +126,7 @@ class ModelConfig(BaseModel):
 class TrainerConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    min_epochs: int = Field(default=1, gt=0)
     max_epochs: int = Field(default=10, gt=0)
     batch_size: int | None = Field(default=None, gt=0)
     learning_rate: float = Field(default=1e-3, gt=0.0)

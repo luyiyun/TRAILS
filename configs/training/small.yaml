@@ -26,7 +26,7 @@ model:
     n_heads: 2
 trainer:
   max_epochs: 2
-  batch_size: null
+  batch_size: 64
   learning_rate: 1.0e-3
   warmup_epochs: 1
   gmm_init_iters: 5
@@ -35,9 +35,9 @@ trainer:
   seed: 20260517
   valid_size: 0.2
   early_stop: true
-  early_stopping_patience: 5
-  early_stopping_min_delta: 0.001
-  early_stopping_monitor: "loss"
+  early_stopping_patience: 30
+  early_stopping_min_delta: 0.0
+  early_stopping_monitor: "cindex"
 artifacts:
   names: [config, history, test, plot]
   save: null
