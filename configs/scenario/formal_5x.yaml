@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - override /simulation: formal_5x
-  - override /training: formal_5x
-
-command: simulate

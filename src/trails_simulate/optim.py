@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,17 +14,8 @@ from .config import (
     ApplicationConfig,
     FloatSearchRangeConfig,
 )
-from .generators import ClinicalTimeSeriesDatasetGenerator
-from .path import TrainPaths, resolve_path
+from .path import DatasetRunPaths, TrainPaths, discover_dataset_runs, resolve_path
 from .training import fit_training_run
-
-
-@dataclass(frozen=True)
-class OptimDataPaths:
-    train_data: Path
-    test_data: Path
-    source: str
-    splits: dict[str, dict[str, Any]]
 
 
 def run_optim_command(
@@ -33,21 +23,66 @@ def run_optim_command(
     hydra_run_dir: Path,
     project_root: Path,
 ) -> dict[str, Any]:
+    raise NotImplementedError("Optim command is not implemented yet.")
     optuna = load_optuna()
-    optim_root = resolve_path(config.optim.root, project_root)
-    optim_root.mkdir(parents=True, exist_ok=True)
+    runs = discover_dataset_runs(config, hydra_run_dir, project_root)
+    if config.optim.storage is not None and len(runs) > 1:
+        raise ValueError("optim.storage can only be used when command=optim receives one dataset.")
 
-    optim_data = optim_data_paths(config, optim_root=optim_root, project_root=project_root)
-    validate_optim_test_data(optim_data.test_data)
+    run_payloads = []
+    for index, run_paths in enumerate(runs):
+        validate_optim_test_data(run_paths.test_data)
+        run_root = hydra_run_dir / run_paths.run_id
+        run_payloads.append(
+            run_optim_dataset(
+                optuna,
+                config=config,
+                run_paths=run_paths,
+                run_root=run_root,
+                project_root=project_root,
+                seed=config.training.trainer.seed + index,
+                study_name=optim_study_name(config.optim.study_name, run_paths, len(runs)),
+            )
+        )
 
-    storage_url = optim_storage_url(config.optim.storage, optim_root, project_root)
-    sampler = optuna.samplers.TPESampler(seed=config.simulation.seed)
+    summary_path = hydra_run_dir / "optim_summary.json"
+    summary = {
+        "command": "optim",
+        "config": config.model_dump(mode="json"),
+        "hydra_run_dir": str(hydra_run_dir),
+        "n_trials_requested": config.optim.n_trials,
+        "outputs": {
+            "summary": str(summary_path),
+        },
+        "paths": {
+            "optim_summary": str(summary_path),
+        },
+        "runs": run_payloads,
+    }
+
+    save_json(summary_path, summary)
+    return summary
+
+
+def run_optim_dataset(
+    optuna: Any,
+    *,
+    config: ApplicationConfig,
+    run_paths: DatasetRunPaths,
+    run_root: Path,
+    project_root: Path,
+    seed: int,
+    study_name: str,
+) -> dict[str, Any]:
+    run_root.mkdir(parents=True, exist_ok=True)
+    storage_url = optim_storage_url(config.optim.storage, run_root, project_root)
+    sampler = optuna.samplers.TPESampler(seed=seed)
     study = optuna.create_study(
         directions=["maximize", "maximize"],
         load_if_exists=True,
         sampler=sampler,
         storage=storage_url,
-        study_name=config.optim.study_name,
+        study_name=study_name,
     )
 
     completed_before = count_completed_trials(study.trials)
@@ -55,43 +90,48 @@ def run_optim_command(
         lambda trial: run_optim_trial(
             trial,
             config=config,
-            optim_root=optim_root,
-            train_data=optim_data.train_data,
-            test_data=optim_data.test_data,
+            optim_root=run_root,
+            train_data=run_paths.train_data,
+            test_data=run_paths.test_data,
+            seed=seed + trial.number,
         ),
         n_trials=config.optim.n_trials,
     )
     completed_after = count_completed_trials(study.trials)
 
-    summary_path = optim_root / "optim_summary.json"
-    trials_csv_path = optim_root / "trials.csv"
-    pareto_path = optim_root / "pareto_trials.json"
+    summary_path = run_root / "optim_summary.json"
+    trials_csv_path = run_root / "trials.csv"
+    pareto_path = run_root / "pareto_trials.json"
     pareto_trials = serialize_optim_trials(study.best_trials)
     all_trials = serialize_optim_trials(study.trials)
-    summary = {
-        "command": "optim",
-        "config": config.model_dump(mode="json"),
-        "data": optim_data_payload(optim_data),
-        "hydra_run_dir": str(hydra_run_dir),
+    payload = {
+        "data": {
+            "splits": optim_existing_split_summaries(
+                run_paths.train_data,
+                run_paths.test_data,
+            ),
+            "test_data": str(run_paths.test_data),
+            "train_data": str(run_paths.train_data),
+        },
         "n_completed_after": completed_after,
         "n_completed_before": completed_before,
-        "n_trials_requested": config.optim.n_trials,
-        "optim_root": str(optim_root),
-        "pareto_trials": pareto_trials,
-        "paths": {
+        "outputs": {
             "optim_summary": str(summary_path),
             "pareto_trials": str(pareto_path),
             "trials_csv": str(trials_csv_path),
         },
+        "run_id": run_paths.run_id,
+        "run_root": str(run_root),
+        "seed": seed,
         "storage": storage_url,
         "study_name": study.study_name,
         "trials": all_trials,
+        "pareto_trials": pareto_trials,
     }
-
-    save_json(summary_path, summary)
+    save_json(summary_path, payload)
     save_optim_trials_csv(trials_csv_path, study.trials)
     save_json(pareto_path, pareto_trials)
-    return summary
+    return payload
 
 
 def load_optuna() -> Any:
@@ -100,7 +140,7 @@ def load_optuna() -> Any:
     except ImportError as error:
         raise RuntimeError(
             "command=optim requires Optuna. Install the project dev dependencies with "
-            "`uv sync --group dev` before running `uv run main.py scenario=optim`."
+            "`uv sync --group dev` before running `uv run main.py command=optim`."
         ) from error
     return optuna
 
@@ -112,9 +152,9 @@ def run_optim_trial(
     optim_root: Path,
     train_data: Path,
     test_data: Path,
+    seed: int,
 ) -> tuple[float, float]:
-    trial_seed = config.simulation.seed + trial.number
-    trial_config = optim_trial_config(config, trial)
+    trial_config = optim_trial_config(config_for_dataset_clusters(config, train_data), trial)
     train_paths = TrainPaths(
         data=train_data,
         test_data=test_data,
@@ -124,13 +164,13 @@ def run_optim_trial(
     result = fit_training_run(
         trial_config,
         train_paths=train_paths,
-        seed=trial_seed,
+        seed=seed,
         swanlab_repeat_label=None,
     )
     cindex = required_metric(result.metrics, "cindex", trial.number)
     ari = required_metric(result.metrics, "ari", trial.number)
 
-    trial.set_user_attr("seed", trial_seed)
+    trial.set_user_attr("seed", seed)
     trial.set_user_attr("metrics", json_safe_metrics(result.metrics))
     trial.set_user_attr("model_config", trial_config.training.model.model_dump(mode="json"))
     trial.set_user_attr("trainer_config", trial_config.training.trainer.model_dump(mode="json"))
@@ -256,159 +296,59 @@ def set_trial_user_attr(trial: Any, name: str, value: Any) -> None:
         set_user_attr(name, value)
 
 
-def optim_data_paths(
-    config: ApplicationConfig,
-    *,
-    optim_root: Path,
-    project_root: Path,
-) -> OptimDataPaths:
-    configured_data_root = (
-        None
-        if config.paths.data_root is None
-        else resolve_path(config.paths.data_root, project_root)
-    )
-    if configured_data_root is not None:
-        train_data = (
-            resolve_path(config.paths.data, project_root)
-            if config.paths.data is not None
-            else configured_data_root / "train.pt"
-        )
-        test_data = (
-            resolve_path(config.paths.test_data, project_root)
-            if config.paths.test_data is not None
-            else configured_data_root / "test.pt"
-        )
-        return OptimDataPaths(
-            train_data=train_data,
-            test_data=test_data,
-            source="external",
-            splits=optim_existing_split_summaries(config, train_data, test_data),
-        )
-
-    if config.paths.data is not None or config.paths.test_data is not None:
-        if config.paths.data is None or config.paths.test_data is None:
-            raise ValueError(
-                "command=optim requires both paths.data and paths.test_data when paths.data_root "
-                "is not set."
+def config_for_dataset_clusters(config: ApplicationConfig, train_data: Path) -> ApplicationConfig:
+    dataset = ClinicalTimeSeriesDataset.load(train_data)
+    params = dataset.metadata.get("generation_params")
+    if not isinstance(params, Mapping) or "n_clusters" not in params:
+        return config
+    n_clusters = int(params["n_clusters"])
+    return config.model_copy(
+        update={
+            "training": config.training.model_copy(
+                update={
+                    "model": config.training.model.model_copy(update={"n_clusters": n_clusters})
+                }
             )
-        train_data = resolve_path(config.paths.data, project_root)
-        test_data = resolve_path(config.paths.test_data, project_root)
-        return OptimDataPaths(
-            train_data=train_data,
-            test_data=test_data,
-            source="external",
-            splits=optim_existing_split_summaries(config, train_data, test_data),
-        )
-
-    data_dir = optim_root / "data"
-    train_data = data_dir / "train.pt"
-    test_data = data_dir / "test.pt"
-    train_patients, test_patients = optim_patient_counts(config)
-    splits = {
-        "train": optim_cached_or_generate_split(
-            config,
-            out=train_data,
-            patient_count=train_patients,
-            seed=config.simulation.seed,
-        ),
-        "test": optim_cached_or_generate_split(
-            config,
-            out=test_data,
-            patient_count=test_patients,
-            seed=config.simulation.seed + 1,
-        ),
-    }
-    return OptimDataPaths(
-        train_data=train_data,
-        test_data=test_data,
-        source="cache",
-        splits=splits,
+        }
     )
+
+
+def optim_study_name(study_name: str, run_paths: DatasetRunPaths, n_runs: int) -> str:
+    if n_runs == 1:
+        return study_name
+    return f"{study_name}-{run_paths.run_id.replace('/', '-')}"
 
 
 def optim_existing_split_summaries(
-    config: ApplicationConfig,
     train_data: Path,
     test_data: Path,
 ) -> dict[str, dict[str, Any]]:
     return {
         "train": existing_dataset_summary(
             train_data,
-            clusters=config.simulation.generator.n_clusters,
             default_seed=0,
         ),
         "test": existing_dataset_summary(
             test_data,
-            clusters=config.simulation.generator.n_clusters,
             default_seed=0,
         ),
     }
 
 
-def optim_cached_or_generate_split(
-    config: ApplicationConfig,
-    *,
-    out: Path,
-    patient_count: int,
-    seed: int,
-) -> dict[str, Any]:
-    if out.exists():
-        return existing_dataset_summary(
-            out,
-            clusters=config.simulation.generator.n_clusters,
-            default_seed=seed,
-        )
-    return simulate_one_dataset(
-        config,
-        out=out,
-        patient_count=patient_count,
-        seed=seed,
-    )
-
-
-def optim_patient_counts(config: ApplicationConfig) -> tuple[int, int]:
-    return config.simulation.train_size, config.simulation.test_size
-
-
 def existing_dataset_summary(
     path: Path,
     *,
-    clusters: int,
     default_seed: int,
 ) -> dict[str, Any]:
     dataset = ClinicalTimeSeriesDataset.load(path)
     metadata_params = dataset.metadata.get("generation_params")
     if isinstance(metadata_params, Mapping):
         seed = int(metadata_params.get("sample_seed", metadata_params.get("seed", default_seed)))
-        clusters = int(metadata_params.get("n_clusters", clusters))
+        clusters = int(metadata_params.get("n_clusters", 0))
     else:
         seed = default_seed
+        clusters = 0
     return simulation_summary(dataset, clusters=clusters, out=path, seed=seed)
-
-
-def simulate_one_dataset(
-    config: ApplicationConfig,
-    *,
-    out: Path,
-    patient_count: int,
-    seed: int,
-) -> dict[str, Any]:
-    mechanism_seed = (
-        config.simulation.seed
-        if config.simulation.mechanism_seed is None
-        else config.simulation.mechanism_seed
-    )
-    dataset = ClinicalTimeSeriesDatasetGenerator(
-        config.simulation.generator,
-        mechanism_seed=mechanism_seed,
-    ).simulate(n_patients=patient_count, seed=seed)
-    dataset.save(out)
-    return simulation_summary(
-        dataset,
-        clusters=config.simulation.generator.n_clusters,
-        out=out,
-        seed=seed,
-    )
 
 
 def simulation_summary(
@@ -463,15 +403,6 @@ def json_safe_metrics(metrics: Mapping[str, float]) -> dict[str, float | str]:
 
 def count_completed_trials(trials: Sequence[Any]) -> int:
     return sum(1 for trial in trials if trial.state.name == "COMPLETE")
-
-
-def optim_data_payload(optim_data: OptimDataPaths) -> dict[str, Any]:
-    return {
-        "source": optim_data.source,
-        "splits": optim_data.splits,
-        "test_data": str(optim_data.test_data),
-        "train_data": str(optim_data.train_data),
-    }
 
 
 def serialize_optim_trials(trials: Sequence[Any]) -> list[dict[str, Any]]:

@@ -14,7 +14,7 @@ items.
 ## Layout
 
 - `main.py`: all CLI commands. Use `uv run main.py ...`.
-- `configs/`: Hydra simulation/training configuration and reusable scenarios.
+- `configs/`: Hydra simulation, training, baseline, and optimization configuration.
 - `src/trails/`: reusable core code: data, model, trainer, estimator, metrics.
 - `src/trails_simulate/`: synthetic clinical data generation; imports `trails`.
 - `src/trails_case/`: future real-data/case-study utilities; imports `trails`.
@@ -40,12 +40,12 @@ clean reusable method library.
 
 ## Commands
 
-- Quick simulation split generation: `uv run main.py scenario=quick`
-- Normal SwanLab tuning run: `uv run main.py command=train scenario=debug paths.data_root=data/simulated/debug training.trainer.max_epochs=5 training.swanlab.mode=disabled`
-- Formal repeated simulation: `uv run main.py scenario=formal_5x`
-- Simulate only: `uv run main.py command=simulate scenario=quick paths.data_root=data/simulated/quick`
-- Train existing splits: `uv run main.py command=train scenario=quick paths.data_root=data/simulated/quick`
-- Run lightweight baselines on existing splits: `uv run main.py command=baseline scenario=quick paths.data_root=data/simulated/quick`
+- Quick simulation split generation: `uv run main.py command=simulate simulation=quick paths.data_root=data/simulated`
+- Paper simulation grid generation for one scene: `uv run main.py command=simulate simulation=base paths.data_root=data/simulated`
+- Train existing splits: `uv run main.py command=train training=base paths.data_root=data/simulated/base`
+- Train with mTAN-style input: `uv run main.py command=train training=mtan paths.data_root=data/simulated/base`
+- Run lightweight baselines on existing splits: `uv run main.py command=baseline paths.data_root=data/simulated/base`
+- Run Optuna tuning on existing splits: `uv run main.py command=optim paths.data_root=data/simulated/base`
 - Format: `uv run ruff format`
 - Lint: `uv run ruff check --fix`
 - Type check: `UV_CACHE_DIR=/tmp/uv-cache uv run pyright`
@@ -75,24 +75,35 @@ clean reusable method library.
 - CLI lives only in root `main.py`; no package console script is configured.
 - `main.py` is a Hydra app. Default `command=simulate` generates train/test
   split simulation data. Training and baseline comparison are separate commands.
-- Common scenarios live under `configs/scenario/`: `quick`,
-  `debug`, and `formal_5x`.
+- Simulation scenarios live under `configs/simulation/`: `quick`, `base`,
+  `imbalance`, `censored`, and `high_dimension`. `quick` is for smoke tests;
+  the other four are paper simulation scenes.
+- Training model presets live under `configs/training/`: `small`, `base`,
+  `large`, and `mtan`. Training scene selection comes from `paths.data_root` or
+  explicit `paths.data` plus `paths.test_data`, not from simulation config.
 - Command-level config namespaces are `simulation`, `training`, `baseline`,
   `optim`, and shared `paths`; generator parameters live under
   `simulation.generator`, while TRAILS model/trainer/artifacts/diagnostics/SwanLab
   parameters live under `training`.
-- `simulation.repeats` means paired split repeats: each repeat generates one
-  source simulation dataset and splits it into train/test.
+- `simulation.train_size` and `simulation.test_size` are equal-length lists that
+  are paired by position. Each paired sample-size level is crossed with
+  `simulation.generator.n_clusters`, and each combination is repeated
+  `simulation.repeats` times.
+- `simulation.repeats` means paired split repeats within each sample-size and K
+  combination: each repeat generates one source simulation dataset and splits it
+  into train/test.
 - Generator instantiation fixes DGP mechanism parameters using
-  `simulation.mechanism_seed` when set, otherwise `simulation.seed`; repeat sample
-  seeds use `simulation.seed + repeat_index` for patient draws, train/test split
-  shuffling, and downstream model training.
+  `simulation.mechanism_seed` when set, otherwise `simulation.seed`. The same
+  `simulation.name × K` combination uses a fixed mechanism seed; sample seeds vary
+  across sample-size levels and repeats for patient draws, train/test split
+  shuffling. Train, baseline, and optim command seeds come from
+  `training.trainer.seed` plus the discovered split index.
 - Validation data is cut internally from `train.pt` by `training.trainer.valid_size`, is
   not saved as a separate `val.pt`, and is used for early stopping; if no validation
   split is requested, early stopping monitors the training metric instead.
 - Hydra outputs go under `outputs/` by default and are ignored by git. Command run
-  directories are named `command-<timestamp>`, with repeat outputs flattened under
-  numeric directories such as `0/`, `1/`, and `2/`.
+  directories are named `command-<timestamp>`. Train, baseline, and optim outputs
+  mirror the relative data split path discovered under `paths.data_root`.
 - Simulation uses a VaDeSC-EHR-style latent-cluster generator adapted to
   continuous asynchronous clinical measurements.
 - Simulation outputs a `ClinicalTimeSeriesDataset` saved via `torch.save`.
@@ -119,12 +130,18 @@ clean reusable method library.
   number of latent-width hidden layers before the Weibull output.
 - Validation and test metrics include ACC/ARI/NMI only when true cluster labels are
   available; test metrics also report predicted-cluster occupancy diagnostics.
-- Train and baseline commands save unified prediction payloads directly under each
-  numeric repeat directory, plus command-level metrics CSV and summary JSON.
+- Train and baseline commands recursively discover all sibling `train.pt`/`test.pt`
+  directories under `paths.data_root`, infer K from dataset metadata when present,
+  and save unified prediction payloads under mirrored run directories plus
+  command-level metrics CSV and summary JSON.
 - `command=baseline` lives in `trails_simulate` and runs lightweight simulation
   comparators on existing train/test splits: summary-feature k-means and
   risk-stratified summary-feature k-means. It writes baseline summary JSON and
   metrics CSV under the Hydra run directory.
+- `command=optim` recursively discovers existing train/test splits like train and
+  baseline, creates one Optuna study per split, and writes `study.db`, `trials.csv`,
+  and `optim_summary.json` under the mirrored run directory. Explicit shared
+  `optim.storage` is only allowed for a single discovered dataset.
 
 ## Verification
 

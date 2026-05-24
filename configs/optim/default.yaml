@@ -1,6 +1,5 @@
 n_trials: 30
-study_name: ${simulation.name}
-root: outputs/optim/${simulation.name}
+study_name: optim
 storage: null
 search:
   encoder_input_kind: [grud, mtan]

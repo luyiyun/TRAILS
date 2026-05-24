@@ -1,7 +1,0 @@
-# @package _global_
-
-defaults:
-  - override /simulation: quick
-  - override /training: quick
-
-command: simulate

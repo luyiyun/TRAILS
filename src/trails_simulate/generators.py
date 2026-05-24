@@ -35,7 +35,9 @@ DEFAULT_FEATURE_NAMES = [
 class ClinicalTimeSeriesDatasetGeneratorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    n_clusters: int = Field(default=3, gt=1)
+    n_clusters: int | tuple[int, ...] = 3
+    cluster_prior: list[float] | None = None
+    cluster_prior_power: float = Field(default=0.0, ge=0.0)
     min_visits: int = Field(default=4, gt=0)
     max_visits: int = Field(default=8, gt=0)
     hidden_size: int = Field(default=100, gt=0)
@@ -44,6 +46,10 @@ class ClinicalTimeSeriesDatasetGeneratorConfig(BaseModel):
     attention_heads: int | None = None
     censoring_rate: float = Field(default=0.3, ge=0.0, le=1.0)
     weibull_shape: float = Field(default=1.0, gt=0.0)
+    observation_rate_low: float = Field(default=0.25, ge=0.0, le=1.0)
+    observation_rate_high: float = Field(default=0.7, ge=0.0, le=1.0)
+    observation_severity_weight: float = Field(default=0.18, ge=0.0)
+    observation_value_weight: float = Field(default=0.08, ge=0.0)
     x_low: float = -10.0
     x_high: float = 10.0
     beta_low: float = -2.5
@@ -53,16 +59,38 @@ class ClinicalTimeSeriesDatasetGeneratorConfig(BaseModel):
 
     @model_validator(mode="after")
     def check_config(self) -> Self:
+        cluster_values = self.n_clusters_tuple_
+        if not cluster_values:
+            raise ValueError("n_clusters must contain at least one value.")
+        if any(n_clusters <= 1 for n_clusters in cluster_values):
+            raise ValueError("n_clusters values must be greater than 1.")
         if self.max_visits < self.min_visits:
             raise ValueError("max_visits must be greater than or equal to min_visits.")
+        if self.cluster_prior is not None:
+            if len(cluster_values) != 1:
+                raise ValueError("cluster_prior cannot be used with multiple n_clusters values.")
+            if len(self.cluster_prior) != cluster_values[0]:
+                raise ValueError("cluster_prior length must match n_clusters.")
+            if any(value < 0 for value in self.cluster_prior) or sum(self.cluster_prior) <= 0:
+                raise ValueError(
+                    "cluster_prior must contain non-negative values with positive sum."
+                )
         if self.attention_heads is not None and (
             self.attention_heads <= 0 or self.hidden_size % self.attention_heads != 0
         ):
             raise ValueError("attention_heads must divide hidden_size.")
+        if self.observation_rate_low > self.observation_rate_high:
+            raise ValueError("observation_rate_low cannot exceed observation_rate_high.")
         if self.x_low >= self.x_high or self.beta_low >= self.beta_high:
             raise ValueError("low bounds must be smaller than high bounds.")
 
         return self
+
+    @property
+    def n_clusters_tuple_(self) -> tuple[int, ...]:
+        if isinstance(self.n_clusters, int):
+            return (self.n_clusters,)
+        return tuple(self.n_clusters)
 
 
 class ClinicalTimeSeriesDatasetGenerator:
@@ -76,15 +104,20 @@ class ClinicalTimeSeriesDatasetGenerator:
             self.config.mechanism_seed if mechanism_seed is None else mechanism_seed
         )
         mechanism_generator = torch.Generator().manual_seed(self.mechanism_seed)
+        n_clusters = _single_n_clusters(config.n_clusters)
         self.resolved_attention_heads = config.attention_heads or _default_attention_heads(
             config.hidden_size
         )
         n_features = len(config.feature_names)
 
         # 机制参数在实例化时固定；simulate 只改变样本抽样随机性。
-        self.cluster_prior = torch.ones(config.n_clusters, dtype=torch.float32) / config.n_clusters
+        self.cluster_prior = _resolve_cluster_prior(
+            n_clusters,
+            exact_prior=config.cluster_prior,
+            power=config.cluster_prior_power,
+        )
         self.cluster_means = _uniform(
-            (config.n_clusters, config.latent_dim),
+            (n_clusters, config.latent_dim),
             config.x_low,
             config.x_high,
             mechanism_generator,
@@ -92,17 +125,17 @@ class ClinicalTimeSeriesDatasetGenerator:
         self.cluster_covariances = torch.stack(
             [
                 _random_spd_matrix(config.latent_dim, mechanism_generator)
-                for _cluster in range(config.n_clusters)
+                for _cluster in range(n_clusters)
             ]
         )
         self.survival_coefficients = _uniform(
-            (config.n_clusters, config.latent_dim),
+            (n_clusters, config.latent_dim),
             config.beta_low,
             config.beta_high,
             mechanism_generator,
         )
         self.survival_intercepts = _uniform(
-            (config.n_clusters,),
+            (n_clusters,),
             config.beta_low,
             config.beta_high,
             mechanism_generator,
@@ -139,7 +172,8 @@ class ClinicalTimeSeriesDatasetGenerator:
         n_patients: int,
         seed: int = 2026,
     ) -> ClinicalTimeSeriesDataset:
-        if n_patients <= self.config.n_clusters:
+        n_clusters = _single_n_clusters(self.config.n_clusters)
+        if n_patients <= n_clusters:
             raise ValueError("n_patients must be greater than n_clusters.")
 
         generator = torch.Generator().manual_seed(seed)
@@ -220,6 +254,10 @@ class ClinicalTimeSeriesDatasetGenerator:
             mask = _sample_asynchronous_observation_mask(
                 values=values,
                 severity=severity,
+                rate_low=self.config.observation_rate_low,
+                rate_high=self.config.observation_rate_high,
+                severity_weight=self.config.observation_severity_weight,
+                value_weight=self.config.observation_value_weight,
                 generator=generator,
             )
             delta_time = _compute_delta_time(times, mask)
@@ -239,15 +277,22 @@ class ClinicalTimeSeriesDatasetGenerator:
         metadata = {
             "generation_params": {
                 "n_patients": n_patients,
-                "n_clusters": self.config.n_clusters,
+                "n_clusters": n_clusters,
+                "cluster_prior": self.cluster_prior.tolist(),
                 "min_visits": self.config.min_visits,
                 "max_visits": self.config.max_visits,
+                "n_features": len(names),
+                "feature_names": list(names),
                 "latent_dim": self.config.latent_dim,
                 "hidden_size": self.config.hidden_size,
                 "attention_layers": self.config.attention_layers,
                 "attention_heads": self.resolved_attention_heads,
                 "censoring_rate": self.config.censoring_rate,
                 "weibull_shape": self.config.weibull_shape,
+                "observation_rate_low": self.config.observation_rate_low,
+                "observation_rate_high": self.config.observation_rate_high,
+                "observation_severity_weight": self.config.observation_severity_weight,
+                "observation_value_weight": self.config.observation_value_weight,
                 "x_low": self.config.x_low,
                 "x_high": self.config.x_high,
                 "beta_low": self.config.beta_low,
@@ -376,16 +421,48 @@ def _default_attention_heads(hidden_size: int) -> int:
     return 1
 
 
+def _resolve_cluster_prior(
+    n_clusters: int,
+    *,
+    exact_prior: list[float] | None,
+    power: float,
+) -> Tensor:
+    if exact_prior is not None:
+        weights = torch.tensor(exact_prior, dtype=torch.float32)
+    elif power == 0.0:
+        weights = torch.ones(n_clusters, dtype=torch.float32)
+    else:
+        # 不均衡场景用排序权重构造长尾亚型；K 改变时仍保持“少数亚型更稀有”的结构。
+        weights = torch.arange(n_clusters, 0, -1, dtype=torch.float32).pow(power)
+    return weights / weights.sum()
+
+
+def _single_n_clusters(n_clusters: int | tuple[int, ...]) -> int:
+    if isinstance(n_clusters, int):
+        return n_clusters
+    if len(n_clusters) != 1:
+        raise ValueError(
+            "ClinicalTimeSeriesDatasetGenerator requires one resolved n_clusters value."
+        )
+    return n_clusters[0]
+
+
 def _sample_asynchronous_observation_mask(
     *,
     values: Tensor,
     severity: Tensor,
+    rate_low: float,
+    rate_high: float,
+    severity_weight: float,
+    value_weight: float,
     generator: torch.Generator,
 ) -> Tensor:
     n_visits, n_features = values.shape
-    base_rates = torch.linspace(0.25, 0.7, n_features)
-    value_signal = 0.08 * torch.sigmoid(values.abs())
-    probability = (base_rates.unsqueeze(0) + 0.18 * severity + value_signal).clamp(0.05, 0.95)
+    base_rates = torch.linspace(rate_low, rate_high, n_features)
+    value_signal = value_weight * torch.sigmoid(values.abs())
+    probability = (base_rates.unsqueeze(0) + severity_weight * severity + value_signal).clamp(
+        0.05, 0.95
+    )
     mask = (torch.rand(n_visits, n_features, generator=generator) < probability).float()
     _ensure_at_least_one_observation_per_visit(mask, generator)
     _ensure_asynchronous_visit(mask, generator)

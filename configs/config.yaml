@@ -1,10 +1,9 @@
 defaults:
   - _self_
-  - simulation: base
-  - training: base
+  - simulation: quick
+  - training: small
   - baseline: default
   - optim: default
-  - scenario: quick
 
 command: simulate
 
@@ -18,7 +17,7 @@ hydra:
   job:
     chdir: false
   run:
-    dir: outputs/${simulation.name}/${command}-${now:%Y%m%d-%H%M%S-%f}
+    dir: outputs/${command}-${now:%Y%m%d-%H%M%S-%f}
   sweep:
-    dir: multirun/${simulation.name}/${command}-${now:%Y%m%d-%H%M%S-%f}
+    dir: multirun/${command}-${now:%Y%m%d-%H%M%S-%f}
     subdir: ${hydra.job.num}

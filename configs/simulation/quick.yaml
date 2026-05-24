@@ -1,11 +1,11 @@
 name: quick
 repeats: 1
-train_size: 64
-test_size: 24
+train_size: [64]
+test_size: [24]
 seed: 20260517
 generator:
   mechanism_seed: 20260501
-  n_clusters: 3
+  n_clusters: [3]
   min_visits: 3
   max_visits: 6
   hidden_size: 32

@@ -1,39 +1,43 @@
 model:
-  latent_dim: 8
-  n_clusters: 3
+  latent_dim: 32
+  n_clusters: 4
   dropout: 0.0
-  survival_head_hidden_layers: 0
+  survival_head_hidden_layers: 2
   loss:
     weighting: uncertainty
     reconstruction_weight: 1.0
     survival_weight: 0.2
-    cluster_weight: 0.05
+    cluster_weight: 0.1
   encoder:
     input:
       kind: grud
-      hidden_dim: 32
+      hidden_dim: 64
       n_heads: 2
     mapping:
-      kind: gru
-      hidden_dim: 32
-      n_layers: 1
+      kind: transformer
+      hidden_dim: 64
+      n_layers: 2
       n_heads: 2
   decoder:
-    kind: gru
-    conditioning: initial_state
-    hidden_dim: 32
-    n_layers: 1
+    kind: transformer
+    conditioning: concat_time
+    hidden_dim: 64
+    n_layers: 2
     n_heads: 2
 trainer:
-  max_epochs: 5
-  batch_size: 16
-  learning_rate: 1.0e-3
-  warmup_epochs: 1
+  max_epochs: 300
+  batch_size: 256
+  learning_rate: 5.0e-4
+  warmup_epochs: 20
   gmm_init_iters: 20
-  gradient_clip_norm: 5.0
-  device: cpu
-  seed: 2026
+  gradient_clip_norm: null
+  device: cuda:0
+  seed: 20260517
   valid_size: 0.2
+  early_stop: true
+  early_stopping_patience: 5
+  early_stopping_min_delta: 0.001
+  early_stopping_monitor: "loss"
 artifacts:
   names: [all]
   save: null
@@ -43,5 +47,5 @@ diagnostics:
 swanlab:
   enabled: false
   project: TRAILS
-  experiment: null
+  experiment: base
   mode: null

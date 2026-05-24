@@ -34,8 +34,8 @@ class SimulationConfig(BaseModel):
 
     name: str = "quick"
     repeats: int = Field(default=1, gt=0)
-    train_size: int = 128
-    test_size: int = 64
+    train_size: tuple[int, ...] = Field(default=(128,), min_length=1)
+    test_size: tuple[int, ...] = Field(default=(64,), min_length=1)
     seed: int = 20260517
     mechanism_seed: int | None = None
     generator: ClinicalTimeSeriesDatasetGeneratorConfig = Field(
@@ -46,6 +46,17 @@ class SimulationConfig(BaseModel):
     def resolve_mechanism_seed(self) -> SimulationConfig:
         if self.mechanism_seed is None:
             self.mechanism_seed = self.seed
+        if len(self.train_size) != len(self.test_size):
+            raise ValueError(
+                "simulation.train_size and simulation.test_size must have equal length."
+            )
+        cluster_values = self.generator.n_clusters_tuple_
+        if any(value <= 0 for value in (*self.train_size, *self.test_size)):
+            raise ValueError("simulation train/test sizes must be positive.")
+        if min(
+            train + test for train, test in zip(self.train_size, self.test_size, strict=True)
+        ) <= max(cluster_values):
+            raise ValueError("Every simulated sample size must be greater than every requested K.")
         return self
 
 
@@ -196,7 +207,6 @@ class OptimConfig(BaseModel):
 
     n_trials: int = Field(default=30, gt=0)
     study_name: str = Field(default="optim", min_length=1)
-    root: Path = Path("outputs/optim/optim")
     storage: str | None = None
     search: OptimSearchSpaceConfig = Field(default_factory=OptimSearchSpaceConfig)
 

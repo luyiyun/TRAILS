@@ -10,9 +10,11 @@ model:
     cluster_weight: 0.1
   encoder:
     input:
-      kind: grud
+      kind: mtan
       hidden_dim: 64
       n_heads: 2
+      num_ref_points: 16
+      learn_time_embedding: true
     mapping:
       kind: transformer
       hidden_dim: 64
@@ -43,9 +45,9 @@ artifacts:
   save: null
 diagnostics:
   latent_embeddings:
-    enabled: true
+    enabled: false
 swanlab:
-  enabled: true
+  enabled: false
   project: TRAILS
-  experiment: normal-swanlab
+  experiment: mtan
   mode: null

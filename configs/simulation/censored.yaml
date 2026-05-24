@@ -1,0 +1,39 @@
+name: censored
+repeats: 5
+train_size: [375, 750, 1500, 3750, 7500]
+test_size: [125, 250, 500, 1250, 2500]
+seed: 20260517
+generator:
+  mechanism_seed: 20260501
+  n_clusters: [2, 3, 4, 5]
+  min_visits: 2
+  max_visits: 8
+  hidden_size: 128
+  latent_dim: 8
+  attention_layers: 4
+  attention_heads: 4
+  censoring_rate: 0.65
+  weibull_shape: 1.1
+  observation_rate_low: 0.08
+  observation_rate_high: 0.35
+  observation_severity_weight: 0.28
+  observation_value_weight: 0.12
+  x_low: -8.0
+  x_high: 8.0
+  beta_low: -1.8
+  beta_high: 1.8
+  feature_names:
+    - hemoglobin
+    - albumin
+    - creatinine
+    - alanine_aminotransferase
+    - aspartate_aminotransferase
+    - bilirubin
+    - c_reactive_protein
+    - neutrophil_count
+    - lymphocyte_count
+    - platelet_count
+    - carcinoembryonic_antigen
+    - carbohydrate_antigen_199
+    - lactate_dehydrogenase
+    - tumor_size

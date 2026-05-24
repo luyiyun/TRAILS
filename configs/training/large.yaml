@@ -1,7 +1,7 @@
 model:
-  latent_dim: 32
+  latent_dim: 64
   n_clusters: 4
-  dropout: 0.0
+  dropout: 0.1
   survival_head_hidden_layers: 2
   loss:
     weighting: uncertainty
@@ -11,31 +11,35 @@ model:
   encoder:
     input:
       kind: grud
-      hidden_dim: 64
-      n_heads: 2
+      hidden_dim: 128
+      n_heads: 4
     mapping:
       kind: transformer
-      hidden_dim: 64
-      n_layers: 2
-      n_heads: 2
+      hidden_dim: 128
+      n_layers: 3
+      n_heads: 4
   decoder:
     kind: transformer
     conditioning: concat_time
-    hidden_dim: 64
-    n_layers: 2
-    n_heads: 2
+    hidden_dim: 128
+    n_layers: 3
+    n_heads: 4
 trainer:
-  max_epochs: 100
+  max_epochs: 300
   batch_size: 256
   learning_rate: 3.0e-4
   warmup_epochs: 20
-  gmm_init_iters: 20
+  gmm_init_iters: 50
   gradient_clip_norm: null
   device: cuda:0
   seed: 20260517
   valid_size: 0.2
+  early_stop: true
+  early_stopping_patience: 5
+  early_stopping_min_delta: 0.001
+  early_stopping_monitor: "loss"
 artifacts:
-  names: [none]
+  names: [all]
   save: null
 diagnostics:
   latent_embeddings:
@@ -43,5 +47,5 @@ diagnostics:
 swanlab:
   enabled: false
   project: TRAILS
-  experiment: optim
+  experiment: large
   mode: null

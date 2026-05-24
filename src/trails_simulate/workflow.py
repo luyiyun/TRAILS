@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+from tqdm import tqdm
 
 from trails.artifacts import save_json
 from trails.data import ClinicalTimeSeriesDataset
@@ -15,7 +18,7 @@ from .evaluation import (
     save_prediction_payload,
     summarize_metric_rows,
 )
-from .generators import ClinicalTimeSeriesDatasetGenerator
+from .generators import ClinicalTimeSeriesDatasetGenerator, ClinicalTimeSeriesDatasetGeneratorConfig
 from .optim import run_optim_command
 from .path import (
     DatasetRunPaths,
@@ -76,50 +79,88 @@ def run_simulate_command(
     if config.paths.train_root is not None:
         raise ValueError("command=simulate does not use paths.train_root.")
 
-    out_root = data_root(config, hydra_run_dir, project_root)
-    repeats: list[dict[str, Any]] = []
-    generator = ClinicalTimeSeriesDatasetGenerator(
-        config.simulation.generator,
-        mechanism_seed=config.simulation.mechanism_seed,
-    )
-    for index in range(config.simulation.repeats):
-        repeat_seed = config.simulation.seed + index
-        run_id = str(index)
-        split_root = out_root / run_id
-        split_root.mkdir(parents=True, exist_ok=True)
+    out_root = data_root(config, hydra_run_dir, project_root) / config.simulation.name
+    manifest_path = out_root / "simulation_manifest.csv"
+    summary_path = out_root / "simulation_summary.json"
+    runs: list[dict[str, Any]] = []
 
-        total_patients = config.simulation.train_size + config.simulation.test_size
-        source_dataset = generator.simulate(n_patients=total_patients, seed=repeat_seed)
-        train_dataset, test_dataset = source_dataset.split_counts(
-            [config.simulation.train_size, config.simulation.test_size],
-            seed=repeat_seed,
+    n_iter = (
+        len(config.simulation.generator.n_clusters_tuple_)
+        * len(config.simulation.train_size)
+        * config.simulation.repeats
+    )
+    iter_bar = tqdm(desc="Simulation", total=n_iter)
+
+    for cluster_index, n_clusters in enumerate(config.simulation.generator.n_clusters_tuple_):
+        generator_config = generator_config_for_cluster(
+            config.simulation.generator,
+            n_clusters=n_clusters,
         )
-        train_path = split_root / "train.pt"
-        test_path = split_root / "test.pt"
-        train_dataset.save(train_path)
-        test_dataset.save(test_path)
-        repeats.append(
-            {
-                "data_root": str(split_root),
-                "run_id": run_id,
-                "seed": repeat_seed,
-                "source_size": total_patients,
-                "splits": {
-                    "train": simulation_summary(
-                        train_dataset,
-                        clusters=config.simulation.generator.n_clusters,
-                        out=train_path,
-                        seed=repeat_seed,
-                    ),
-                    "test": simulation_summary(
-                        test_dataset,
-                        clusters=config.simulation.generator.n_clusters,
-                        out=test_path,
-                        seed=repeat_seed,
-                    ),
-                },
-            }
+        mechanism_seed = simulation_mechanism_seed(config, cluster_index=cluster_index)
+        generator = ClinicalTimeSeriesDatasetGenerator(
+            generator_config,
+            mechanism_seed=mechanism_seed,
         )
+        for size_index, (train_size, test_size) in enumerate(
+            zip(config.simulation.train_size, config.simulation.test_size, strict=True)
+        ):
+            total_patients = train_size + test_size
+            for repeat_index in range(config.simulation.repeats):
+                repeat_seed = simulation_sample_seed(
+                    config,
+                    size_index=size_index,
+                    cluster_index=cluster_index,
+                    repeat_index=repeat_index,
+                )
+                run_id = f"train_{train_size}_test_{test_size}/k{n_clusters}/{repeat_index}"
+                split_root = out_root / run_id
+                split_root.mkdir(parents=True, exist_ok=True)
+
+                source_dataset = generator.simulate(n_patients=total_patients, seed=repeat_seed)
+                train_dataset, test_dataset = source_dataset.split_counts(
+                    [train_size, test_size],
+                    seed=repeat_seed,
+                )
+                train_path = split_root / "train.pt"
+                test_path = split_root / "test.pt"
+                train_dataset.save(train_path)
+                test_dataset.save(test_path)
+                train_summary = simulation_summary(
+                    train_dataset,
+                    clusters=n_clusters,
+                    out=train_path,
+                    seed=repeat_seed,
+                )
+                test_summary = simulation_summary(
+                    test_dataset,
+                    clusters=n_clusters,
+                    out=test_path,
+                    seed=repeat_seed,
+                )
+                runs.append(
+                    {
+                        "data_root": str(split_root),
+                        "n_clusters": n_clusters,
+                        "n_features": train_dataset.n_features,
+                        "repeat": repeat_index,
+                        "run_id": run_id,
+                        "seed": repeat_seed,
+                        "mechanism_seed": mechanism_seed,
+                        "source_size": total_patients,
+                        "train_size": train_size,
+                        "test_size": test_size,
+                        "train_censoring_rate": train_summary["censoring_rate"],
+                        "test_censoring_rate": test_summary["censoring_rate"],
+                        "train_path": str(train_path),
+                        "test_path": str(test_path),
+                        "splits": {
+                            "train": train_summary,
+                            "test": test_summary,
+                        },
+                    }
+                )
+
+                iter_bar.update()
 
     summary = {
         "command": "simulate",
@@ -127,12 +168,14 @@ def run_simulate_command(
         "data_root": str(out_root),
         "hydra_run_dir": str(hydra_run_dir),
         "outputs": {
-            "summary": str(out_root / "simulation_summary.json"),
+            "manifest": str(manifest_path),
+            "summary": str(summary_path),
         },
-        "repeats": repeats,
+        "runs": runs,
         "simulation": config.simulation.model_dump(mode="json"),
     }
-    save_json(out_root / "simulation_summary.json", summary)
+    save_metrics_csv(manifest_path, runs)
+    save_json(summary_path, summary)
     return summary
 
 
@@ -145,13 +188,15 @@ def run_train_command(
     metric_rows: list[dict[str, Any]] = []
     run_payloads: list[dict[str, Any]] = []
     for index, run_paths in enumerate(runs):
-        seed = config.simulation.seed + index
+        print(f"Training run {index + 1}/{len(runs)}: {run_paths.run_id}")
+        seed = config.training.trainer.seed + index
+        run_config = config_for_dataset_clusters(config, run_paths.train_data)
         train_paths = TrainPaths(
             data=run_paths.train_data,
             test_data=run_paths.test_data,
             train_root=hydra_run_dir / run_paths.run_id,
             save=checkpoint_path_for_run(
-                config,
+                run_config,
                 hydra_run_dir=hydra_run_dir,
                 project_root=project_root,
                 run_id=run_paths.run_id,
@@ -159,7 +204,7 @@ def run_train_command(
             ),
         )
         train_result = fit_training_run(
-            config,
+            run_config,
             train_paths=train_paths,
             seed=seed,
             swanlab_repeat_label=None if len(runs) == 1 else run_paths.run_id,
@@ -181,6 +226,7 @@ def run_train_command(
                 "run_dir": None if train_result.run_dir is None else str(train_result.run_dir),
                 "run_id": run_paths.run_id,
                 "seed": seed,
+                "n_clusters": run_config.training.model.n_clusters,
             }
         )
 
@@ -197,7 +243,6 @@ def run_train_command(
             "summary": str(summary_path),
         },
         "runs": run_payloads,
-        "simulation": config.simulation.model_dump(mode="json"),
     }
 
     save_json(summary_path, summary)
@@ -211,14 +256,19 @@ def run_baseline_command(
     project_root: Path,
 ) -> dict[str, Any]:
     runs = discover_dataset_runs(config, hydra_run_dir, project_root)
-    n_clusters = config.baseline.n_clusters or config.simulation.generator.n_clusters
     metric_rows: list[dict[str, Any]] = []
     run_payloads: list[dict[str, Any]] = []
 
+    iter_bar = tqdm(desc="Baseline", total=len(runs) * len(config.baseline.methods))
+
     for index, run_paths in enumerate(runs):
-        seed = config.simulation.seed + index
+        seed = config.training.trainer.seed + index
         train_dataset = ClinicalTimeSeriesDataset.load(run_paths.train_data)
         test_dataset = ClinicalTimeSeriesDataset.load(run_paths.test_data)
+        n_clusters = config.baseline.n_clusters or dataset_n_clusters(
+            train_dataset,
+            fallback=config.training.model.n_clusters,
+        )
         method_payloads: list[dict[str, Any]] = []
         for method in config.baseline.methods:
             baseline = make_baseline(
@@ -248,9 +298,11 @@ def run_baseline_command(
                     "prediction_path": str(prediction_path),
                 }
             )
+            iter_bar.update()
         run_payloads.append(
             {
                 "methods": method_payloads,
+                "n_clusters": n_clusters,
                 "run_id": run_paths.run_id,
                 "seed": seed,
             }
@@ -261,7 +313,6 @@ def run_baseline_command(
     summary = {
         "baseline": {
             **config.baseline.model_dump(mode="json"),
-            "n_clusters_resolved": n_clusters,
         },
         "command": "baseline",
         "config": config.model_dump(mode="json"),
@@ -273,7 +324,6 @@ def run_baseline_command(
             "summary": str(summary_path),
         },
         "runs": run_payloads,
-        "simulation": config.simulation.model_dump(mode="json"),
     }
     save_json(summary_path, summary)
     save_metrics_csv(metrics_csv_path, metric_rows)
@@ -301,16 +351,19 @@ def dataset_source_payload(
     runs: list[DatasetRunPaths],
 ) -> dict[str, Any]:
     if not runs:
-        return {"auto_selected": False, "data_root": None}
+        return {"data_root": None, "source": "empty"}
     if config.paths.data is not None:
         root = runs[0].data_root
+        source = "explicit split"
     elif config.paths.data_root is not None:
-        root = common_dataset_root(runs)
+        root = config.paths.data_root
+        source = "data root"
     else:
         root = common_dataset_root(runs)
+        source = "discovered split"
     return {
-        "auto_selected": config.paths.data is None and config.paths.data_root is None,
         "data_root": str(root),
+        "source": source,
     }
 
 
@@ -318,3 +371,52 @@ def common_dataset_root(runs: list[DatasetRunPaths]) -> Path:
     if runs[0].run_id.isdigit() and runs[0].data_root.name == runs[0].run_id:
         return runs[0].data_root.parent
     return runs[0].data_root if len(runs) == 1 else runs[0].data_root.parent
+
+
+def generator_config_for_cluster(
+    generator_config: ClinicalTimeSeriesDatasetGeneratorConfig,
+    *,
+    n_clusters: int,
+) -> ClinicalTimeSeriesDatasetGeneratorConfig:
+    payload = generator_config.model_dump(mode="json")
+    payload["n_clusters"] = n_clusters
+    return ClinicalTimeSeriesDatasetGeneratorConfig.model_validate(payload)
+
+
+def simulation_mechanism_seed(config: ApplicationConfig, *, cluster_index: int) -> int:
+    base_seed = config.simulation.mechanism_seed or config.simulation.seed
+    return base_seed + cluster_index * 100
+
+
+def simulation_sample_seed(
+    config: ApplicationConfig,
+    *,
+    size_index: int,
+    cluster_index: int,
+    repeat_index: int,
+) -> int:
+    return config.simulation.seed + size_index * 10_000 + cluster_index * 100 + repeat_index
+
+
+def dataset_n_clusters(dataset: ClinicalTimeSeriesDataset, *, fallback: int) -> int:
+    params = dataset.metadata.get("generation_params")
+    if isinstance(params, Mapping) and "n_clusters" in params:
+        return int(params["n_clusters"])
+    return fallback
+
+
+def config_for_dataset_clusters(
+    config: ApplicationConfig,
+    train_data: Path,
+) -> ApplicationConfig:
+    dataset = ClinicalTimeSeriesDataset.load(train_data)
+    n_clusters = dataset_n_clusters(dataset, fallback=config.training.model.n_clusters)
+    return config.model_copy(
+        update={
+            "training": config.training.model_copy(
+                update={
+                    "model": config.training.model.model_copy(update={"n_clusters": n_clusters})
+                }
+            )
+        }
+    )

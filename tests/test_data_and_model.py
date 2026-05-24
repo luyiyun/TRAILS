@@ -428,6 +428,83 @@ def test_simulation_has_asynchronous_masks_and_valid_delta_time() -> None:
     assert 0.45 <= float(event_rate) <= 0.95
 
 
+def test_generator_cluster_prior_power_creates_imbalanced_clusters() -> None:
+    config = ClinicalTimeSeriesDatasetGeneratorConfig(
+        n_clusters=4,
+        cluster_prior_power=1.5,
+        min_visits=3,
+        max_visits=5,
+        hidden_size=12,
+        latent_dim=4,
+        attention_layers=1,
+        feature_names=["hemoglobin", "albumin", "tumor_size"],
+    )
+
+    dataset = ClinicalTimeSeriesDatasetGenerator(config, mechanism_seed=101).simulate(
+        n_patients=200,
+        seed=201,
+    )
+    prior = dataset.metadata["cluster_prior"]
+    labels = torch.stack(
+        [sample.cluster_label for sample in dataset if sample.cluster_label is not None]
+    )
+    counts = torch.bincount(labels.long(), minlength=4)
+
+    assert torch.isclose(prior.sum(), torch.tensor(1.0))
+    assert prior[0] > prior[-1]
+    assert counts[0] > counts[-1]
+    assert dataset.metadata["generation_params"]["n_features"] == 3
+    assert dataset.metadata["generation_params"]["feature_names"] == [
+        "hemoglobin",
+        "albumin",
+        "tumor_size",
+    ]
+
+
+def test_sparse_observation_config_reduces_observed_density() -> None:
+    common = {
+        "n_clusters": 2,
+        "min_visits": 4,
+        "max_visits": 6,
+        "hidden_size": 12,
+        "latent_dim": 4,
+        "attention_layers": 1,
+        "feature_names": ["a", "b", "c", "d"],
+    }
+    dense = ClinicalTimeSeriesDatasetGeneratorConfig(**common)
+    sparse = ClinicalTimeSeriesDatasetGeneratorConfig(
+        **common,
+        observation_rate_low=0.05,
+        observation_rate_high=0.15,
+        observation_severity_weight=0.0,
+        observation_value_weight=0.0,
+    )
+
+    dense_dataset = ClinicalTimeSeriesDatasetGenerator(dense, mechanism_seed=101).simulate(
+        n_patients=64,
+        seed=201,
+    )
+    sparse_dataset = ClinicalTimeSeriesDatasetGenerator(sparse, mechanism_seed=101).simulate(
+        n_patients=64,
+        seed=201,
+    )
+
+    def observed_density(dataset: ClinicalTimeSeriesDataset) -> float:
+        observed = 0.0
+        total = 0.0
+        for sample in dataset:
+            aligned = sample.to_aligned()
+            observed += float(aligned.mask.sum().item())
+            total += float(aligned.mask.numel())
+        return observed / total
+
+    assert observed_density(sparse_dataset) < observed_density(dense_dataset)
+    assert (
+        sparse_dataset.metadata["generation_params"]["observation_rate_high"]
+        == sparse.observation_rate_high
+    )
+
+
 def test_sequence_pool_masks_padding_visits() -> None:
     hidden_sequence = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
     sequence_lengths = torch.tensor([2, 3])

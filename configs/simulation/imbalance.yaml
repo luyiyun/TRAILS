@@ -1,4 +1,4 @@
-name: base
+name: imbalance
 repeats: 5
 train_size: [375, 750, 1500, 3750, 7500]
 test_size: [125, 250, 500, 1250, 2500]
@@ -6,9 +6,10 @@ seed: 20260517
 generator:
   mechanism_seed: 20260501
   n_clusters: [2, 3, 4, 5]
+  cluster_prior_power: 1.5
   min_visits: 3
-  max_visits: 16
-  hidden_size: 128
+  max_visits: 12
+  hidden_size: 96
   latent_dim: 8
   attention_layers: 4
   attention_heads: 4
@@ -18,3 +19,12 @@ generator:
   x_high: 8.0
   beta_low: -1.8
   beta_high: 1.8
+  feature_names:
+    - hemoglobin
+    - albumin
+    - creatinine
+    - alanine_aminotransferase
+    - c_reactive_protein
+    - neutrophil_count
+    - lymphocyte_count
+    - tumor_size

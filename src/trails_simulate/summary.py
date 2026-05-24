@@ -19,33 +19,37 @@ def format_run_summary(result: Mapping[str, Any]) -> str:
 
 
 def format_simulate_summary(result: Mapping[str, Any]) -> str:
-    repeats = [dict(repeat) for repeat in result["repeats"]]
+    runs = [dict(run) for run in result["runs"]]
     outputs = dict(result["outputs"])
     lines = [
         "TRAILS simulate complete",
         f"Hydra run: {result['hydra_run_dir']}",
         f"Data root: {result['data_root']}",
-        f"Runs: {len(repeats)}",
-        f"Seeds: {format_seed_list([int(repeat['seed']) for repeat in repeats])}",
+        f"Runs: {len(runs)}",
+        f"Seeds: {format_seed_list([int(run['seed']) for run in runs])}",
         "",
         "Saved summaries:",
         f"  summary: {outputs['summary']}",
+        f"  manifest: {outputs['manifest']}",
     ]
-    if repeats:
+    if runs:
         lines.append("")
         lines.append("Generated splits:")
-        for repeat in repeats:
-            splits = dict(repeat["splits"])
+        for run in runs[:20]:
+            splits = dict(run["splits"])
             train_split = dict(splits["train"])
             test_split = dict(splits["test"])
             lines.append(
                 "  "
-                f"{repeat['run_id']:<10} "
+                f"{run['run_id']:<30} "
                 f"train={train_split['n_patients']} "
                 f"test={test_split['n_patients']} "
-                f"seed={repeat['seed']} "
-                f"data_root={repeat['data_root']}"
+                f"k={run['n_clusters']} "
+                f"seed={run['seed']} "
+                f"data_root={run['data_root']}"
             )
+        if len(runs) > 20:
+            lines.append(f"  ... {len(runs) - 20} more")
     return "\n".join(lines)
 
 
@@ -53,9 +57,7 @@ def format_train_summary(result: Mapping[str, Any]) -> str:
     outputs = dict(result["outputs"])
     runs = [dict(run) for run in result["runs"]]
     data_source = dict(result.get("data_source", {}))
-    data_source_label = (
-        "latest simulation" if data_source.get("auto_selected") else "configured path"
-    )
+    data_source_label = str(data_source.get("source", "configured path"))
     lines = [
         "TRAILS train complete",
         f"Hydra run: {result['hydra_run_dir']}",
@@ -74,49 +76,43 @@ def format_train_summary(result: Mapping[str, Any]) -> str:
 
 def format_optim_summary(result: Mapping[str, Any]) -> str:
     paths = dict(result["paths"])
-    pareto_trials = [dict(trial) for trial in result["pareto_trials"]]
+    runs = [dict(run) for run in result["runs"]]
     lines = [
         "TRAILS optim complete",
         f"Hydra run: {result['hydra_run_dir']}",
-        f"Optim root: {result['optim_root']}",
-        f"Study: {result['study_name']}",
-        f"Storage: {result['storage']}",
-        "Trials: "
-        f"{result['n_completed_before']} -> {result['n_completed_after']} "
-        f"(requested {result['n_trials_requested']})",
+        f"Runs: {len(runs)}",
+        f"Trials per run: {result['n_trials_requested']}",
         "",
         "Saved summaries:",
         f"  summary: {paths['optim_summary']}",
-        f"  trials csv: {paths['trials_csv']}",
-        f"  pareto: {paths['pareto_trials']}",
     ]
-    if pareto_trials:
+    if runs:
         lines.append("")
-        lines.append("Pareto front:")
-        for trial in pareto_trials[:8]:
-            values = trial.get("values")
-            params = dict(trial.get("params", {}))
-            metric_text = format_optim_objectives(values)
-            param_text = format_optim_params(params)
-            lines.append(f"  trial {trial['number']:<4} {metric_text} {param_text}")
+        lines.append("Optim runs:")
+        for run in runs[:8]:
+            outputs = dict(run["outputs"])
+            lines.append(
+                "  "
+                f"{run['run_id']:<30} "
+                f"trials={run['n_completed_before']}->{run['n_completed_after']} "
+                f"summary={outputs['optim_summary']}"
+            )
+        if len(runs) > 8:
+            lines.append(f"  ... {len(runs) - 8} more")
     return "\n".join(lines)
 
 
 def format_baseline_summary(result: Mapping[str, Any]) -> str:
     outputs = dict(result["outputs"])
-    baseline = dict(result["baseline"])
     runs = [dict(run) for run in result["runs"]]
     data_source = dict(result.get("data_source", {}))
-    data_source_label = (
-        "latest simulation" if data_source.get("auto_selected") else "configured path"
-    )
+    data_source_label = str(data_source.get("source", "configured path"))
     lines = [
         "TRAILS baseline complete",
         f"Hydra run: {result['hydra_run_dir']}",
         f"Data root: {data_source.get('data_root', 'unknown')}",
         f"Data source: {data_source_label}",
         f"Runs: {len(runs)}",
-        f"Clusters: {baseline['n_clusters_resolved']}",
         "",
         "Saved summaries:",
         f"  summary: {outputs['summary']}",
@@ -131,50 +127,8 @@ def format_baseline_summary(result: Mapping[str, Any]) -> str:
                 method_result = dict(method)
                 metrics = dict(method_result["metrics"])
                 metric_text = format_inline_metrics(metrics)
-                lines.append(f"  {run['run_id']:<10} {method_result['method']:<24} {metric_text}")
+                lines.append(f"  {run['run_id']:<30} {method_result['method']:<24} {metric_text}")
     return "\n".join(lines)
-
-
-def format_optim_objectives(values: Any) -> str:
-    if not isinstance(values, Sequence) or len(values) < 2:
-        return "cindex=NA ari=NA"
-    return f"cindex={format_float(values[0])} ari={format_float(values[1])}"
-
-
-def format_optim_params(params: Mapping[str, Any]) -> str:
-    selected = [
-        "encoder_input_kind",
-        "encoder_mapping_kind",
-        "decoder_kind",
-        "decoder_conditioning",
-        "hidden_dim",
-        "latent_dim",
-        "learning_rate",
-    ]
-    chunks = [
-        f"{name}={format_optim_param_value(params[name])}" for name in selected if name in params
-    ]
-    return " ".join(chunks)
-
-
-def format_optim_param_value(value: Any) -> str:
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return format_float(value)
-    return str(value)
-
-
-def format_metrics_block(title: str, metrics: Mapping[str, Any]) -> list[str]:
-    names = ordered_metric_names(metrics.keys())
-    if not names:
-        return []
-    lines = ["", f"{title}:"]
-    for name in names:
-        value = metrics[name]
-        if isinstance(value, int | float):
-            lines.append(f"  {name:<22} {format_float(value)}")
-    return lines
 
 
 def format_metric_summary_block(summary: Mapping[str, Any]) -> list[str]:
