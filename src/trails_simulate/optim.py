@@ -23,27 +23,21 @@ def run_optim_command(
     hydra_run_dir: Path,
     project_root: Path,
 ) -> dict[str, Any]:
-    raise NotImplementedError("Optim command is not implemented yet.")
     optuna = load_optuna()
     runs = discover_dataset_runs(config, hydra_run_dir, project_root)
-    if config.optim.storage is not None and len(runs) > 1:
-        raise ValueError("optim.storage can only be used when command=optim receives one dataset.")
+    selected_run, selected_index, selection_source = select_optim_run(runs, config.optim.run_id)
 
-    run_payloads = []
-    for index, run_paths in enumerate(runs):
-        validate_optim_test_data(run_paths.test_data)
-        run_root = hydra_run_dir / run_paths.run_id
-        run_payloads.append(
-            run_optim_dataset(
-                optuna,
-                config=config,
-                run_paths=run_paths,
-                run_root=run_root,
-                project_root=project_root,
-                seed=config.training.trainer.seed + index,
-                study_name=optim_study_name(config.optim.study_name, run_paths, len(runs)),
-            )
-        )
+    validate_optim_test_data(selected_run.test_data)
+    run_root = hydra_run_dir / selected_run.run_id
+    run_payload = run_optim_dataset(
+        optuna,
+        config=config,
+        run_paths=selected_run,
+        run_root=run_root,
+        project_root=project_root,
+        seed=config.training.trainer.seed + selected_index,
+        study_name=optim_study_name(config.optim.study_name, selected_run, len(runs)),
+    )
 
     summary_path = hydra_run_dir / "optim_summary.json"
     summary = {
@@ -57,11 +51,61 @@ def run_optim_command(
         "paths": {
             "optim_summary": str(summary_path),
         },
-        "runs": run_payloads,
+        "runs": [run_payload],
+        "selection": {
+            "available_run_ids": [run.run_id for run in runs],
+            "run_id": selected_run.run_id,
+            "source": selection_source,
+        },
     }
 
     save_json(summary_path, summary)
     return summary
+
+
+def select_optim_run(
+    runs: Sequence[DatasetRunPaths],
+    configured_run_id: str | None,
+) -> tuple[DatasetRunPaths, int, str]:
+    if len(runs) == 1:
+        return runs[0], 0, "single"
+    if configured_run_id is not None:
+        for index, run in enumerate(runs):
+            if run.run_id == configured_run_id:
+                return run, index, "configured"
+        raise ValueError(
+            "optim.run_id did not match any discovered dataset split. Available run_id values: "
+            f"{format_available_run_ids(runs)}"
+        )
+    return interactive_select_optim_run(runs)
+
+
+def interactive_select_optim_run(
+    runs: Sequence[DatasetRunPaths],
+) -> tuple[DatasetRunPaths, int, str]:
+    print("Multiple dataset splits discovered for command=optim. Select one split:")
+    for index, run in enumerate(runs, start=1):
+        print(
+            f"  [{index}] {run.run_id}\n      train: {run.train_data}\n      test:  {run.test_data}"
+        )
+    try:
+        choice = input("Enter split number: ").strip()
+    except EOFError as error:
+        raise ValueError(
+            "command=optim discovered multiple dataset splits but no interactive selection was "
+            "available. Use optim.run_id=... or explicit paths.data and paths.test_data. "
+            f"Available run_id values: {format_available_run_ids(runs)}"
+        ) from error
+    if not choice.isdigit():
+        raise ValueError(f"Invalid optim split selection: {choice!r}")
+    selected_index = int(choice) - 1
+    if selected_index < 0 or selected_index >= len(runs):
+        raise ValueError(f"Invalid optim split selection: {choice!r}")
+    return runs[selected_index], selected_index, "interactive"
+
+
+def format_available_run_ids(runs: Sequence[DatasetRunPaths]) -> str:
+    return ", ".join(run.run_id for run in runs)
 
 
 def run_optim_dataset(

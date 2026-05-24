@@ -1,7 +1,7 @@
 name: censored
 repeats: 5
-train_size: [375, 750, 1500, 3750, 7500]
-test_size: [125, 250, 500, 1250, 2500]
+train_size: [500, 1000, 2000, 3000, 5000]
+test_size: [300, 300, 300, 300, 300]
 seed: 20260517
 generator:
   mechanism_seed: 20260501

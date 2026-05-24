@@ -4,6 +4,7 @@ defaults:
   - training: small
   - baseline: default
   - optim: default
+  - summary: default
 
 command: simulate
 

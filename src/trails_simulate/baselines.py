@@ -195,9 +195,137 @@ class RiskStratifiedKMeansBaseline(BaseBaseline):
         return np.hstack([features, risk_feature])
 
 
+class FPCAKMeansBaseline(BaseBaseline):
+    name: BaselineMethod = "fpca_kmeans"
+
+    def __init__(
+        self,
+        *,
+        n_clusters: int,
+        random_state: int,
+        fpca_components: int,
+        fpca_grid_size: int,
+        kmeans_iters: int = 50,
+    ) -> None:
+        super().__init__(
+            n_clusters=n_clusters,
+            random_state=random_state,
+            kmeans_iters=kmeans_iters,
+        )
+        self.fpca_components = fpca_components
+        self.fpca_grid_size = fpca_grid_size
+        self.fpca_imputers: list[SimpleImputer] = []
+        self.fpca_models: list[Any] = []
+        self.reference_grid = np.linspace(0.0, 1.0, fpca_grid_size)
+
+    def fit(self, data: ClinicalTimeSeriesDataset) -> BaseBaseline:
+        raw_features = self.fit_fpca_features(data)
+        features = self.fit_features(raw_features)
+        model_features = self.fit_model_features(features, data)
+        self.cluster_model = KMeans(
+            n_clusters=self.n_clusters,
+            max_iter=self.kmeans_iters,
+            n_init="auto",
+            random_state=self.random_state,
+        ).fit(model_features)
+        train_cluster = self.cluster_model.predict(model_features)
+        target = self.survival_risk_target(data)
+        self.cluster_risk = np.array(
+            [
+                target[train_cluster == cluster].mean()
+                if np.any(train_cluster == cluster)
+                else target.mean()
+                for cluster in range(self.n_clusters)
+            ],
+            dtype=np.float64,
+        )
+        return self
+
+    def predict(self, data: ClinicalTimeSeriesDataset) -> PredictionPayload:
+        if self.feature_pipeline is None or self.cluster_model is None or self.cluster_risk is None:
+            raise RuntimeError(f"{self.__class__.__name__} must be fitted before predict().")
+        raw_features = self.transform_fpca_features(data)
+        features = self.feature_pipeline.transform(raw_features)
+        model_features = self.predict_model_features(features)
+        pred_cluster = self.cluster_model.predict(model_features)
+        risk_score = self.cluster_risk[pred_cluster]
+        return prediction_payload_from_dataset(
+            data,
+            pred_cluster=torch.as_tensor(pred_cluster, dtype=torch.long),
+            risk_score=torch.as_tensor(risk_score, dtype=torch.float32),
+        )
+
+    def fit_fpca_features(self, data: ClinicalTimeSeriesDataset) -> NDArray[np.float64]:
+        fdata_grid_cls, fpca_cls = load_skfda_fpca()
+        self.fpca_imputers = []
+        self.fpca_models = []
+        score_blocks = []
+        for matrix in self.interpolated_feature_matrices(data):
+            imputer = SimpleImputer(strategy="mean", keep_empty_features=True)
+            imputed = np.asarray(imputer.fit_transform(matrix), dtype=np.float64)
+            n_components = min(self.fpca_components, imputed.shape[0], imputed.shape[1])
+            fpca_model = fpca_cls(n_components=n_components)
+            scores = np.asarray(
+                fpca_model.fit_transform(
+                    fdata_grid_cls(data_matrix=imputed, grid_points=self.reference_grid)
+                ),
+                dtype=np.float64,
+            )
+            self.fpca_imputers.append(imputer)
+            self.fpca_models.append(fpca_model)
+            score_blocks.append(scores)
+        return np.hstack(score_blocks)
+
+    def transform_fpca_features(self, data: ClinicalTimeSeriesDataset) -> NDArray[np.float64]:
+        if not self.fpca_imputers or not self.fpca_models:
+            raise RuntimeError(f"{self.__class__.__name__} must be fitted before predict().")
+        fdata_grid_cls, _fpca_cls = load_skfda_fpca()
+        score_blocks = []
+        matrices = self.interpolated_feature_matrices(data)
+        for matrix, imputer, fpca_model in zip(
+            matrices,
+            self.fpca_imputers,
+            self.fpca_models,
+            strict=True,
+        ):
+            imputed = np.asarray(imputer.transform(matrix), dtype=np.float64)
+            scores = np.asarray(
+                fpca_model.transform(
+                    fdata_grid_cls(data_matrix=imputed, grid_points=self.reference_grid)
+                ),
+                dtype=np.float64,
+            )
+            score_blocks.append(scores)
+        return np.hstack(score_blocks)
+
+    def interpolated_feature_matrices(
+        self,
+        data: ClinicalTimeSeriesDataset,
+    ) -> list[NDArray[np.float64]]:
+        aligned_data = data.with_return_kind("aligned")
+        matrices = [
+            np.full((len(aligned_data), self.fpca_grid_size), np.nan, dtype=np.float64)
+            for _feature in range(aligned_data.n_features)
+        ]
+        for sample_index in range(len(aligned_data)):
+            sample = aligned_data.samples[sample_index].to_aligned()
+            times = sample.times.detach().cpu().numpy()
+            values = sample.x.detach().cpu().numpy()
+            mask = sample.mask.detach().cpu().numpy()
+            for feature_index in range(aligned_data.n_features):
+                matrices[feature_index][sample_index] = interpolate_feature_to_grid(
+                    times=times,
+                    values=values[:, feature_index],
+                    mask=mask[:, feature_index],
+                    reference_grid=self.reference_grid,
+                )
+        return matrices
+
+
 BASELINE_REGISTRY: Mapping[BaselineMethod, type[BaseBaseline]] = {
     SummaryKMeansBaseline.name: SummaryKMeansBaseline,
     RiskStratifiedKMeansBaseline.name: RiskStratifiedKMeansBaseline,
+    FPCAKMeansBaseline.name: FPCAKMeansBaseline,
 }
 
 
@@ -209,6 +337,8 @@ def make_baseline(
     kmeans_iters: int,
     ridge_alpha: float,
     risk_feature_weight: float,
+    fpca_components: int = 3,
+    fpca_grid_size: int = 16,
 ) -> BaseBaseline:
     baseline_cls = BASELINE_REGISTRY[method]
     kwargs: dict[str, Any] = {
@@ -223,4 +353,53 @@ def make_baseline(
                 "risk_feature_weight": risk_feature_weight,
             }
         )
+    if issubclass(baseline_cls, FPCAKMeansBaseline):
+        kwargs.update(
+            {
+                "fpca_components": fpca_components,
+                "fpca_grid_size": fpca_grid_size,
+            }
+        )
     return baseline_cls(**kwargs)
+
+
+def load_skfda_fpca() -> tuple[Any, Any]:
+    try:
+        from skfda import FDataGrid
+        from skfda.preprocessing.dim_reduction import FPCA
+    except ImportError as error:
+        raise RuntimeError(
+            "baseline method fpca_kmeans requires scikit-fda. Run `uv sync` after "
+            "updating project dependencies."
+        ) from error
+    return FDataGrid, FPCA
+
+
+def interpolate_feature_to_grid(
+    *,
+    times: NDArray[np.float64],
+    values: NDArray[np.float64],
+    mask: NDArray[np.float64],
+    reference_grid: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    observed = np.flatnonzero(mask > 0)
+    if observed.size == 0:
+        return np.full(reference_grid.shape, np.nan, dtype=np.float64)
+    observed_times = times[observed].astype(np.float64)
+    observed_values = values[observed].astype(np.float64)
+    if observed.size == 1:
+        return np.full(reference_grid.shape, float(observed_values[0]), dtype=np.float64)
+    span = float(observed_times[-1] - observed_times[0])
+    if span <= 1e-8:
+        return np.full(reference_grid.shape, float(observed_values[-1]), dtype=np.float64)
+    normalized_times = (observed_times - observed_times[0]) / span
+    return np.asarray(
+        np.interp(
+            reference_grid,
+            normalized_times,
+            observed_values,
+            left=float(observed_values[0]),
+            right=float(observed_values[-1]),
+        ),
+        dtype=np.float64,
+    )

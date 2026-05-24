@@ -9,8 +9,8 @@ from trails.config import ModelConfig, TrainerConfig
 
 from .generators import ClinicalTimeSeriesDatasetGeneratorConfig
 
-Command = Literal["baseline", "simulate", "train", "optim"]
-BaselineMethod = Literal["summary_kmeans", "risk_stratified_kmeans"]
+Command = Literal["baseline", "simulate", "summary", "train", "optim"]
+BaselineMethod = Literal["summary_kmeans", "risk_stratified_kmeans", "fpca_kmeans"]
 
 OPTIM_PARAM_NAMES = (
     "encoder_input_kind",
@@ -113,13 +113,15 @@ class BaselineConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     methods: tuple[BaselineMethod, ...] = Field(
-        default=("summary_kmeans", "risk_stratified_kmeans"),
+        default=("summary_kmeans", "risk_stratified_kmeans", "fpca_kmeans"),
         min_length=1,
     )
     n_clusters: int | None = Field(default=None, gt=1)
     kmeans_iters: int = Field(default=50, ge=0)
     ridge_alpha: float = Field(default=1.0, ge=0.0)
     risk_feature_weight: float = Field(default=1.0, ge=0.0)
+    fpca_components: int = Field(default=3, gt=0)
+    fpca_grid_size: int = Field(default=16, gt=1)
 
     @model_validator(mode="after")
     def validate_unique_methods(self) -> BaselineConfig:
@@ -206,9 +208,18 @@ class OptimConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     n_trials: int = Field(default=30, gt=0)
+    run_id: str | None = None
     study_name: str = Field(default="optim", min_length=1)
     storage: str | None = None
     search: OptimSearchSpaceConfig = Field(default_factory=OptimSearchSpaceConfig)
+
+
+class SummaryConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    train_root: Path | None = None
+    baseline_root: Path | None = None
+    metrics: tuple[str, ...] = Field(default=("cindex", "ari", "nmi", "acc"), min_length=1)
 
 
 class ApplicationConfig(BaseModel):
@@ -220,3 +231,13 @@ class ApplicationConfig(BaseModel):
     paths: PathsConfig = Field(default_factory=PathsConfig)
     baseline: BaselineConfig = Field(default_factory=BaselineConfig)
     optim: OptimConfig = Field(default_factory=OptimConfig)
+    summary: SummaryConfig = Field(default_factory=SummaryConfig)
+
+    @model_validator(mode="after")
+    def validate_command_specific_config(self) -> ApplicationConfig:
+        if self.command == "summary":
+            if self.summary.train_root is None:
+                raise ValueError("command=summary requires summary.train_root=...")
+            if self.summary.baseline_root is None:
+                raise ValueError("command=summary requires summary.baseline_root=...")
+        return self

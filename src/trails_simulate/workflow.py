@@ -27,6 +27,7 @@ from .path import (
     data_root,
     discover_dataset_runs,
 )
+from .result_summary import run_summary_command
 from .training import fit_training_run
 
 
@@ -63,6 +64,8 @@ def run(
         return run_optim_command(config, hydra_run_dir, project_root)
     if config.command == "baseline":
         return run_baseline_command(config, hydra_run_dir, project_root)
+    if config.command == "summary":
+        return run_summary_command(config, hydra_run_dir, project_root)
 
     raise ValueError(f"Unsupported command: {config.command}")
 
@@ -218,6 +221,15 @@ def run_train_command(
             metrics=train_result.metrics,
         )
         metric_rows.append(row)
+        tqdm.write(
+            format_completed_train_run(
+                run_id=run_paths.run_id,
+                n_clusters=run_config.training.model.n_clusters,
+                seed=seed,
+                prediction_path=prediction_path,
+                metrics=train_result.metrics,
+            )
+        )
         run_payloads.append(
             {
                 "history": train_result.history,
@@ -278,6 +290,8 @@ def run_baseline_command(
                 kmeans_iters=config.baseline.kmeans_iters,
                 ridge_alpha=config.baseline.ridge_alpha,
                 risk_feature_weight=config.baseline.risk_feature_weight,
+                fpca_components=config.baseline.fpca_components,
+                fpca_grid_size=config.baseline.fpca_grid_size,
             )
             prediction = baseline.fit(train_dataset).predict(test_dataset)
             metrics = evaluate_predictions(prediction, n_clusters=n_clusters)
@@ -344,6 +358,24 @@ def metric_row(
         "run_id": run_paths.run_id,
         **metrics,
     }
+
+
+def format_completed_train_run(
+    *,
+    run_id: str,
+    n_clusters: int,
+    seed: int,
+    prediction_path: Path,
+    metrics: Mapping[str, float],
+) -> str:
+    metric_names = ("cindex", "ari", "nmi", "acc", "cluster_empty_count")
+    metric_text = " ".join(
+        f"{name}={float(metrics[name]):.4g}" for name in metric_names if name in metrics
+    )
+    return (
+        f"Completed train run: {run_id} "
+        f"k={n_clusters} seed={seed} {metric_text} prediction={prediction_path}"
+    )
 
 
 def dataset_source_payload(

@@ -46,6 +46,7 @@ clean reusable method library.
 - Train with mTAN-style input: `uv run main.py command=train training=mtan paths.data_root=data/simulated/base`
 - Run lightweight baselines on existing splits: `uv run main.py command=baseline paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run main.py command=optim paths.data_root=data/simulated/base`
+- Summarize train and baseline results: `uv run main.py command=summary summary.train_root=outputs/train-... summary.baseline_root=outputs/baseline-...`
 - Format: `uv run ruff format`
 - Lint: `uv run ruff check --fix`
 - Type check: `UV_CACHE_DIR=/tmp/uv-cache uv run pyright`
@@ -82,13 +83,15 @@ clean reusable method library.
   `large`, and `mtan`. Training scene selection comes from `paths.data_root` or
   explicit `paths.data` plus `paths.test_data`, not from simulation config.
 - Command-level config namespaces are `simulation`, `training`, `baseline`,
-  `optim`, and shared `paths`; generator parameters live under
+  `optim`, `summary`, and shared `paths`; generator parameters live under
   `simulation.generator`, while TRAILS model/trainer/artifacts/diagnostics/SwanLab
   parameters live under `training`.
 - `simulation.train_size` and `simulation.test_size` are equal-length lists that
   are paired by position. Each paired sample-size level is crossed with
   `simulation.generator.n_clusters`, and each combination is repeated
-  `simulation.repeats` times.
+  `simulation.repeats` times. Formal simulation scenes use train sizes
+  `[500, 1000, 2000, 3000, 5000]` and fixed test size `300`; `quick` remains a
+  small smoke-test configuration.
 - `simulation.repeats` means paired split repeats within each sample-size and K
   combination: each repeat generates one source simulation dataset and splits it
   into train/test.
@@ -136,12 +139,15 @@ clean reusable method library.
   command-level metrics CSV and summary JSON.
 - `command=baseline` lives in `trails_simulate` and runs lightweight simulation
   comparators on existing train/test splits: summary-feature k-means and
-  risk-stratified summary-feature k-means. It writes baseline summary JSON and
-  metrics CSV under the Hydra run directory.
-- `command=optim` recursively discovers existing train/test splits like train and
-  baseline, creates one Optuna study per split, and writes `study.db`, `trials.csv`,
-  and `optim_summary.json` under the mirrored run directory. Explicit shared
-  `optim.storage` is only allowed for a single discovered dataset.
+  risk-stratified summary-feature k-means, plus FPCA-KMeans via `scikit-fda`. It
+  writes baseline summary JSON and metrics CSV under the Hydra run directory.
+- `command=optim` recursively discovers existing train/test splits but runs only
+  one split per invocation. Use `optim.run_id` for reproducible batch execution;
+  otherwise the command interactively lists discovered split numbers for selection.
+- `command=summary` reads explicit train and baseline Hydra run directories,
+  combines `train_metrics.csv` and `baseline_metrics.csv`, aggregates metrics by
+  scenario/sample size/K/method, and writes CSV/JSON plus publication-facing PNG
+  figures under the summary Hydra run directory.
 
 ## Verification
 

@@ -83,7 +83,7 @@ uv run main.py command=train training=mtan paths.data_root=data/simulated/high_d
 训练显式指定的 train/test `.pt` 数据：
 
 ```bash
-uv run main.py command=train training=small paths.data=data/simulated/base/train_375_test_125/k2/0/train.pt paths.test_data=data/simulated/base/train_375_test_125/k2/0/test.pt
+uv run main.py command=train training=small paths.data=data/simulated/base/train_500_test_300/k2/0/train.pt paths.test_data=data/simulated/base/train_500_test_300/k2/0/test.pt
 ```
 
 对已有 train/test split 运行轻量基线方法：
@@ -96,21 +96,29 @@ uv run main.py command=baseline paths.data_root=data/simulated/base
 
 ```bash
 uv run main.py command=optim paths.data_root=data/simulated/base optim.n_trials=20
+uv run main.py command=optim paths.data_root=data/simulated/base optim.run_id=base/train_500_test_300/k2/0 optim.n_trials=20
+```
+
+合并训练与基线结果并生成图表：
+
+```bash
+uv run main.py command=summary summary.train_root=outputs/train-... summary.baseline_root=outputs/baseline-...
 ```
 
 `command=train`、`command=baseline` 和 `command=optim` 都会递归扫描
 `paths.data_root` 下所有 sibling `train.pt`/`test.pt` 目录；也可以用
 `paths.data + paths.test_data` 显式指定单个 split。输出会镜像数据相对路径，例如
-`outputs/.../train_375_test_125/k2/0/trails.pt`。训练和基线会优先从 dataset metadata
+`outputs/.../train_500_test_300/k2/0/trails.pt`。训练和基线会优先从 dataset metadata
 中的 `generation_params.n_clusters` 推断 K，metadata 缺失时才回退到 YAML 默认值。
 
 `command=train` 会在 Hydra run 目录下保存 `train_summary.json`、`train_metrics.csv`
 和 `<run_id>/trails.pt`。`command=baseline` 会保存
 `baseline_summary.json`、`baseline_metrics.csv` 和
-`<run_id>/<method>.pt`，用于比较 summary-feature KMeans 与
-risk-stratified summary-feature KMeans 两个轻量模拟基线。`command=optim` 会为每个
-数据 split 创建独立 study，保存 `<run_id>/study.db`、`trials.csv` 和
-`optim_summary.json`；显式共享 `optim.storage` 时只允许单个数据 split。
+`<run_id>/<method>.pt`，用于比较 summary-feature KMeans、risk-stratified
+summary-feature KMeans 和 FPCA-KMeans。`command=optim` 一次只对一个数据 split
+创建 study；当 `paths.data_root` 下有多个 split 且未提供 `optim.run_id` 时，会在终端
+列出编号让用户选择一个。`command=summary` 读取显式 train/baseline run 目录下的
+metrics CSV，保存合并 CSV、聚合 CSV、summary JSON 和 `figures/*.png`。
 
 命令结束时 stdout 会打印精简的可读 summary；完整机器可读结果保存在上述
 JSON/CSV artifacts 中。

@@ -15,6 +15,8 @@ def format_run_summary(result: Mapping[str, Any]) -> str:
         return format_optim_summary(result)
     if command == "baseline":
         return format_baseline_summary(result)
+    if command == "summary":
+        return format_result_summary(result)
     raise ValueError(f"Unsupported command summary: {command}")
 
 
@@ -128,6 +130,27 @@ def format_baseline_summary(result: Mapping[str, Any]) -> str:
                 metrics = dict(method_result["metrics"])
                 metric_text = format_inline_metrics(metrics)
                 lines.append(f"  {run['run_id']:<30} {method_result['method']:<24} {metric_text}")
+    return "\n".join(lines)
+
+
+def format_result_summary(result: Mapping[str, Any]) -> str:
+    outputs = dict(result["outputs"])
+    metrics = dict(result["metrics"])
+    figures = dict(outputs.get("figures", {}))
+    lines = [
+        "TRAILS summary complete",
+        f"Hydra run: {result['hydra_run_dir']}",
+        f"Rows: {result['n_rows']}",
+        f"Groups: {result['n_groups']}",
+        f"Available metrics: {', '.join(metrics.get('available', []))}",
+        f"Skipped metrics: {', '.join(metrics.get('skipped', [])) or 'none'}",
+        "",
+        "Saved summaries:",
+        f"  summary: {outputs['summary']}",
+        f"  metrics csv: {outputs['metrics_csv']}",
+        f"  grouped csv: {outputs['grouped_csv']}",
+        f"  figures: {len(figures)}",
+    ]
     return "\n".join(lines)
 
 

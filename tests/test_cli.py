@@ -42,6 +42,15 @@ def write_synthetic_split(root: Path, *, n_clusters: int, seed: int) -> None:
     test_data.save(root / "test.pt")
 
 
+def write_metrics_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    fieldnames = sorted({name for row in rows for name in row})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def test_command_enum_rejects_removed_paper_grid() -> None:
     from trails_simulate.config import ApplicationConfig
 
@@ -49,6 +58,26 @@ def test_command_enum_rejects_removed_paper_grid() -> None:
 
     with pytest.raises(ValidationError, match="Input should be"):
         ApplicationConfig.model_validate(payload)
+
+
+def test_summary_command_config_validates_required_roots(tmp_path: Path) -> None:
+    from trails_simulate.config import ApplicationConfig
+
+    payload = compose_payload("command=summary")
+
+    with pytest.raises(ValidationError, match="summary.train_root"):
+        ApplicationConfig.model_validate(payload)
+
+    app_config = ApplicationConfig.model_validate(
+        compose_payload(
+            "command=summary",
+            f"summary.train_root={tmp_path / 'train'}",
+            f"summary.baseline_root={tmp_path / 'baseline'}",
+        )
+    )
+
+    assert app_config.command == "summary"
+    assert app_config.summary.metrics == ("cindex", "ari", "nmi", "acc")
 
 
 def test_simulation_configs_validate() -> None:
@@ -79,10 +108,25 @@ def test_simulation_configs_validate() -> None:
         )
 
     base_config = ApplicationConfig.model_validate(compose_payload("simulation=base"))
-    assert base_config.simulation.train_size == (375, 750, 1500, 3750, 7500)
-    assert base_config.simulation.test_size == (125, 250, 500, 1250, 2500)
+    assert base_config.simulation.train_size == (500, 1000, 2000, 3000, 5000)
+    assert base_config.simulation.test_size == (300, 300, 300, 300, 300)
     assert base_config.simulation.generator.n_clusters_tuple_ == (2, 3, 4, 5)
     assert base_config.simulation.repeats == 5
+
+
+def test_baseline_config_includes_fpca_and_rejects_duplicate_methods() -> None:
+    from trails_simulate.config import ApplicationConfig
+
+    app_config = ApplicationConfig.model_validate(compose_payload())
+    assert app_config.baseline.methods == (
+        "summary_kmeans",
+        "risk_stratified_kmeans",
+        "fpca_kmeans",
+    )
+
+    payload = compose_payload("baseline.methods=[summary_kmeans,summary_kmeans]")
+    with pytest.raises(ValidationError, match="duplicates"):
+        ApplicationConfig.model_validate(payload)
 
 
 def test_training_configs_validate() -> None:
@@ -213,6 +257,7 @@ def test_recursive_dataset_discovery_uses_mirrored_run_ids(tmp_path: Path) -> No
 
 def test_train_command_runs_all_discovered_splits_and_uses_dataset_k(
     monkeypatch,
+    capsys,
     tmp_path: Path,
 ) -> None:
     from trails.data import ClinicalTimeSeriesDataset
@@ -247,7 +292,7 @@ def test_train_command_runs_all_discovered_splits_and_uses_dataset_k(
         )
         return TrainResult(
             history=[],
-            metrics={"cindex": 1.0, "cluster_entropy": 0.0},
+            metrics={"ari": 0.2, "cindex": 1.0, "cluster_empty_count": 0.0},
             prediction=prediction,
             run_dir=None,
         )
@@ -261,6 +306,10 @@ def test_train_command_runs_all_discovered_splits_and_uses_dataset_k(
         "base/train_6_test_2/k3/0",
     ]
     assert seen_clusters == [2, 3]
+    captured = capsys.readouterr()
+    assert "Completed train run: base/train_6_test_2/k2/0" in captured.out
+    assert "cindex=1" in captured.out
+    assert "ari=0.2" in captured.out
     assert (tmp_path / "run" / "base" / "train_6_test_2" / "k2" / "0" / "trails.pt").exists()
     assert (tmp_path / "run" / "train_summary.json").exists()
     assert (tmp_path / "run" / "train_metrics.csv").exists()
@@ -320,31 +369,57 @@ def test_optim_trial_config_updates_training_namespace() -> None:
     assert app_config.training.model.n_clusters == 4
 
 
-def test_optim_command_rejects_shared_storage_for_multiple_splits(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    from trails_simulate import optim
+def test_summary_command_combines_metrics_and_writes_figures(tmp_path: Path) -> None:
+    from trails_simulate import workflow
     from trails_simulate.config import ApplicationConfig
 
-    data_root = tmp_path / "data"
-    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
-    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
+    train_root = tmp_path / "train"
+    baseline_root = tmp_path / "baseline"
+    run_id_a = "base/train_500_test_300/k3/0"
+    run_id_b = "base/train_500_test_300/k3/1"
+    write_metrics_csv(
+        train_root / "train_metrics.csv",
+        [
+            {"run_id": run_id_a, "method": "trails", "cindex": 0.7, "ari": 0.2},
+            {"run_id": run_id_b, "method": "trails", "cindex": 0.8, "ari": 0.4},
+        ],
+    )
+    write_metrics_csv(
+        baseline_root / "baseline_metrics.csv",
+        [
+            {"run_id": run_id_a, "method": "summary_kmeans", "cindex": 0.5, "ari": 0.1},
+            {"run_id": run_id_b, "method": "summary_kmeans", "cindex": 0.6, "ari": 0.2},
+        ],
+    )
     app_config = ApplicationConfig.model_validate(
         compose_payload(
-            "command=optim",
-            f"paths.data_root={data_root}",
-            f"optim.storage={tmp_path / 'shared.db'}",
+            "command=summary",
+            f"summary.train_root={train_root}",
+            f"summary.baseline_root={baseline_root}",
+            "summary.metrics=[cindex,ari,nmi]",
         )
     )
 
-    monkeypatch.setattr(optim, "load_optuna", lambda: object())
+    result = workflow.run(app_config, hydra_run_dir=tmp_path / "run", project_root=ROOT)
 
-    with pytest.raises(ValueError, match="one dataset"):
-        optim.run_optim_command(app_config, tmp_path / "run", ROOT)
+    assert result["command"] == "summary"
+    assert result["n_rows"] == 4
+    assert "nmi" in result["metrics"]["skipped"]
+    assert (tmp_path / "run" / "summary_metrics.csv").exists()
+    assert (tmp_path / "run" / "summary_metrics_grouped.csv").exists()
+    assert (tmp_path / "run" / "summary_summary.json").exists()
+    assert (tmp_path / "run" / "figures" / "cindex_by_train_size.png").exists()
+
+    with (tmp_path / "run" / "summary_metrics.csv").open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["scenario"] == "base"
+    assert rows[0]["train_size"] == "500"
+    assert rows[0]["test_size"] == "300"
+    assert rows[0]["n_clusters"] == "3"
+    assert rows[0]["repeat"] == "0"
 
 
-def test_optim_command_runs_independent_studies_for_multiple_splits(
+def test_optim_command_filters_configured_run_id_with_shared_storage(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -401,6 +476,8 @@ def test_optim_command_runs_independent_studies_for_multiple_splits(
             "command=optim",
             "optim.n_trials=1",
             f"paths.data_root={data_root}",
+            "optim.run_id=base/train_6_test_2/k3/0",
+            f"optim.storage={tmp_path / 'shared.db'}",
         )
     )
     fake_optuna = FakeOptuna()
@@ -414,15 +491,70 @@ def test_optim_command_runs_independent_studies_for_multiple_splits(
 
     result = optim.run_optim_command(app_config, tmp_path / "run", ROOT)
 
-    assert len(result["runs"]) == 2
-    assert [study.study_name for study in fake_optuna.created] == [
-        "optim-base-train_6_test_2-k2-0",
-        "optim-base-train_6_test_2-k3-0",
-    ]
-    assert fake_optuna.created[0].storage != fake_optuna.created[1].storage
-    assert fake_optuna.created[0].storage.endswith("base/train_6_test_2/k2/0/study.db")
-    assert (tmp_path / "run" / "base" / "train_6_test_2" / "k2" / "0" / "trials.csv").exists()
+    assert len(result["runs"]) == 1
+    assert result["selection"]["run_id"] == "base/train_6_test_2/k3/0"
+    assert result["selection"]["source"] == "configured"
+    assert fake_optuna.created[0].study_name == "optim-base-train_6_test_2-k3-0"
+    assert fake_optuna.created[0].storage.endswith("shared.db")
+    assert (tmp_path / "run" / "base" / "train_6_test_2" / "k3" / "0" / "trials.csv").exists()
     assert (tmp_path / "run" / "optim_summary.json").exists()
+
+
+def test_optim_command_interactively_selects_one_split(monkeypatch, tmp_path: Path) -> None:
+    from trails_simulate import optim
+    from trails_simulate.config import ApplicationConfig
+
+    data_root = tmp_path / "data"
+    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
+    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
+    app_config = ApplicationConfig.model_validate(
+        compose_payload("command=optim", "optim.n_trials=1", f"paths.data_root={data_root}")
+    )
+
+    selected: list[str] = []
+
+    def fake_run_optim_dataset(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        run_paths = kwargs["run_paths"]
+        selected.append(run_paths.run_id)
+        run_root = kwargs["run_root"]
+        run_root.mkdir(parents=True, exist_ok=True)
+        return {
+            "n_completed_after": 1,
+            "n_completed_before": 0,
+            "outputs": {"optim_summary": str(run_root / "optim_summary.json")},
+            "run_id": run_paths.run_id,
+        }
+
+    monkeypatch.setattr(optim, "load_optuna", lambda: object())
+    monkeypatch.setattr(optim, "run_optim_dataset", fake_run_optim_dataset)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "2")
+
+    result = optim.run_optim_command(app_config, tmp_path / "run", ROOT)
+
+    assert selected == ["base/train_6_test_2/k3/0"]
+    assert result["selection"]["source"] == "interactive"
+    assert result["selection"]["run_id"] == "base/train_6_test_2/k3/0"
+
+
+def test_optim_command_raises_when_interactive_selection_is_unavailable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from trails_simulate import optim
+    from trails_simulate.config import ApplicationConfig
+
+    data_root = tmp_path / "data"
+    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
+    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
+    app_config = ApplicationConfig.model_validate(
+        compose_payload("command=optim", "optim.n_trials=1", f"paths.data_root={data_root}")
+    )
+
+    monkeypatch.setattr(optim, "load_optuna", lambda: object())
+    monkeypatch.setattr("builtins.input", lambda _prompt: (_ for _ in ()).throw(EOFError()))
+
+    with pytest.raises(ValueError, match="optim.run_id"):
+        optim.run_optim_command(app_config, tmp_path / "run", ROOT)
 
 
 def test_paths_reject_removed_validation_data_field() -> None:

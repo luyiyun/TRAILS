@@ -6,6 +6,7 @@ from sklearn.linear_model import Ridge
 
 from trails.data import ClinicalTimeSeriesDataset, make_clinical_sample
 from trails_simulate.baselines import (
+    FPCAKMeansBaseline,
     RiskStratifiedKMeansBaseline,
     SummaryKMeansBaseline,
     make_baseline,
@@ -104,9 +105,39 @@ def test_baseline_factory_builds_registered_methods() -> None:
         ridge_alpha=1.0,
         risk_feature_weight=1.0,
     )
+    fpca = make_baseline(
+        "fpca_kmeans",
+        n_clusters=2,
+        random_state=17,
+        kmeans_iters=5,
+        ridge_alpha=1.0,
+        risk_feature_weight=1.0,
+    )
 
     assert isinstance(summary, SummaryKMeansBaseline)
     assert isinstance(risk, RiskStratifiedKMeansBaseline)
+    assert isinstance(fpca, FPCAKMeansBaseline)
+
+
+def test_fpca_baseline_class_api_and_sklearn_fit() -> None:
+    train_data, test_data = simulate_split()
+    baseline = FPCAKMeansBaseline(
+        n_clusters=2,
+        random_state=101,
+        fpca_components=2,
+        fpca_grid_size=8,
+        kmeans_iters=5,
+    )
+
+    fitted = baseline.fit(train_data)
+    prediction = fitted.predict(test_data)
+    metrics = evaluate_predictions(prediction, n_clusters=2)
+
+    assert fitted is baseline
+    assert isinstance(baseline.cluster_model, KMeans)
+    assert len(baseline.fpca_models) == train_data.n_features
+    assert prediction["pred_cluster"].shape == (len(test_data),)
+    assert metrics.keys() >= {"cindex", "acc", "ari", "nmi", "cluster_entropy"}
 
 
 def test_baseline_feature_extraction_keeps_missing_values_for_imputer() -> None:
@@ -150,6 +181,13 @@ def test_baseline_assignments_do_not_use_test_survival_labels() -> None:
             random_state=202,
             ridge_alpha=1.0,
             risk_feature_weight=1.0,
+        ),
+        FPCAKMeansBaseline(
+            n_clusters=2,
+            random_state=202,
+            fpca_components=2,
+            fpca_grid_size=8,
+            kmeans_iters=5,
         ),
     ):
         baseline.fit(train_data)

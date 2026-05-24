@@ -1,4 +1,5 @@
 n_trials: 30
+run_id: null
 study_name: optim
 storage: null
 search:
