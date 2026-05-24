@@ -17,7 +17,7 @@ from trails.artifacts import (
     save_json,
     save_latent_embedding_artifacts,
 )
-from trails.config import DataConfig, TrailsConfig
+from trails.config import DataConfig, TrailsConfig, resolve_batch_size
 from trails.data import ClinicalTimeSeriesDataset
 from trails.estimator import TrailsEstimator
 from trails.trainer import HistoryEntry
@@ -57,7 +57,15 @@ def fit_training_run(
     trails_config = TrailsConfig(
         data=DataConfig(n_features=dataset.n_features),
         model=config.training.model,
-        trainer=config.training.trainer.model_copy(update={"seed": seed}),
+        trainer=config.training.trainer.model_copy(
+            update={
+                "batch_size": resolve_batch_size(
+                    len(dataset),
+                    config.training.trainer.batch_size,
+                ),
+                "seed": seed,
+            }
+        ),
         seed=seed,
     )
 

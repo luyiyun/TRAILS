@@ -82,6 +82,9 @@ clean reusable method library.
 - Training model presets live under `configs/training/`: `small`, `base`,
   `large`, and `mtan`. Training scene selection comes from `paths.data_root` or
   explicit `paths.data` plus `paths.test_data`, not from simulation config.
+- `training.trainer.batch_size: null` means the trainer resolves batch size from
+  the loaded training split size using a conservative automatic rule; explicit
+  integer overrides keep their exact value.
 - Command-level config namespaces are `simulation`, `training`, `baseline`,
   `optim`, `summary`, and shared `paths`; generator parameters live under
   `simulation.generator`, while TRAILS model/trainer/artifacts/diagnostics/SwanLab

@@ -35,7 +35,7 @@ def tiny_config(n_features: int) -> TrailsConfig:
         trainer=TrainerConfig(
             max_epochs=1,
             warmup_epochs=1,
-            batch_size=4,
+            batch_size=None,
             gmm_init_iters=2,
             valid_size=0.0,
         ),

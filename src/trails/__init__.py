@@ -7,6 +7,7 @@ from .config import (
     ModelConfig,
     TrailsConfig,
     TrainerConfig,
+    resolve_batch_size,
 )
 from .data import (
     AlignedClinicalSample,
@@ -32,4 +33,5 @@ __all__ = [
     "TrainerConfig",
     "TrailsEstimator",
     "clinical_collate_fn",
+    "resolve_batch_size",
 ]

@@ -13,6 +13,8 @@ from trails.config import (
     EncoderMappingConfig,
     LossConfig,
     ModelConfig,
+    TrainerConfig,
+    resolve_batch_size,
 )
 from trails.data import (
     AlignedClinicalSample,
@@ -21,6 +23,7 @@ from trails.data import (
     CompactClinicalSample,
     clinical_collate_fn,
     make_clinical_sample,
+    make_data_loader,
 )
 from trails.metrics import (
     ClusteringAccuracy,
@@ -71,6 +74,42 @@ def simulate_dataset(
         n_patients=patients,
         seed=seed,
     )
+
+
+@pytest.mark.parametrize(
+    ("n_samples", "expected"),
+    [
+        (8, 8),
+        (64, 16),
+        (500, 64),
+        (1000, 128),
+        (3000, 256),
+        (5000, 256),
+    ],
+)
+def test_resolve_batch_size_uses_auto_rule(n_samples: int, expected: int) -> None:
+    assert resolve_batch_size(n_samples, None) == expected
+
+
+def test_resolve_batch_size_preserves_explicit_override() -> None:
+    assert resolve_batch_size(8, 64) == 64
+
+
+def test_data_loader_accepts_auto_batch_size() -> None:
+    dataset = simulate_dataset(
+        patients=8,
+        n_clusters=2,
+        min_visits=3,
+        max_visits=5,
+        hidden_size=12,
+        latent_dim=4,
+        attention_layers=2,
+        seed=5,
+    )
+    loader = make_data_loader(dataset, TrainerConfig(batch_size=None), shuffle=False)
+    batch = next(iter(loader))
+
+    assert batch["x"].shape[0] == 8
 
 
 def test_clinical_dataset_and_collate_shapes() -> None:

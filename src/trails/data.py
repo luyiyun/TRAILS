@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
-from .config import DataConfig, TrainerConfig
+from .config import DataConfig, TrainerConfig, resolve_batch_size
 
 type SampleKind = Literal["aligned", "compact"]
 Batch = dict[str, Tensor]
@@ -522,7 +522,7 @@ def make_data_loader(
         DataLoader[Batch],
         DataLoader(
             data,
-            batch_size=trainer_config.batch_size,
+            batch_size=resolve_batch_size(len(data), trainer_config.batch_size),
             shuffle=shuffle,
             collate_fn=clinical_collate_fn,
         ),

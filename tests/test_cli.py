@@ -1,4 +1,5 @@
 import csv
+import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -142,7 +143,13 @@ def test_training_configs_validate() -> None:
         app_config = ApplicationConfig.model_validate(compose_payload(f"training={training}"))
         assert app_config.training.model.encoder.input.kind == input_kind
         assert app_config.training.model.n_clusters > 1
+        assert app_config.training.trainer.batch_size is None
         assert app_config.training.trainer.valid_size == 0.2
+
+    explicit_config = ApplicationConfig.model_validate(
+        compose_payload("training=base", "training.trainer.batch_size=64")
+    )
+    assert explicit_config.training.trainer.batch_size == 64
 
 
 def test_simulation_list_overrides_are_validated() -> None:
@@ -313,6 +320,63 @@ def test_train_command_runs_all_discovered_splits_and_uses_dataset_k(
     assert (tmp_path / "run" / "base" / "train_6_test_2" / "k2" / "0" / "trails.pt").exists()
     assert (tmp_path / "run" / "train_summary.json").exists()
     assert (tmp_path / "run" / "train_metrics.csv").exists()
+
+
+def test_fit_training_run_resolves_auto_batch_size_and_records_effective_value(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from trails_simulate import training
+    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.path import TrainPaths
+
+    split_root = tmp_path / "data"
+    write_synthetic_split(split_root, n_clusters=2, seed=47)
+    seen_batch_sizes: list[int | None] = []
+
+    class FakeEstimator:
+        def __init__(self, config: Any) -> None:
+            self.config = config
+            self.history: list[Any] = []
+            seen_batch_sizes.append(config.trainer.batch_size)
+
+        def fit(self, *_args: Any, **_kwargs: Any) -> Any:
+            return self
+
+        def predict(self, data: Any) -> torch.Tensor:
+            return torch.zeros(len(data), dtype=torch.long)
+
+        def predict_risk(self, data: Any) -> torch.Tensor:
+            return torch.arange(len(data), dtype=torch.float32)
+
+        def predict_proba(self, data: Any) -> torch.Tensor:
+            return torch.ones(len(data), self.config.model.n_clusters, dtype=torch.float32)
+
+    monkeypatch.setattr(training, "TrailsEstimator", FakeEstimator)
+    app_config = ApplicationConfig.model_validate(
+        compose_payload(
+            "command=train",
+            "training=small",
+            "training.artifacts.names=[config]",
+        )
+    )
+
+    training.fit_training_run(
+        app_config,
+        train_paths=TrainPaths(
+            data=split_root / "train.pt",
+            test_data=split_root / "test.pt",
+            train_root=tmp_path / "run",
+            save=None,
+        ),
+        seed=61,
+        swanlab_repeat_label=None,
+    )
+    config_payload = json.loads((tmp_path / "run" / "config.json").read_text(encoding="utf-8"))
+
+    assert seen_batch_sizes == [8]
+    assert config_payload["config"]["trainer"]["batch_size"] == 8
+    assert config_payload["train_args"]["batch_size"] == 8
 
 
 def test_baseline_command_infers_k_per_split(tmp_path: Path) -> None:

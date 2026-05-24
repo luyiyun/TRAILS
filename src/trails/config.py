@@ -1,8 +1,25 @@
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+AUTO_BATCH_TARGET_UPDATES = 10
+AUTO_BATCH_MIN_SIZE = 16
+AUTO_BATCH_MAX_SIZE = 256
+
+
+def resolve_batch_size(n_samples: int, configured_batch_size: int | None) -> int:
+    if n_samples <= 0:
+        raise ValueError("n_samples must be positive when resolving batch size.")
+    if configured_batch_size is not None:
+        return configured_batch_size
+
+    target_size = math.ceil(n_samples / AUTO_BATCH_TARGET_UPDATES)
+    power_of_two_size = 1 << (target_size - 1).bit_length()
+    bounded_size = min(max(power_of_two_size, AUTO_BATCH_MIN_SIZE), AUTO_BATCH_MAX_SIZE)
+    return min(n_samples, bounded_size)
 
 
 class DataConfig(BaseModel):
@@ -110,7 +127,7 @@ class TrainerConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     max_epochs: int = Field(default=10, gt=0)
-    batch_size: int = Field(default=16, gt=0)
+    batch_size: int | None = Field(default=None, gt=0)
     learning_rate: float = Field(default=1e-3, gt=0.0)
     warmup_epochs: int = Field(default=1, ge=0)
     gmm_init_iters: int = Field(default=20, ge=0)
