@@ -29,7 +29,7 @@ model:
 trainer:
   min_epochs: 100
   max_epochs: 300
-  batch_size: 64
+  batch_size: 32
   learning_rate: 5.0e-4
   warmup_epochs: 20
   gmm_init_iters: 20

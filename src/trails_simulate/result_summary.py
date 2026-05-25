@@ -4,6 +4,7 @@ import csv
 import math
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,31 @@ RUN_ID_PATTERN = re.compile(
     r"k(?P<n_clusters>\d+)/(?P<repeat>\d+)$"
 )
 PARSED_RUN_FIELDS = ("scenario", "train_size", "test_size", "n_clusters", "repeat")
+GRID_FIGURE_METRIC_LABELS = {
+    "acc": "ACC",
+    "ari": "ARI",
+    "nmi": "NMI",
+    "cindex": "C-index",
+}
+OKABE_ITO_COLORS = (
+    "#0072B2",
+    "#D55E00",
+    "#009E73",
+    "#CC79A7",
+    "#E69F00",
+    "#56B4E9",
+    "#000000",
+    "#F0E442",
+)
+PLOT_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "h")
+
+
+@dataclass(frozen=True)
+class MetricInput:
+    source: str
+    root: Path
+    label: str
+    metrics_csv: Path
 
 
 def run_summary_command(
@@ -24,21 +50,13 @@ def run_summary_command(
     hydra_run_dir: Path,
     project_root: Path,
 ) -> dict[str, Any]:
-    if config.summary.train_root is None or config.summary.baseline_root is None:
-        raise ValueError("command=summary requires summary.train_root and summary.baseline_root.")
+    inputs = summary_metric_inputs(config, project_root)
+    if not inputs:
+        raise ValueError("command=summary requires at least one train or baseline metrics root.")
 
-    train_root = resolve_path(config.summary.train_root, project_root)
-    baseline_root = resolve_path(config.summary.baseline_root, project_root)
-    train_csv = train_root / "train_metrics.csv"
-    baseline_csv = baseline_root / "baseline_metrics.csv"
-    require_file(train_csv)
-    require_file(baseline_csv)
-
-    rows = [
-        *read_metric_rows(train_csv, source="train"),
-        *read_metric_rows(baseline_csv, source="baseline"),
-    ]
+    rows = [row for metric_input in inputs for row in read_metric_rows(metric_input)]
     parse_warnings = add_run_id_fields(rows)
+    add_method_labels(rows)
     grouped_rows = group_metric_rows(rows)
     requested_metrics = list(config.summary.metrics)
     available_metrics = available_numeric_metrics(rows)
@@ -60,12 +78,7 @@ def run_summary_command(
         "command": "summary",
         "config": config.model_dump(mode="json"),
         "hydra_run_dir": str(hydra_run_dir),
-        "inputs": {
-            "baseline_metrics": str(baseline_csv),
-            "baseline_root": str(baseline_root),
-            "train_metrics": str(train_csv),
-            "train_root": str(train_root),
-        },
+        "inputs": [metric_input_payload(metric_input) for metric_input in inputs],
         "metrics": {
             "available": available_metrics,
             "requested": requested_metrics,
@@ -85,18 +98,67 @@ def run_summary_command(
     return payload
 
 
+def summary_metric_inputs(config: ApplicationConfig, project_root: Path) -> list[MetricInput]:
+    inputs: list[MetricInput] = []
+    train_roots = tuple(
+        resolve_path(root, project_root) for root in config.summary.effective_train_roots()
+    )
+    train_labels = source_labels(train_roots, config.summary.train_labels)
+    for root, label in zip(train_roots, train_labels, strict=True):
+        metrics_csv = root / "train_metrics.csv"
+        require_file(metrics_csv)
+        inputs.append(MetricInput("train", root, label, metrics_csv))
+
+    baseline_roots = tuple(
+        resolve_path(root, project_root) for root in config.summary.effective_baseline_roots()
+    )
+    baseline_labels = source_labels(baseline_roots, config.summary.baseline_labels)
+    for root, label in zip(baseline_roots, baseline_labels, strict=True):
+        metrics_csv = root / "baseline_metrics.csv"
+        require_file(metrics_csv)
+        inputs.append(MetricInput("baseline", root, label, metrics_csv))
+    return inputs
+
+
+def source_labels(roots: Sequence[Path], configured_labels: Sequence[str]) -> tuple[str, ...]:
+    if configured_labels:
+        return tuple(configured_labels)
+    return automatic_source_labels(roots)
+
+
+def automatic_source_labels(roots: Sequence[Path]) -> tuple[str, ...]:
+    names = tuple(root.name or str(root) for root in roots)
+    if len(set(names)) == len(names):
+        return names
+    parent_names = tuple(f"{root.parent.name}/{root.name}" for root in roots)
+    if len(set(parent_names)) == len(parent_names):
+        return parent_names
+    return tuple(str(root) for root in roots)
+
+
+def metric_input_payload(metric_input: MetricInput) -> dict[str, str]:
+    return {
+        "label": metric_input.label,
+        "metrics_csv": str(metric_input.metrics_csv),
+        "root": str(metric_input.root),
+        "source": metric_input.source,
+    }
+
+
 def require_file(path: Path) -> None:
     if not path.exists():
         raise ValueError(f"Required summary input does not exist: {path}")
 
 
-def read_metric_rows(path: Path, *, source: str) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8", newline="") as handle:
+def read_metric_rows(metric_input: MetricInput) -> list[dict[str, Any]]:
+    with metric_input.metrics_csv.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         rows = []
         for row in reader:
             parsed = {name: parse_csv_value(value) for name, value in row.items()}
-            parsed["source"] = source
+            parsed["source"] = metric_input.source
+            parsed["source_label"] = metric_input.label
+            parsed["source_root"] = str(metric_input.root)
             rows.append(parsed)
     return rows
 
@@ -131,6 +193,21 @@ def add_run_id_fields(rows: Sequence[dict[str, Any]]) -> list[str]:
     return warnings
 
 
+def add_method_labels(rows: Sequence[dict[str, Any]]) -> None:
+    method_sources: dict[str, set[str]] = {}
+    for row in rows:
+        method = str(row.get("method", ""))
+        source_key = str(row.get("source_root", ""))
+        method_sources.setdefault(method, set()).add(source_key)
+
+    for row in rows:
+        method = str(row.get("method", ""))
+        if len(method_sources.get(method, set())) > 1:
+            row["method_label"] = f"{method} ({row.get('source_label', '')})"
+        else:
+            row["method_label"] = method
+
+
 def available_numeric_metrics(rows: Sequence[Mapping[str, Any]]) -> list[str]:
     excluded = {
         "n_clusters",
@@ -148,7 +225,7 @@ def available_numeric_metrics(rows: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def group_metric_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    group_fields = ("scenario", "train_size", "test_size", "n_clusters", "method")
+    group_fields = ("scenario", "train_size", "test_size", "n_clusters", "method_label")
     metric_names = available_numeric_metrics(rows)
     groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
     for row in rows:
@@ -160,6 +237,9 @@ def group_metric_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
         groups.items(), key=lambda item: tuple(str(value) for value in item[0])
     ):
         grouped: dict[str, Any] = dict(zip(group_fields, key, strict=True))
+        grouped["method"] = joined_unique_values(group_rows, "method")
+        grouped["source"] = joined_unique_values(group_rows, "source")
+        grouped["source_label"] = joined_unique_values(group_rows, "source_label")
         for metric in metric_names:
             values = [
                 float(row[metric])
@@ -179,6 +259,11 @@ def group_metric_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
     return grouped_rows
 
 
+def joined_unique_values(rows: Sequence[Mapping[str, Any]], name: str) -> str:
+    values = sorted({str(row.get(name, "")) for row in rows if row.get(name, "") != ""})
+    return "|".join(values)
+
+
 def save_summary_figures(
     grouped_rows: Sequence[Mapping[str, Any]],
     *,
@@ -195,51 +280,68 @@ def save_summary_figures(
 
     figures_dir.mkdir(parents=True, exist_ok=True)
     figures = {}
-    for metric in metrics:
-        metric_path = figures_dir / f"{metric}_by_train_size.png"
-        plot_metric_by_train_size(grouped_rows, metric=metric, path=metric_path, plt=plt)
-        figures[f"{metric}_by_train_size"] = str(metric_path)
-
-    overview_path = figures_dir / "method_metric_overview.png"
-    plot_method_metric_overview(grouped_rows, metrics=metrics, path=overview_path, plt=plt)
-    figures["method_metric_overview"] = str(overview_path)
+    scenarios = sorted({str(row.get("scenario", "")) for row in grouped_rows})
+    for scenario in scenarios:
+        scenario_rows = [row for row in grouped_rows if row.get("scenario") == scenario]
+        if not scenario_rows:
+            continue
+        filename = safe_filename(scenario)
+        png_path = figures_dir / f"{filename}_metrics_by_train_size.png"
+        pdf_path = figures_dir / f"{filename}_metrics_by_train_size.pdf"
+        plot_scenario_metric_grid(
+            scenario_rows,
+            scenario=scenario,
+            metrics=metrics,
+            png_path=png_path,
+            pdf_path=pdf_path,
+            plt=plt,
+        )
+        figures[f"{filename}_metrics_by_train_size_png"] = str(png_path)
+        figures[f"{filename}_metrics_by_train_size_pdf"] = str(pdf_path)
     return figures
 
 
-def plot_metric_by_train_size(
+def safe_filename(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_")
+    return sanitized or "unknown"
+
+
+def plot_scenario_metric_grid(
     grouped_rows: Sequence[Mapping[str, Any]],
     *,
-    metric: str,
-    path: Path,
+    scenario: str,
+    metrics: Sequence[str],
+    png_path: Path,
+    pdf_path: Path,
     plt: Any,
 ) -> None:
-    metric_key = f"{metric}_mean"
-    rows = [row for row in grouped_rows if isinstance(row.get(metric_key), int | float)]
-    scenarios = sorted({str(row.get("scenario", "")) for row in rows})
     clusters = sorted(
-        {int(row["n_clusters"]) for row in rows if isinstance(row.get("n_clusters"), int)}
+        {int(row["n_clusters"]) for row in grouped_rows if isinstance(row.get("n_clusters"), int)}
     )
-    methods = sorted({str(row.get("method", "")) for row in rows})
-    if not scenarios or not clusters or not methods:
+    methods = sorted({str(row.get("method_label", "")) for row in grouped_rows})
+    if not metrics or not clusters or not methods:
         return
 
+    set_publication_style(plt)
     fig, axes = plt.subplots(
-        len(scenarios),
+        len(metrics),
         len(clusters),
-        figsize=(4.2 * len(clusters), 3.2 * len(scenarios)),
+        figsize=(3.4 * len(clusters), 2.55 * len(metrics)),
+        sharex="col",
         squeeze=False,
     )
-    for row_index, scenario in enumerate(scenarios):
+    for row_index, metric in enumerate(metrics):
+        metric_key = f"{metric}_mean"
         for col_index, cluster in enumerate(clusters):
             ax = axes[row_index][col_index]
             subset = [
                 row
-                for row in rows
-                if row.get("scenario") == scenario and row.get("n_clusters") == cluster
+                for row in grouped_rows
+                if row.get("n_clusters") == cluster and isinstance(row.get(metric_key), int | float)
             ]
-            for method in methods:
+            for method_index, method in enumerate(methods):
                 method_rows = sorted(
-                    [row for row in subset if row.get("method") == method],
+                    [row for row in subset if row.get("method_label") == method],
                     key=lambda row: int(row["train_size"]),
                 )
                 if not method_rows:
@@ -247,55 +349,78 @@ def plot_metric_by_train_size(
                 x = [int(row["train_size"]) for row in method_rows]
                 y = [float(row[metric_key]) for row in method_rows]
                 yerr = [float(row.get(f"{metric}_std", 0.0)) for row in method_rows]
-                ax.errorbar(x, y, yerr=yerr, marker="o", linewidth=1.5, capsize=3, label=method)
-            ax.set_title(f"{scenario} K={cluster}")
-            ax.set_xlabel("train size")
-            ax.set_ylabel(metric)
-            ax.grid(alpha=0.25)
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="upper center", ncol=max(1, min(len(labels), 4)))
+                ax.errorbar(
+                    x,
+                    y,
+                    yerr=yerr,
+                    color=OKABE_ITO_COLORS[method_index % len(OKABE_ITO_COLORS)],
+                    marker=PLOT_MARKERS[method_index % len(PLOT_MARKERS)],
+                    linewidth=1.8,
+                    markersize=4.5,
+                    capsize=3,
+                    capthick=1.0,
+                    elinewidth=1.0,
+                    label=method,
+                )
+            if row_index == 0:
+                ax.set_title(f"K = {cluster}", pad=8)
+            if col_index == 0:
+                ax.set_ylabel(metric_label(metric))
+            if row_index == len(metrics) - 1:
+                ax.set_xlabel("Training sample size")
+            apply_metric_limits(ax, metric)
+            ax.grid(axis="y", alpha=0.22, linewidth=0.7)
+            ax.set_axisbelow(True)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.tick_params(axis="x", rotation=0)
+
+    handles_by_label: dict[str, Any] = {}
+    for ax in axes.ravel():
+        handles, labels = ax.get_legend_handles_labels()
+        for handle, label in zip(handles, labels, strict=True):
+            handles_by_label.setdefault(label, handle)
+    if handles_by_label:
+        fig.legend(
+            list(handles_by_label.values()),
+            list(handles_by_label.keys()),
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.985),
+            frameon=False,
+            ncol=max(1, min(len(handles_by_label), 5)),
+        )
+    fig.suptitle(f"{scenario} simulation", y=1.02, fontsize=12, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    fig.savefig(path, dpi=160)
+    fig.savefig(png_path, dpi=320, bbox_inches="tight")
+    fig.savefig(pdf_path, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_method_metric_overview(
-    grouped_rows: Sequence[Mapping[str, Any]],
-    *,
-    metrics: Sequence[str],
-    path: Path,
-    plt: Any,
-) -> None:
-    methods = sorted({str(row.get("method", "")) for row in grouped_rows})
-    fig, axes = plt.subplots(1, len(metrics), figsize=(4.2 * len(metrics), 3.6), squeeze=False)
-    for index, metric in enumerate(metrics):
-        ax = axes[0][index]
-        values = [
-            overall_method_mean(grouped_rows, method=method, metric=metric) for method in methods
-        ]
-        ax.bar(methods, values)
-        ax.set_title(metric)
-        ax.tick_params(axis="x", rotation=35)
-        ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
+def set_publication_style(plt: Any) -> None:
+    plt.rcParams.update(
+        {
+            "axes.labelsize": 9,
+            "axes.linewidth": 0.8,
+            "axes.titlesize": 9,
+            "font.size": 9,
+            "legend.fontsize": 8,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
+        }
+    )
 
 
-def overall_method_mean(
-    grouped_rows: Sequence[Mapping[str, Any]],
-    *,
-    method: str,
-    metric: str,
-) -> float:
-    key = f"{metric}_mean"
-    values = [
-        float(row[key])
-        for row in grouped_rows
-        if row.get("method") == method and isinstance(row.get(key), int | float)
-    ]
-    return sum(values) / len(values) if values else float("nan")
+def metric_label(metric: str) -> str:
+    return GRID_FIGURE_METRIC_LABELS.get(metric, metric)
+
+
+def apply_metric_limits(ax: Any, metric: str) -> None:
+    if metric in {"acc", "nmi", "cindex"}:
+        ax.set_ylim(0.0, 1.02)
+    elif metric == "ari":
+        ax.set_ylim(-0.05, 1.02)
 
 
 def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -318,6 +443,9 @@ def csv_fieldnames(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         "n_clusters",
         "repeat",
         "method",
+        "method_label",
+        "source_label",
+        "source_root",
         "data_root",
         "prediction_path",
     ]

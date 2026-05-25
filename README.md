@@ -102,6 +102,12 @@ uv run main.py command=optim paths.data_root=data/simulated/base optim.run_id=ba
 合并训练与基线结果并生成图表：
 
 ```bash
+uv run main.py command=summary 'summary.train_roots=[outputs/train-base,outputs/train-mtan]' 'summary.baseline_roots=[outputs/baseline-kmeans,outputs/baseline-fpca]' 'summary.train_labels=[base,mtan]' 'summary.baseline_labels=[kmeans,fpca]'
+```
+
+旧的单次运行参数仍然可用：
+
+```bash
 uv run main.py command=summary summary.train_root=outputs/train-... summary.baseline_root=outputs/baseline-...
 ```
 
@@ -111,14 +117,16 @@ uv run main.py command=summary summary.train_root=outputs/train-... summary.base
 `outputs/.../train_500_test_300/k2/0/trails.pt`。训练和基线会优先从 dataset metadata
 中的 `generation_params.n_clusters` 推断 K，metadata 缺失时才回退到 YAML 默认值。
 
-`command=train` 会在 Hydra run 目录下保存 `train_summary.json`、`train_metrics.csv`
+`command=train` 会在每个 split 开始和结束时打印已耗时与剩余时间估计，并在
+Hydra run 目录下保存 `train_summary.json`、`train_metrics.csv`
 和 `<run_id>/trails.pt`。`command=baseline` 会保存
 `baseline_summary.json`、`baseline_metrics.csv` 和
 `<run_id>/<method>.pt`，用于比较 summary-feature KMeans、risk-stratified
 summary-feature KMeans 和 FPCA-KMeans。`command=optim` 一次只对一个数据 split
 创建 study；当 `paths.data_root` 下有多个 split 且未提供 `optim.run_id` 时，会在终端
 列出编号让用户选择一个。`command=summary` 读取显式 train/baseline run 目录下的
-metrics CSV，保存合并 CSV、聚合 CSV、summary JSON 和 `figures/*.png`。
+metrics CSV，保存合并 CSV、聚合 CSV、summary JSON，并为每个 simulation scenario
+生成一张按 `metrics × K` 排布的带误差条总图 PNG/PDF。
 
 命令结束时 stdout 会打印精简的可读 summary；完整机器可读结果保存在上述
 JSON/CSV artifacts 中。

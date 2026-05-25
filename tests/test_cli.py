@@ -66,10 +66,10 @@ def test_summary_command_config_validates_required_roots(tmp_path: Path) -> None
 
     payload = compose_payload("command=summary")
 
-    with pytest.raises(ValidationError, match="summary.train_root"):
+    with pytest.raises(ValidationError, match="at least one"):
         ApplicationConfig.model_validate(payload)
 
-    app_config = ApplicationConfig.model_validate(
+    legacy_config = ApplicationConfig.model_validate(
         compose_payload(
             "command=summary",
             f"summary.train_root={tmp_path / 'train'}",
@@ -77,8 +77,33 @@ def test_summary_command_config_validates_required_roots(tmp_path: Path) -> None
         )
     )
 
-    assert app_config.command == "summary"
-    assert app_config.summary.metrics == ("cindex", "ari", "nmi", "acc")
+    assert legacy_config.command == "summary"
+    assert legacy_config.summary.effective_train_roots() == (tmp_path / "train",)
+    assert legacy_config.summary.effective_baseline_roots() == (tmp_path / "baseline",)
+    assert legacy_config.summary.metrics == ("acc", "ari", "nmi", "cindex")
+
+    plural_payload = compose_payload("command=summary")
+    plural_payload["summary"]["train_roots"] = [
+        str(tmp_path / "train-base"),
+        str(tmp_path / "train-mtan"),
+    ]
+    plural_payload["summary"]["train_labels"] = ["base", "mtan"]
+    plural_config = ApplicationConfig.model_validate(plural_payload)
+
+    assert plural_config.summary.effective_train_roots() == (
+        tmp_path / "train-base",
+        tmp_path / "train-mtan",
+    )
+    assert plural_config.summary.train_labels == ("base", "mtan")
+
+    bad_label_payload = compose_payload("command=summary")
+    bad_label_payload["summary"]["baseline_roots"] = [
+        str(tmp_path / "baseline-a"),
+        str(tmp_path / "baseline-b"),
+    ]
+    bad_label_payload["summary"]["baseline_labels"] = ["only-one"]
+    with pytest.raises(ValidationError, match="baseline_labels"):
+        ApplicationConfig.model_validate(bad_label_payload)
 
 
 def test_simulation_configs_validate() -> None:
@@ -322,6 +347,46 @@ def test_train_command_runs_all_discovered_splits_and_uses_dataset_k(
     assert (tmp_path / "run" / "train_metrics.csv").exists()
 
 
+def test_train_progress_time_formatting() -> None:
+    from trails_simulate.workflow import (
+        estimate_remaining_seconds,
+        format_completed_train_run,
+        format_duration,
+        format_start_train_run,
+    )
+
+    assert format_duration(None) == "estimating"
+    assert format_duration(12.34) == "12.3s"
+    assert format_duration(65.0) == "1m05s"
+    assert estimate_remaining_seconds([10.0, 20.0], remaining_runs=2) == pytest.approx(30.0)
+
+    start_message = format_start_train_run(
+        index=1,
+        total=3,
+        run_id="base/train_500_test_300/k3/0",
+        elapsed_seconds=65.0,
+        remaining_seconds=130.0,
+    )
+    assert "Training run 2/3" in start_message
+    assert "elapsed=1m05s" in start_message
+    assert "remaining=2m10s" in start_message
+
+    completed_message = format_completed_train_run(
+        run_id="base/train_500_test_300/k3/0",
+        n_clusters=3,
+        seed=7,
+        prediction_path=Path("trails.pt"),
+        metrics={"cindex": 0.9, "ari": 0.5},
+        run_duration_seconds=10.0,
+        elapsed_seconds=75.0,
+        remaining_seconds=20.0,
+    )
+    assert "duration=10.0s" in completed_message
+    assert "elapsed=1m15s" in completed_message
+    assert "remaining=20.0s" in completed_message
+    assert "cindex=0.9" in completed_message
+
+
 def test_fit_training_run_resolves_auto_batch_size_and_records_effective_value(
     monkeypatch,
     tmp_path: Path,
@@ -472,7 +537,8 @@ def test_summary_command_combines_metrics_and_writes_figures(tmp_path: Path) -> 
     assert (tmp_path / "run" / "summary_metrics.csv").exists()
     assert (tmp_path / "run" / "summary_metrics_grouped.csv").exists()
     assert (tmp_path / "run" / "summary_summary.json").exists()
-    assert (tmp_path / "run" / "figures" / "cindex_by_train_size.png").exists()
+    assert (tmp_path / "run" / "figures" / "base_metrics_by_train_size.png").exists()
+    assert (tmp_path / "run" / "figures" / "base_metrics_by_train_size.pdf").exists()
 
     with (tmp_path / "run" / "summary_metrics.csv").open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
@@ -481,6 +547,69 @@ def test_summary_command_combines_metrics_and_writes_figures(tmp_path: Path) -> 
     assert rows[0]["test_size"] == "300"
     assert rows[0]["n_clusters"] == "3"
     assert rows[0]["repeat"] == "0"
+    assert rows[0]["method_label"] == "trails"
+
+
+def test_summary_command_merges_multiple_roots_with_distinct_method_labels(
+    tmp_path: Path,
+) -> None:
+    from trails_simulate import workflow
+    from trails_simulate.config import ApplicationConfig
+
+    train_base = tmp_path / "train-base"
+    train_mtan = tmp_path / "train-mtan"
+    baseline_classic = tmp_path / "baseline-classic"
+    baseline_fpca = tmp_path / "baseline-fpca"
+    run_id_a = "base/train_500_test_300/k3/0"
+    run_id_b = "base/train_500_test_300/k3/1"
+    write_metrics_csv(
+        train_base / "train_metrics.csv",
+        [
+            {"run_id": run_id_a, "method": "trails", "cindex": 0.7, "ari": 0.2},
+            {"run_id": run_id_b, "method": "trails", "cindex": 0.8, "ari": 0.4},
+        ],
+    )
+    write_metrics_csv(
+        train_mtan / "train_metrics.csv",
+        [
+            {"run_id": run_id_a, "method": "trails", "cindex": 0.9, "ari": 0.5},
+            {"run_id": run_id_b, "method": "trails", "cindex": 1.0, "ari": 0.7},
+        ],
+    )
+    write_metrics_csv(
+        baseline_classic / "baseline_metrics.csv",
+        [{"run_id": run_id_a, "method": "summary_kmeans", "cindex": 0.55, "ari": 0.1}],
+    )
+    write_metrics_csv(
+        baseline_fpca / "baseline_metrics.csv",
+        [{"run_id": run_id_a, "method": "fpca_kmeans", "cindex": 0.6, "ari": 0.12}],
+    )
+
+    payload = compose_payload("command=summary", "summary.metrics=[cindex,ari]")
+    payload["summary"]["train_roots"] = [str(train_base), str(train_mtan)]
+    payload["summary"]["baseline_roots"] = [str(baseline_classic), str(baseline_fpca)]
+    payload["summary"]["train_labels"] = ["base", "mtan"]
+    payload["summary"]["baseline_labels"] = ["classic", "fpca"]
+    app_config = ApplicationConfig.model_validate(payload)
+
+    result = workflow.run(app_config, hydra_run_dir=tmp_path / "run", project_root=ROOT)
+
+    assert result["n_rows"] == 6
+    assert len(result["inputs"]) == 4
+    assert (tmp_path / "run" / "figures" / "base_metrics_by_train_size.png").exists()
+    with (tmp_path / "run" / "summary_metrics_grouped.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        grouped = list(csv.DictReader(handle))
+    means = {
+        row["method_label"]: float(row["cindex_mean"])
+        for row in grouped
+        if row["scenario"] == "base" and row["n_clusters"] == "3"
+    }
+    assert means["trails (base)"] == pytest.approx(0.75)
+    assert means["trails (mtan)"] == pytest.approx(0.95)
+    assert means["summary_kmeans"] == pytest.approx(0.55)
+    assert means["fpca_kmeans"] == pytest.approx(0.6)
 
 
 def test_optim_command_filters_configured_run_id_with_shared_storage(

@@ -26,7 +26,7 @@ model:
     n_heads: 2
 trainer:
   max_epochs: 2
-  batch_size: 64
+  batch_size: 32
   learning_rate: 1.0e-3
   warmup_epochs: 1
   gmm_init_iters: 5

@@ -219,7 +219,31 @@ class SummaryConfig(BaseModel):
 
     train_root: Path | None = None
     baseline_root: Path | None = None
-    metrics: tuple[str, ...] = Field(default=("cindex", "ari", "nmi", "acc"), min_length=1)
+    train_roots: tuple[Path, ...] = ()
+    baseline_roots: tuple[Path, ...] = ()
+    train_labels: tuple[str, ...] = ()
+    baseline_labels: tuple[str, ...] = ()
+    metrics: tuple[str, ...] = Field(default=("acc", "ari", "nmi", "cindex"), min_length=1)
+
+    def effective_train_roots(self) -> tuple[Path, ...]:
+        if self.train_roots:
+            return self.train_roots
+        return () if self.train_root is None else (self.train_root,)
+
+    def effective_baseline_roots(self) -> tuple[Path, ...]:
+        if self.baseline_roots:
+            return self.baseline_roots
+        return () if self.baseline_root is None else (self.baseline_root,)
+
+    @model_validator(mode="after")
+    def validate_labels(self) -> SummaryConfig:
+        train_roots = self.effective_train_roots()
+        baseline_roots = self.effective_baseline_roots()
+        if self.train_labels and len(self.train_labels) != len(train_roots):
+            raise ValueError("summary.train_labels length must match summary train roots.")
+        if self.baseline_labels and len(self.baseline_labels) != len(baseline_roots):
+            raise ValueError("summary.baseline_labels length must match summary baseline roots.")
+        return self
 
 
 class ApplicationConfig(BaseModel):
@@ -236,8 +260,12 @@ class ApplicationConfig(BaseModel):
     @model_validator(mode="after")
     def validate_command_specific_config(self) -> ApplicationConfig:
         if self.command == "summary":
-            if self.summary.train_root is None:
-                raise ValueError("command=summary requires summary.train_root=...")
-            if self.summary.baseline_root is None:
-                raise ValueError("command=summary requires summary.baseline_root=...")
+            if (
+                not self.summary.effective_train_roots()
+                and not self.summary.effective_baseline_roots()
+            ):
+                raise ValueError(
+                    "command=summary requires at least one of summary.train_roots, "
+                    "summary.baseline_roots, summary.train_root, or summary.baseline_root."
+                )
         return self

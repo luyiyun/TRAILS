@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -190,8 +191,22 @@ def run_train_command(
     runs = discover_dataset_runs(config, hydra_run_dir, project_root)
     metric_rows: list[dict[str, Any]] = []
     run_payloads: list[dict[str, Any]] = []
+    command_started_at = time.perf_counter()
+    completed_durations: list[float] = []
     for index, run_paths in enumerate(runs):
-        print(f"Training run {index + 1}/{len(runs)}: {run_paths.run_id}")
+        tqdm.write(
+            format_start_train_run(
+                index=index,
+                total=len(runs),
+                run_id=run_paths.run_id,
+                elapsed_seconds=time.perf_counter() - command_started_at,
+                remaining_seconds=estimate_remaining_seconds(
+                    completed_durations,
+                    remaining_runs=len(runs) - index,
+                ),
+            )
+        )
+        run_started_at = time.perf_counter()
         seed = config.training.trainer.seed + index
         run_config = config_for_dataset_clusters(config, run_paths.train_data)
         train_paths = TrainPaths(
@@ -221,6 +236,8 @@ def run_train_command(
             metrics=train_result.metrics,
         )
         metric_rows.append(row)
+        run_duration = time.perf_counter() - run_started_at
+        completed_durations.append(run_duration)
         tqdm.write(
             format_completed_train_run(
                 run_id=run_paths.run_id,
@@ -228,6 +245,12 @@ def run_train_command(
                 seed=seed,
                 prediction_path=prediction_path,
                 metrics=train_result.metrics,
+                run_duration_seconds=run_duration,
+                elapsed_seconds=time.perf_counter() - command_started_at,
+                remaining_seconds=estimate_remaining_seconds(
+                    completed_durations,
+                    remaining_runs=len(runs) - index - 1,
+                ),
             )
         )
         run_payloads.append(
@@ -360,6 +383,21 @@ def metric_row(
     }
 
 
+def format_start_train_run(
+    *,
+    index: int,
+    total: int,
+    run_id: str,
+    elapsed_seconds: float,
+    remaining_seconds: float | None,
+) -> str:
+    return (
+        f"Training run {index + 1}/{total}: {run_id} "
+        f"elapsed={format_duration(elapsed_seconds)} "
+        f"remaining={format_duration(remaining_seconds)}"
+    )
+
+
 def format_completed_train_run(
     *,
     run_id: str,
@@ -367,15 +405,50 @@ def format_completed_train_run(
     seed: int,
     prediction_path: Path,
     metrics: Mapping[str, float],
+    run_duration_seconds: float | None = None,
+    elapsed_seconds: float | None = None,
+    remaining_seconds: float | None = None,
 ) -> str:
     metric_names = ("cindex", "ari", "nmi", "acc", "cluster_empty_count")
     metric_text = " ".join(
         f"{name}={float(metrics[name]):.4g}" for name in metric_names if name in metrics
     )
+    timing_text = " ".join(
+        [
+            f"duration={format_duration(run_duration_seconds)}",
+            f"elapsed={format_duration(elapsed_seconds)}",
+            f"remaining={format_duration(remaining_seconds)}",
+        ]
+    )
     return (
         f"Completed train run: {run_id} "
-        f"k={n_clusters} seed={seed} {metric_text} prediction={prediction_path}"
+        f"k={n_clusters} seed={seed} {timing_text} {metric_text} prediction={prediction_path}"
     )
+
+
+def estimate_remaining_seconds(
+    completed_durations: Sequence[float],
+    *,
+    remaining_runs: int,
+) -> float | None:
+    if remaining_runs <= 0:
+        return 0.0
+    if not completed_durations:
+        return None
+    return (sum(completed_durations) / len(completed_durations)) * remaining_runs
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "estimating"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    rounded_seconds = int(round(seconds))
+    hours, remainder = divmod(rounded_seconds, 3600)
+    minutes, seconds_part = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds_part:02d}s"
+    return f"{minutes}m{seconds_part:02d}s"
 
 
 def dataset_source_payload(

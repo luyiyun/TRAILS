@@ -46,7 +46,7 @@ clean reusable method library.
 - Train with mTAN-style input: `uv run main.py command=train training=mtan paths.data_root=data/simulated/base`
 - Run lightweight baselines on existing splits: `uv run main.py command=baseline paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run main.py command=optim paths.data_root=data/simulated/base`
-- Summarize train and baseline results: `uv run main.py command=summary summary.train_root=outputs/train-... summary.baseline_root=outputs/baseline-...`
+- Summarize train and baseline results: `uv run main.py command=summary 'summary.train_roots=[outputs/train-base,outputs/train-mtan]' 'summary.baseline_roots=[outputs/baseline-kmeans,outputs/baseline-fpca]' 'summary.train_labels=[base,mtan]' 'summary.baseline_labels=[kmeans,fpca]'`
 - Format: `uv run ruff format`
 - Lint: `uv run ruff check --fix`
 - Type check: `UV_CACHE_DIR=/tmp/uv-cache uv run pyright`
@@ -140,6 +140,8 @@ clean reusable method library.
   directories under `paths.data_root`, infer K from dataset metadata when present,
   and save unified prediction payloads under mirrored run directories plus
   command-level metrics CSV and summary JSON.
+- Train command progress reports include split index, elapsed time, per-split
+  duration, and estimated remaining time.
 - `command=baseline` lives in `trails_simulate` and runs lightweight simulation
   comparators on existing train/test splits: summary-feature k-means and
   risk-stratified summary-feature k-means, plus FPCA-KMeans via `scikit-fda`. It
@@ -147,10 +149,11 @@ clean reusable method library.
 - `command=optim` recursively discovers existing train/test splits but runs only
   one split per invocation. Use `optim.run_id` for reproducible batch execution;
   otherwise the command interactively lists discovered split numbers for selection.
-- `command=summary` reads explicit train and baseline Hydra run directories,
-  combines `train_metrics.csv` and `baseline_metrics.csv`, aggregates metrics by
-  scenario/sample size/K/method, and writes CSV/JSON plus publication-facing PNG
-  figures under the summary Hydra run directory.
+- `command=summary` accepts any number of train and baseline Hydra run directories
+  via plural roots, keeps legacy singleton roots as fallback, adds source-aware
+  method labels when repeated method names appear across roots, aggregates by
+  scenario/sample size/K/method label, and writes CSV/JSON plus one publication-facing
+  metrics-by-K PNG/PDF grid per scenario.
 
 ## Verification
 
