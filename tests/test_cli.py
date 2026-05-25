@@ -612,6 +612,53 @@ def test_summary_command_merges_multiple_roots_with_distinct_method_labels(
     assert means["fpca_kmeans"] == pytest.approx(0.6)
 
 
+def test_summary_command_plots_scenarioless_train_run_ids(tmp_path: Path) -> None:
+    from trails_simulate import workflow
+    from trails_simulate.config import ApplicationConfig
+
+    train_root = tmp_path / "train"
+    baseline_root = tmp_path / "baseline"
+    train_run_id = "train_500_test_300/k3/0"
+    baseline_run_id = "base/train_500_test_300/k3/0"
+    write_metrics_csv(
+        train_root / "train_metrics.csv",
+        [
+            {
+                "run_id": train_run_id,
+                "method": "trails",
+                "data_root": str(tmp_path / "data" / "base" / train_run_id),
+                "cindex": 0.9,
+                "ari": 0.5,
+            },
+        ],
+    )
+    write_metrics_csv(
+        baseline_root / "baseline_metrics.csv",
+        [{"run_id": baseline_run_id, "method": "summary_kmeans", "cindex": 0.6, "ari": 0.2}],
+    )
+    app_config = ApplicationConfig.model_validate(
+        compose_payload(
+            "command=summary",
+            f"summary.train_root={train_root}",
+            f"summary.baseline_root={baseline_root}",
+            "summary.metrics=[cindex,ari]",
+        )
+    )
+
+    result = workflow.run(app_config, hydra_run_dir=tmp_path / "run", project_root=ROOT)
+
+    assert result["parse_warnings"] == []
+    assert (tmp_path / "run" / "figures" / "base_metrics_by_train_size.png").exists()
+    with (tmp_path / "run" / "summary_metrics_grouped.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        grouped = list(csv.DictReader(handle))
+    assert {(row["scenario"], row["method_label"], row["n_clusters"]) for row in grouped} == {
+        ("base", "summary_kmeans", "3"),
+        ("base", "trails", "3"),
+    }
+
+
 def test_optim_command_filters_configured_run_id_with_shared_storage(
     monkeypatch,
     tmp_path: Path,

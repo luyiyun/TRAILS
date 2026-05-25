@@ -17,6 +17,10 @@ RUN_ID_PATTERN = re.compile(
     r"^(?P<scenario>[^/]+)/train_(?P<train_size>\d+)_test_(?P<test_size>\d+)/"
     r"k(?P<n_clusters>\d+)/(?P<repeat>\d+)$"
 )
+SCENARIOLESS_RUN_ID_PATTERN = re.compile(
+    r"^train_(?P<train_size>\d+)_test_(?P<test_size>\d+)/"
+    r"k(?P<n_clusters>\d+)/(?P<repeat>\d+)$"
+)
 PARSED_RUN_FIELDS = ("scenario", "train_size", "test_size", "n_clusters", "repeat")
 GRID_FIGURE_METRIC_LABELS = {
     "acc": "ACC",
@@ -180,17 +184,40 @@ def add_run_id_fields(rows: Sequence[dict[str, Any]]) -> list[str]:
     for row in rows:
         run_id = str(row.get("run_id", ""))
         match = RUN_ID_PATTERN.match(run_id)
-        if match is None:
-            for field in PARSED_RUN_FIELDS:
-                row[field] = ""
-            warnings.append(run_id)
+        if match is not None:
+            row["scenario"] = match.group("scenario")
+            row["train_size"] = int(match.group("train_size"))
+            row["test_size"] = int(match.group("test_size"))
+            row["n_clusters"] = int(match.group("n_clusters"))
+            row["repeat"] = int(match.group("repeat"))
             continue
-        row["scenario"] = match.group("scenario")
-        row["train_size"] = int(match.group("train_size"))
-        row["test_size"] = int(match.group("test_size"))
-        row["n_clusters"] = int(match.group("n_clusters"))
-        row["repeat"] = int(match.group("repeat"))
+
+        scenarioless_match = SCENARIOLESS_RUN_ID_PATTERN.match(run_id)
+        if scenarioless_match is not None:
+            row["scenario"] = infer_scenario_from_row(row)
+            row["train_size"] = int(scenarioless_match.group("train_size"))
+            row["test_size"] = int(scenarioless_match.group("test_size"))
+            row["n_clusters"] = int(scenarioless_match.group("n_clusters"))
+            row["repeat"] = int(scenarioless_match.group("repeat"))
+            continue
+
+        for field in PARSED_RUN_FIELDS:
+            row[field] = ""
+        warnings.append(run_id)
     return warnings
+
+
+def infer_scenario_from_row(row: Mapping[str, Any]) -> str:
+    data_root = row.get("data_root")
+    if isinstance(data_root, str) and data_root:
+        parts = Path(data_root).parts
+        for index, part in enumerate(parts):
+            if part.startswith("train_") and index > 0:
+                return parts[index - 1]
+    source_label = row.get("source_label")
+    if isinstance(source_label, str) and source_label:
+        return source_label
+    return "unknown"
 
 
 def add_method_labels(rows: Sequence[dict[str, Any]]) -> None:
@@ -368,7 +395,7 @@ def plot_scenario_metric_grid(
                 ax.set_ylabel(metric_label(metric))
             if row_index == len(metrics) - 1:
                 ax.set_xlabel("Training sample size")
-            apply_metric_limits(ax, metric)
+            apply_independent_metric_limits(ax, metric)
             ax.grid(axis="y", alpha=0.22, linewidth=0.7)
             ax.set_axisbelow(True)
             ax.spines["top"].set_visible(False)
@@ -416,11 +443,26 @@ def metric_label(metric: str) -> str:
     return GRID_FIGURE_METRIC_LABELS.get(metric, metric)
 
 
-def apply_metric_limits(ax: Any, metric: str) -> None:
-    if metric in {"acc", "nmi", "cindex"}:
-        ax.set_ylim(0.0, 1.02)
-    elif metric == "ari":
-        ax.set_ylim(-0.05, 1.02)
+def apply_independent_metric_limits(ax: Any, metric: str) -> None:
+    data_limits = ax.dataLim
+    if data_limits.width == float("-inf") or data_limits.height == float("-inf"):
+        return
+    y_min = float(data_limits.ymin)
+    y_max = float(data_limits.ymax)
+    if not math.isfinite(y_min) or not math.isfinite(y_max):
+        return
+
+    natural_min = -1.0 if metric == "ari" else 0.0
+    natural_max = 1.0 if metric in {"acc", "ari", "nmi", "cindex"} else y_max
+    span = max(y_max - y_min, 0.04)
+    padding = max(span * 0.18, 0.025)
+    lower = max(natural_min, y_min - padding)
+    upper = min(natural_max, y_max + padding)
+    if upper - lower < 0.08:
+        center = (upper + lower) / 2
+        lower = max(natural_min, center - 0.04)
+        upper = min(natural_max, center + 0.04)
+    ax.set_ylim(lower, upper)
 
 
 def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
