@@ -78,8 +78,8 @@ def test_summary_command_config_validates_required_roots(tmp_path: Path) -> None
     )
 
     assert legacy_config.command == "summary"
-    assert legacy_config.summary.effective_train_roots() == (tmp_path / "train",)
-    assert legacy_config.summary.effective_baseline_roots() == (tmp_path / "baseline",)
+    assert legacy_config.summary.train_roots() == (tmp_path / "train",)
+    assert legacy_config.summary.baseline_roots() == (tmp_path / "baseline",)
     assert legacy_config.summary.metrics == ("acc", "ari", "nmi", "cindex")
 
     plural_payload = compose_payload("command=summary")
@@ -90,7 +90,7 @@ def test_summary_command_config_validates_required_roots(tmp_path: Path) -> None
     plural_payload["summary"]["train_labels"] = ["base", "mtan"]
     plural_config = ApplicationConfig.model_validate(plural_payload)
 
-    assert plural_config.summary.effective_train_roots() == (
+    assert plural_config.summary.train_roots() == (
         tmp_path / "train-base",
         tmp_path / "train-mtan",
     )

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import csv
 import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import pandas as pd
 
 from trails.artifacts import save_json
 
@@ -58,7 +59,7 @@ def run_summary_command(
     if not inputs:
         raise ValueError("command=summary requires at least one train or baseline metrics root.")
 
-    rows = [row for metric_input in inputs for row in read_metric_rows(metric_input)]
+    dfs = [read_metric_df(mi) for mi in inputs]
     parse_warnings = add_run_id_fields(rows)
     add_method_labels(rows)
     grouped_rows = group_metric_rows(rows)
@@ -104,9 +105,7 @@ def run_summary_command(
 
 def summary_metric_inputs(config: ApplicationConfig, project_root: Path) -> list[MetricInput]:
     inputs: list[MetricInput] = []
-    train_roots = tuple(
-        resolve_path(root, project_root) for root in config.summary.effective_train_roots()
-    )
+    train_roots = tuple(resolve_path(root, project_root) for root in config.summary.train_roots)
     train_labels = source_labels(train_roots, config.summary.train_labels)
     for root, label in zip(train_roots, train_labels, strict=True):
         metrics_csv = root / "train_metrics.csv"
@@ -114,7 +113,7 @@ def summary_metric_inputs(config: ApplicationConfig, project_root: Path) -> list
         inputs.append(MetricInput("train", root, label, metrics_csv))
 
     baseline_roots = tuple(
-        resolve_path(root, project_root) for root in config.summary.effective_baseline_roots()
+        resolve_path(root, project_root) for root in config.summary.baseline_roots
     )
     baseline_labels = source_labels(baseline_roots, config.summary.baseline_labels)
     for root, label in zip(baseline_roots, baseline_labels, strict=True):
@@ -154,29 +153,12 @@ def require_file(path: Path) -> None:
         raise ValueError(f"Required summary input does not exist: {path}")
 
 
-def read_metric_rows(metric_input: MetricInput) -> list[dict[str, Any]]:
-    with metric_input.metrics_csv.open(encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        rows = []
-        for row in reader:
-            parsed = {name: parse_csv_value(value) for name, value in row.items()}
-            parsed["source"] = metric_input.source
-            parsed["source_label"] = metric_input.label
-            parsed["source_root"] = str(metric_input.root)
-            rows.append(parsed)
-    return rows
-
-
-def parse_csv_value(value: str | None) -> Any:
-    if value is None or value == "":
-        return ""
-    try:
-        number = float(value)
-    except ValueError:
-        return value
-    if math.isfinite(number):
-        return number
-    return value
+def read_metric_df(metric_input: MetricInput) -> pd.DataFrame:
+    df = pd.read_csv(metric_input.metrics_csv, index_col=0)
+    df["source"] = metric_input.source
+    df["source_label"] = metric_input.label
+    df["source_root"] = str(metric_input.root)
+    return df
 
 
 def add_run_id_fields(rows: Sequence[dict[str, Any]]) -> list[str]:
