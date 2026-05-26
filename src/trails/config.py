@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 LOGGER = logging.getLogger(__name__)
 
-AUTO_BATCH_TARGET_UPDATES = 10
+AUTO_BATCH_TARGET_UPDATES = 20
 AUTO_BATCH_MIN_SIZE = 16
 AUTO_BATCH_MAX_SIZE = 256
 
