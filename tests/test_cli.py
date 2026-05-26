@@ -69,18 +69,15 @@ def test_summary_command_config_validates_required_roots(tmp_path: Path) -> None
     with pytest.raises(ValidationError, match="at least one"):
         ApplicationConfig.model_validate(payload)
 
-    legacy_config = ApplicationConfig.model_validate(
-        compose_payload(
-            "command=summary",
-            f"summary.train_root={tmp_path / 'train'}",
-            f"summary.baseline_root={tmp_path / 'baseline'}",
-        )
-    )
+    roots_payload = compose_payload("command=summary")
+    roots_payload["summary"]["train_roots"] = [str(tmp_path / "train")]
+    roots_payload["summary"]["baseline_roots"] = [str(tmp_path / "baseline")]
+    roots_config = ApplicationConfig.model_validate(roots_payload)
 
-    assert legacy_config.command == "summary"
-    assert legacy_config.summary.train_roots() == (tmp_path / "train",)
-    assert legacy_config.summary.baseline_roots() == (tmp_path / "baseline",)
-    assert legacy_config.summary.metrics == ("acc", "ari", "nmi", "cindex")
+    assert roots_config.command == "summary"
+    assert roots_config.summary.train_roots == (tmp_path / "train",)
+    assert roots_config.summary.baseline_roots == (tmp_path / "baseline",)
+    assert roots_config.summary.metrics == ("acc", "ari", "nmi", "cindex")
 
     plural_payload = compose_payload("command=summary")
     plural_payload["summary"]["train_roots"] = [
@@ -90,7 +87,7 @@ def test_summary_command_config_validates_required_roots(tmp_path: Path) -> None
     plural_payload["summary"]["train_labels"] = ["base", "mtan"]
     plural_config = ApplicationConfig.model_validate(plural_payload)
 
-    assert plural_config.summary.train_roots() == (
+    assert plural_config.summary.train_roots == (
         tmp_path / "train-base",
         tmp_path / "train-mtan",
     )
@@ -520,14 +517,10 @@ def test_summary_command_combines_metrics_and_writes_figures(tmp_path: Path) -> 
             {"run_id": run_id_b, "method": "summary_kmeans", "cindex": 0.6, "ari": 0.2},
         ],
     )
-    app_config = ApplicationConfig.model_validate(
-        compose_payload(
-            "command=summary",
-            f"summary.train_root={train_root}",
-            f"summary.baseline_root={baseline_root}",
-            "summary.metrics=[cindex,ari,nmi]",
-        )
-    )
+    payload = compose_payload("command=summary", "summary.metrics=[cindex,ari,nmi]")
+    payload["summary"]["train_roots"] = [str(train_root)]
+    payload["summary"]["baseline_roots"] = [str(baseline_root)]
+    app_config = ApplicationConfig.model_validate(payload)
 
     result = workflow.run(app_config, hydra_run_dir=tmp_path / "run", project_root=ROOT)
 
@@ -636,14 +629,10 @@ def test_summary_command_plots_scenarioless_train_run_ids(tmp_path: Path) -> Non
         baseline_root / "baseline_metrics.csv",
         [{"run_id": baseline_run_id, "method": "summary_kmeans", "cindex": 0.6, "ari": 0.2}],
     )
-    app_config = ApplicationConfig.model_validate(
-        compose_payload(
-            "command=summary",
-            f"summary.train_root={train_root}",
-            f"summary.baseline_root={baseline_root}",
-            "summary.metrics=[cindex,ari]",
-        )
-    )
+    payload = compose_payload("command=summary", "summary.metrics=[cindex,ari]")
+    payload["summary"]["train_roots"] = [str(train_root)]
+    payload["summary"]["baseline_roots"] = [str(baseline_root)]
+    app_config = ApplicationConfig.model_validate(payload)
 
     result = workflow.run(app_config, hydra_run_dir=tmp_path / "run", project_root=ROOT)
 

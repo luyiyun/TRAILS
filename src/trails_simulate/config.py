@@ -251,6 +251,6 @@ class ApplicationConfig(BaseModel):
             if not self.summary.train_roots and not self.summary.baseline_roots:
                 raise ValueError(
                     "command=summary requires at least one of summary.train_roots, "
-                    "summary.baseline_roots, summary.train_root, or summary.baseline_root."
+                    "or summary.baseline_roots."
                 )
         return self

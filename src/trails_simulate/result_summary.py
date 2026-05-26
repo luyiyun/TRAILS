@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
@@ -59,26 +59,28 @@ def run_summary_command(
     if not inputs:
         raise ValueError("command=summary requires at least one train or baseline metrics root.")
 
-    dfs = [read_metric_df(mi) for mi in inputs]
-    parse_warnings = add_run_id_fields(rows)
-    add_method_labels(rows)
-    grouped_rows = group_metric_rows(rows)
+    metric_df = pd.concat(
+        [read_metric_df(metric_input) for metric_input in inputs], ignore_index=True
+    )
+    metric_df, parse_warnings = add_run_id_fields(metric_df)
+    metric_df = add_method_labels(metric_df)
     requested_metrics = list(config.summary.metrics)
-    available_metrics = available_numeric_metrics(rows)
+    available_metrics = available_numeric_metrics(metric_df)
     skipped_metrics = [metric for metric in requested_metrics if metric not in available_metrics]
+    grouped_df = group_metric_df(metric_df, metrics=available_metrics)
 
     metrics_path = hydra_run_dir / "summary_metrics.csv"
     grouped_path = hydra_run_dir / "summary_metrics_grouped.csv"
     summary_path = hydra_run_dir / "summary_summary.json"
     figures_dir = hydra_run_dir / "figures"
     figures = save_summary_figures(
-        grouped_rows,
+        grouped_df,
         metrics=[metric for metric in requested_metrics if metric in available_metrics],
         figures_dir=figures_dir,
     )
 
-    write_csv(metrics_path, rows)
-    write_csv(grouped_path, grouped_rows)
+    write_metric_df(metrics_path, metric_df)
+    write_metric_df(grouped_path, grouped_df)
     payload = {
         "command": "summary",
         "config": config.model_dump(mode="json"),
@@ -89,8 +91,8 @@ def run_summary_command(
             "requested": requested_metrics,
             "skipped": skipped_metrics,
         },
-        "n_groups": len(grouped_rows),
-        "n_rows": len(rows),
+        "n_groups": len(grouped_df),
+        "n_rows": len(metric_df),
         "outputs": {
             "figures": figures,
             "grouped_csv": str(grouped_path),
@@ -154,42 +156,60 @@ def require_file(path: Path) -> None:
 
 
 def read_metric_df(metric_input: MetricInput) -> pd.DataFrame:
-    df = pd.read_csv(metric_input.metrics_csv, index_col=0)
+    df = pd.read_csv(metric_input.metrics_csv)
     df["source"] = metric_input.source
     df["source_label"] = metric_input.label
     df["source_root"] = str(metric_input.root)
     return df
 
 
-def add_run_id_fields(rows: Sequence[dict[str, Any]]) -> list[str]:
-    warnings = []
-    for row in rows:
-        run_id = str(row.get("run_id", ""))
+def add_run_id_fields(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    result = df.copy()
+    warnings: list[str] = []
+    parsed_records: list[dict[str, Any]] = []
+
+    for _, row in result.iterrows():
+        run_id = normalize_string(row.get("run_id", ""))
         match = RUN_ID_PATTERN.match(run_id)
-        if match is not None:
-            row["scenario"] = match.group("scenario")
-            row["train_size"] = int(match.group("train_size"))
-            row["test_size"] = int(match.group("test_size"))
-            row["n_clusters"] = int(match.group("n_clusters"))
-            row["repeat"] = int(match.group("repeat"))
-            continue
-
         scenarioless_match = SCENARIOLESS_RUN_ID_PATTERN.match(run_id)
-        if scenarioless_match is not None:
-            row["scenario"] = infer_scenario_from_row(row)
-            row["train_size"] = int(scenarioless_match.group("train_size"))
-            row["test_size"] = int(scenarioless_match.group("test_size"))
-            row["n_clusters"] = int(scenarioless_match.group("n_clusters"))
-            row["repeat"] = int(scenarioless_match.group("repeat"))
-            continue
 
-        for field in PARSED_RUN_FIELDS:
-            row[field] = ""
-        warnings.append(run_id)
-    return warnings
+        # run_id 承载模拟场景、样本量、K 和 repeat，是后续跨重复聚合的主键来源。
+        if match is not None:
+            parsed_records.append(parsed_run_fields(match, scenario=match.group("scenario")))
+        elif scenarioless_match is not None:
+            parsed_records.append(
+                parsed_run_fields(
+                    scenarioless_match,
+                    scenario=infer_scenario_from_row(row),
+                )
+            )
+        else:
+            parsed_records.append({field: pd.NA for field in PARSED_RUN_FIELDS})
+            warnings.append(run_id)
+
+    parsed_df = pd.DataFrame(parsed_records, index=result.index)
+    for field in PARSED_RUN_FIELDS:
+        result[field] = parsed_df[field]
+    return result, warnings
 
 
-def infer_scenario_from_row(row: Mapping[str, Any]) -> str:
+def parsed_run_fields(match: re.Match[str], *, scenario: str) -> dict[str, Any]:
+    return {
+        "scenario": scenario,
+        "train_size": int(match.group("train_size")),
+        "test_size": int(match.group("test_size")),
+        "n_clusters": int(match.group("n_clusters")),
+        "repeat": int(match.group("repeat")),
+    }
+
+
+def normalize_string(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value)
+
+
+def infer_scenario_from_row(row: pd.Series) -> str:
     data_root = row.get("data_root")
     if isinstance(data_root, str) and data_root:
         parts = Path(data_root).parts
@@ -202,84 +222,94 @@ def infer_scenario_from_row(row: Mapping[str, Any]) -> str:
     return "unknown"
 
 
-def add_method_labels(rows: Sequence[dict[str, Any]]) -> None:
-    method_sources: dict[str, set[str]] = {}
-    for row in rows:
-        method = str(row.get("method", ""))
-        source_key = str(row.get("source_root", ""))
-        method_sources.setdefault(method, set()).add(source_key)
+def add_method_labels(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    result["method"] = result["method"].astype(str)
+    result["source_label"] = result["source_label"].astype(str)
+    source_counts = result.groupby("method", dropna=False)["source_root"].transform("nunique")
+    result["method_label"] = result["method"]
+    duplicate_method_mask = source_counts > 1
+    result.loc[duplicate_method_mask, "method_label"] = (
+        result.loc[duplicate_method_mask, "method"]
+        + " ("
+        + result.loc[duplicate_method_mask, "source_label"]
+        + ")"
+    )
+    return result
 
-    for row in rows:
-        method = str(row.get("method", ""))
-        if len(method_sources.get(method, set())) > 1:
-            row["method_label"] = f"{method} ({row.get('source_label', '')})"
-        else:
-            row["method_label"] = method
 
-
-def available_numeric_metrics(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+def available_numeric_metrics(df: pd.DataFrame) -> list[str]:
     excluded = {
+        "data_root",
+        "method",
+        "method_label",
         "n_clusters",
+        "prediction_path",
         "repeat",
+        "run_id",
+        "scenario",
+        "source",
+        "source_label",
+        "source_root",
         "test_size",
         "train_size",
     }
-    names = {
-        name
-        for row in rows
-        for name, value in row.items()
-        if name not in excluded and isinstance(value, int | float)
+    metrics = []
+    for column in df.columns:
+        if column in excluded:
+            continue
+        values = numeric_column(df, str(column))
+        if values.notna().any():
+            metrics.append(str(column))
+    return sorted(metrics)
+
+
+def group_metric_df(df: pd.DataFrame, *, metrics: Sequence[str]) -> pd.DataFrame:
+    group_fields = ["scenario", "train_size", "test_size", "n_clusters", "method_label"]
+    working_df = df.copy()
+    for metric in metrics:
+        working_df[metric] = numeric_column(working_df, metric)
+
+    # 同一实验设置下，不同 repeat 的指标在这里合并，std 使用总体标准差以保持旧结果一致。
+    aggregations: dict[str, Any] = {
+        "method": pd.NamedAgg(column="method", aggfunc=joined_unique_values),
+        "source": pd.NamedAgg(column="source", aggfunc=joined_unique_values),
+        "source_label": pd.NamedAgg(column="source_label", aggfunc=joined_unique_values),
     }
-    return sorted(names)
+    for metric in metrics:
+        aggregations[f"{metric}_mean"] = pd.NamedAgg(column=metric, aggfunc="mean")
+        aggregations[f"{metric}_std"] = pd.NamedAgg(column=metric, aggfunc=population_std)
+        aggregations[f"{metric}_min"] = pd.NamedAgg(column=metric, aggfunc="min")
+        aggregations[f"{metric}_max"] = pd.NamedAgg(column=metric, aggfunc="max")
+        aggregations[f"{metric}_n"] = pd.NamedAgg(column=metric, aggfunc="count")
+
+    grouped = (
+        working_df.groupby(group_fields, dropna=False, sort=True).agg(**aggregations).reset_index()
+    )
+    return grouped.sort_values(group_fields).reset_index(drop=True)
 
 
-def group_metric_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    group_fields = ("scenario", "train_size", "test_size", "n_clusters", "method_label")
-    metric_names = available_numeric_metrics(rows)
-    groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
-    for row in rows:
-        key = tuple(row.get(field, "") for field in group_fields)
-        groups.setdefault(key, []).append(row)
-
-    grouped_rows = []
-    for key, group_rows in sorted(
-        groups.items(), key=lambda item: tuple(str(value) for value in item[0])
-    ):
-        grouped: dict[str, Any] = dict(zip(group_fields, key, strict=True))
-        grouped["method"] = joined_unique_values(group_rows, "method")
-        grouped["source"] = joined_unique_values(group_rows, "source")
-        grouped["source_label"] = joined_unique_values(group_rows, "source_label")
-        for metric in metric_names:
-            values = [
-                float(row[metric])
-                for row in group_rows
-                if isinstance(row.get(metric), int | float) and math.isfinite(float(row[metric]))
-            ]
-            if not values:
-                continue
-            mean = sum(values) / len(values)
-            variance = sum((value - mean) ** 2 for value in values) / len(values)
-            grouped[f"{metric}_mean"] = mean
-            grouped[f"{metric}_std"] = math.sqrt(variance)
-            grouped[f"{metric}_min"] = min(values)
-            grouped[f"{metric}_max"] = max(values)
-            grouped[f"{metric}_n"] = len(values)
-        grouped_rows.append(grouped)
-    return grouped_rows
+def joined_unique_values(values: pd.Series) -> str:
+    unique_values = sorted({str(value) for value in values.dropna().unique() if str(value) != ""})
+    return "|".join(unique_values)
 
 
-def joined_unique_values(rows: Sequence[Mapping[str, Any]], name: str) -> str:
-    values = sorted({str(row.get(name, "")) for row in rows if row.get(name, "") != ""})
-    return "|".join(values)
+def population_std(values: pd.Series) -> float:
+    finite_values = [float(value) for value in numeric_values(values).dropna().tolist()]
+    if not finite_values:
+        return math.nan
+    mean = sum(finite_values) / len(finite_values)
+    variance = sum((value - mean) ** 2 for value in finite_values) / len(finite_values)
+    return math.sqrt(variance)
 
 
 def save_summary_figures(
-    grouped_rows: Sequence[Mapping[str, Any]],
+    grouped_df: pd.DataFrame,
     *,
     metrics: Sequence[str],
     figures_dir: Path,
 ) -> dict[str, str]:
-    if not grouped_rows or not metrics:
+    if grouped_df.empty or not metrics:
         return {}
 
     import matplotlib
@@ -288,25 +318,29 @@ def save_summary_figures(
     import matplotlib.pyplot as plt
 
     figures_dir.mkdir(parents=True, exist_ok=True)
-    figures = {}
-    scenarios = sorted({str(row.get("scenario", "")) for row in grouped_rows})
+    figures: dict[str, str] = {}
+    scenarios = sorted(
+        str(value) for value in column_series(grouped_df, "scenario").dropna().unique()
+    )
+    scenario_values = string_column(grouped_df, "scenario")
     for scenario in scenarios:
-        scenario_rows = [row for row in grouped_rows if row.get("scenario") == scenario]
-        if not scenario_rows:
+        scenario_df = cast(pd.DataFrame, grouped_df.loc[scenario_values == scenario]).copy()
+        if scenario_df.empty:
             continue
         filename = safe_filename(scenario)
         png_path = figures_dir / f"{filename}_metrics_by_train_size.png"
         pdf_path = figures_dir / f"{filename}_metrics_by_train_size.pdf"
-        plot_scenario_metric_grid(
-            scenario_rows,
+        saved = plot_scenario_metric_grid(
+            scenario_df,
             scenario=scenario,
             metrics=metrics,
             png_path=png_path,
             pdf_path=pdf_path,
             plt=plt,
         )
-        figures[f"{filename}_metrics_by_train_size_png"] = str(png_path)
-        figures[f"{filename}_metrics_by_train_size_pdf"] = str(pdf_path)
+        if saved:
+            figures[f"{filename}_metrics_by_train_size_png"] = str(png_path)
+            figures[f"{filename}_metrics_by_train_size_pdf"] = str(pdf_path)
     return figures
 
 
@@ -316,20 +350,21 @@ def safe_filename(value: str) -> str:
 
 
 def plot_scenario_metric_grid(
-    grouped_rows: Sequence[Mapping[str, Any]],
+    grouped_df: pd.DataFrame,
     *,
     scenario: str,
     metrics: Sequence[str],
     png_path: Path,
     pdf_path: Path,
     plt: Any,
-) -> None:
-    clusters = sorted(
-        {int(row["n_clusters"]) for row in grouped_rows if isinstance(row.get("n_clusters"), int)}
+) -> bool:
+    cluster_values = numeric_column(grouped_df, "n_clusters").dropna()
+    clusters = sorted({int(value) for value in cluster_values})
+    methods = sorted(
+        str(value) for value in string_column(grouped_df, "method_label").dropna().unique()
     )
-    methods = sorted({str(row.get("method_label", "")) for row in grouped_rows})
     if not metrics or not clusters or not methods:
-        return
+        return False
 
     set_publication_style(plt)
     fig, axes = plt.subplots(
@@ -339,25 +374,38 @@ def plot_scenario_metric_grid(
         sharex="col",
         squeeze=False,
     )
+    plotted = False
     for row_index, metric in enumerate(metrics):
         metric_key = f"{metric}_mean"
+        metric_std_key = f"{metric}_std"
+        if metric_key not in grouped_df:
+            continue
         for col_index, cluster in enumerate(clusters):
             ax = axes[row_index][col_index]
-            subset = [
-                row
-                for row in grouped_rows
-                if row.get("n_clusters") == cluster and isinstance(row.get(metric_key), int | float)
-            ]
+            cluster_mask = numeric_column(grouped_df, "n_clusters") == cluster
+            subset = cast(pd.DataFrame, grouped_df.loc[cluster_mask]).copy()
+            subset["train_size"] = numeric_column(subset, "train_size")
+            subset[metric_key] = numeric_column(subset, metric_key)
+            if metric_std_key in subset:
+                subset[metric_std_key] = numeric_column(subset, metric_std_key)
+            else:
+                subset[metric_std_key] = 0.0
+            subset = subset.dropna(subset=["train_size", metric_key])
+            panel_lowers: list[float] = []
+            panel_uppers: list[float] = []
             for method_index, method in enumerate(methods):
-                method_rows = sorted(
-                    [row for row in subset if row.get("method_label") == method],
-                    key=lambda row: int(row["train_size"]),
-                )
-                if not method_rows:
+                method_mask = string_column(subset, "method_label") == method
+                method_df = cast(pd.DataFrame, subset.loc[method_mask]).sort_values("train_size")
+                if method_df.empty:
                     continue
-                x = [int(row["train_size"]) for row in method_rows]
-                y = [float(row[metric_key]) for row in method_rows]
-                yerr = [float(row.get(f"{metric}_std", 0.0)) for row in method_rows]
+                x = [int(value) for value in numeric_column(method_df, "train_size").tolist()]
+                y = [float(value) for value in numeric_column(method_df, metric_key).tolist()]
+                yerr = [
+                    float(value)
+                    for value in numeric_column(method_df, metric_std_key).fillna(0.0).tolist()
+                ]
+                panel_lowers.extend(value - error for value, error in zip(y, yerr, strict=True))
+                panel_uppers.extend(value + error for value, error in zip(y, yerr, strict=True))
                 ax.errorbar(
                     x,
                     y,
@@ -371,13 +419,15 @@ def plot_scenario_metric_grid(
                     elinewidth=1.0,
                     label=method,
                 )
+                plotted = True
             if row_index == 0:
                 ax.set_title(f"K = {cluster}", pad=8)
             if col_index == 0:
                 ax.set_ylabel(metric_label(metric))
             if row_index == len(metrics) - 1:
                 ax.set_xlabel("Training sample size")
-            apply_independent_metric_limits(ax, metric)
+            # 每个子图按当前 metric 的均值和误差线独立缩放，避免不同 K 之间互相挤压。
+            apply_independent_metric_limits(ax, metric, panel_lowers, panel_uppers)
             ax.grid(axis="y", alpha=0.22, linewidth=0.7)
             ax.set_axisbelow(True)
             ax.spines["top"].set_visible(False)
@@ -398,11 +448,13 @@ def plot_scenario_metric_grid(
             frameon=False,
             ncol=max(1, min(len(handles_by_label), 5)),
         )
-    fig.suptitle(f"{scenario} simulation", y=1.02, fontsize=12, fontweight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
-    fig.savefig(png_path, dpi=320, bbox_inches="tight")
-    fig.savefig(pdf_path, bbox_inches="tight")
+    if plotted:
+        fig.suptitle(f"{scenario} simulation", y=1.02, fontsize=12, fontweight="bold")
+        fig.tight_layout(rect=(0, 0, 1, 0.93))
+        fig.savefig(png_path, dpi=320, bbox_inches="tight")
+        fig.savefig(pdf_path, bbox_inches="tight")
     plt.close(fig)
+    return plotted
 
 
 def set_publication_style(plt: Any) -> None:
@@ -425,14 +477,34 @@ def metric_label(metric: str) -> str:
     return GRID_FIGURE_METRIC_LABELS.get(metric, metric)
 
 
-def apply_independent_metric_limits(ax: Any, metric: str) -> None:
-    data_limits = ax.dataLim
-    if data_limits.width == float("-inf") or data_limits.height == float("-inf"):
+def column_series(df: pd.DataFrame, column: str) -> pd.Series:
+    return cast(pd.Series, df[column])
+
+
+def numeric_column(df: pd.DataFrame, column: str) -> pd.Series:
+    return numeric_values(column_series(df, column))
+
+
+def numeric_values(values: pd.Series) -> pd.Series:
+    return cast(pd.Series, pd.to_numeric(values, errors="coerce"))
+
+
+def string_column(df: pd.DataFrame, column: str) -> pd.Series:
+    return column_series(df, column).astype(str)
+
+
+def apply_independent_metric_limits(
+    ax: Any,
+    metric: str,
+    lower_values: Sequence[float],
+    upper_values: Sequence[float],
+) -> None:
+    finite_lowers = [value for value in lower_values if math.isfinite(value)]
+    finite_uppers = [value for value in upper_values if math.isfinite(value)]
+    if not finite_lowers or not finite_uppers:
         return
-    y_min = float(data_limits.ymin)
-    y_max = float(data_limits.ymax)
-    if not math.isfinite(y_min) or not math.isfinite(y_max):
-        return
+    y_min = min(finite_lowers)
+    y_max = max(finite_uppers)
 
     natural_min = -1.0 if metric == "ari" else 0.0
     natural_max = 1.0 if metric in {"acc", "ari", "nmi", "cindex"} else y_max
@@ -447,17 +519,12 @@ def apply_independent_metric_limits(ax: Any, metric: str) -> None:
     ax.set_ylim(lower, upper)
 
 
-def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    fieldnames = csv_fieldnames(rows)
+def write_metric_df(path: Path, df: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({field: row.get(field, "") for field in fieldnames})
+    ordered_metric_df(df).to_csv(path, index=False)
 
 
-def csv_fieldnames(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+def ordered_metric_df(df: pd.DataFrame) -> pd.DataFrame:
     preferred = [
         "source",
         "run_id",
@@ -473,7 +540,6 @@ def csv_fieldnames(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         "data_root",
         "prediction_path",
     ]
-    available = {name for row in rows for name in row}
-    ordered = [name for name in preferred if name in available]
-    ordered.extend(sorted(available - set(ordered)))
-    return ordered
+    ordered = [name for name in preferred if name in df.columns]
+    ordered.extend(sorted(set(df.columns) - set(ordered)))
+    return df.loc[:, ordered]

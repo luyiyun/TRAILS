@@ -1,5 +1,3 @@
-train_root: null
-baseline_root: null
 train_roots: []
 baseline_roots: []
 train_labels: []

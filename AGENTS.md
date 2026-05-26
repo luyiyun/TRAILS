@@ -150,7 +150,7 @@ clean reusable method library.
   one split per invocation. Use `optim.run_id` for reproducible batch execution;
   otherwise the command interactively lists discovered split numbers for selection.
 - `command=summary` accepts any number of train and baseline Hydra run directories
-  via plural roots, keeps legacy singleton roots as fallback, adds source-aware
+  via `summary.train_roots` and `summary.baseline_roots`, adds source-aware
   method labels when repeated method names appear across roots, aggregates by
   scenario/sample size/K/method label, and writes CSV/JSON plus one publication-facing
   metrics-by-K PNG/PDF grid per scenario.

@@ -105,10 +105,10 @@ uv run main.py command=optim paths.data_root=data/simulated/base optim.run_id=ba
 uv run main.py command=summary 'summary.train_roots=[outputs/train-base,outputs/train-mtan]' 'summary.baseline_roots=[outputs/baseline-kmeans,outputs/baseline-fpca]' 'summary.train_labels=[base,mtan]' 'summary.baseline_labels=[kmeans,fpca]'
 ```
 
-旧的单次运行参数仍然可用：
+单次运行也使用列表形式：
 
 ```bash
-uv run main.py command=summary summary.train_root=outputs/train-... summary.baseline_root=outputs/baseline-...
+uv run main.py command=summary 'summary.train_roots=[outputs/train-...]' 'summary.baseline_roots=[outputs/baseline-...]'
 ```
 
 `command=train`、`command=baseline` 和 `command=optim` 都会递归扫描
