@@ -4,6 +4,7 @@ import math
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from tqdm import tqdm
 
 AUTO_BATCH_TARGET_UPDATES = 10
 AUTO_BATCH_MIN_SIZE = 16
@@ -19,7 +20,9 @@ def resolve_batch_size(n_samples: int, configured_batch_size: int | None) -> int
     target_size = math.ceil(n_samples / AUTO_BATCH_TARGET_UPDATES)
     power_of_two_size = 1 << (target_size - 1).bit_length()
     bounded_size = min(max(power_of_two_size, AUTO_BATCH_MIN_SIZE), AUTO_BATCH_MAX_SIZE)
-    return min(n_samples, bounded_size)
+    used_batch_size = min(n_samples, bounded_size)
+    tqdm.write(f"Resolving batch size to {used_batch_size}")
+    return used_batch_size
 
 
 class DataConfig(BaseModel):
