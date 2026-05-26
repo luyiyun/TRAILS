@@ -128,8 +128,25 @@ summary-feature KMeans 和 FPCA-KMeans。`command=optim` 一次只对一个数�
 metrics CSV，保存合并 CSV、聚合 CSV、summary JSON，并为每个 simulation scenario
 生成一张按 `metrics × K` 排布的带误差条总图 PNG/PDF。
 
-命令结束时 stdout 会打印精简的可读 summary；完整机器可读结果保存在上述
+命令结束时 logging 会打印精简的可读 summary；完整机器可读结果保存在上述
 JSON/CSV artifacts 中。
+
+训练 split 默认串行执行；需要多进程时显式设置 `training.parallel.workers`：
+
+```bash
+uv run main.py command=train training=base paths.data_root=data/simulated/base training.parallel.workers=4
+```
+
+未配置 `training.parallel.devices` 时，每个 worker 都沿用
+`training.trainer.device`，因此也允许多个进程同时使用同一张 GPU，例如默认的
+`cuda:0`；请按显存情况控制 `workers`。如果有多张 GPU，可以轮转分配设备：
+
+```bash
+uv run main.py command=train training=base paths.data_root=data/simulated/base training.parallel.workers=4 'training.parallel.devices=[cuda:0,cuda:1]'
+```
+
+终端输出统一走 logging，并与 tqdm 进度条兼容；train 会显示总 split 进度条以及
+当前活跃 worker 的训练进度条。
 
 可以用 `training.artifacts.names` 控制训练保存内容：
 

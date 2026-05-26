@@ -1,5 +1,6 @@
 import csv
 import json
+import logging
 from pathlib import Path
 from typing import Any, cast
 
@@ -167,11 +168,28 @@ def test_training_configs_validate() -> None:
         assert app_config.training.model.n_clusters > 1
         assert app_config.training.trainer.batch_size is None
         assert app_config.training.trainer.valid_size == 0.2
+        assert app_config.training.parallel.workers == 1
+        assert app_config.training.parallel.devices == ()
+        assert app_config.training.parallel.torch_threads is None
 
     explicit_config = ApplicationConfig.model_validate(
-        compose_payload("training=base", "training.trainer.batch_size=64")
+        compose_payload(
+            "training=base",
+            "training.trainer.batch_size=64",
+            "training.parallel.workers=4",
+            "training.parallel.devices=[cuda:0,cuda:1]",
+            "training.parallel.torch_threads=2",
+        )
     )
     assert explicit_config.training.trainer.batch_size == 64
+    assert explicit_config.training.parallel.workers == 4
+    assert explicit_config.training.parallel.devices == ("cuda:0", "cuda:1")
+    assert explicit_config.training.parallel.torch_threads == 2
+
+    invalid_payload = compose_payload("training=base")
+    invalid_payload["training"]["parallel"]["workers"] = 0
+    with pytest.raises(ValidationError, match="greater than 0"):
+        ApplicationConfig.model_validate(invalid_payload)
 
 
 def test_simulation_list_overrides_are_validated() -> None:
@@ -286,7 +304,7 @@ def test_recursive_dataset_discovery_uses_mirrored_run_ids(tmp_path: Path) -> No
 
 def test_train_command_runs_all_discovered_splits_and_uses_dataset_k(
     monkeypatch,
-    capsys,
+    caplog,
     tmp_path: Path,
 ) -> None:
     from trails.data import ClinicalTimeSeriesDataset
@@ -327,6 +345,7 @@ def test_train_command_runs_all_discovered_splits_and_uses_dataset_k(
         )
 
     monkeypatch.setattr(workflow, "fit_training_run", fake_fit_training_run)
+    caplog.set_level(logging.INFO)
 
     result = workflow.run_train_command(app_config, tmp_path / "run", ROOT)
 
@@ -335,13 +354,115 @@ def test_train_command_runs_all_discovered_splits_and_uses_dataset_k(
         "base/train_6_test_2/k3/0",
     ]
     assert seen_clusters == [2, 3]
-    captured = capsys.readouterr()
-    assert "Completed train run: base/train_6_test_2/k2/0" in captured.out
-    assert "cindex=1" in captured.out
-    assert "ari=0.2" in captured.out
+    assert "Completed train run: base/train_6_test_2/k2/0" in caplog.text
+    assert "cindex=1" in caplog.text
+    assert "ari=0.2" in caplog.text
     assert (tmp_path / "run" / "base" / "train_6_test_2" / "k2" / "0" / "trails.pt").exists()
     assert (tmp_path / "run" / "train_summary.json").exists()
     assert (tmp_path / "run" / "train_metrics.csv").exists()
+
+
+def test_train_command_parallel_branch_sorts_results_and_rotates_devices(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from concurrent.futures import Future
+
+    from trails.data import ClinicalTimeSeriesDataset
+    from trails_simulate import workflow
+    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.evaluation import prediction_payload_from_dataset
+    from trails_simulate.training import TrainResult
+
+    data_root = tmp_path / "data"
+    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
+    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
+    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k4" / "0", n_clusters=4, seed=45)
+    seen_devices: list[str] = []
+    submitted_slots: list[int] = []
+    seen_max_workers: list[int] = []
+
+    app_config = ApplicationConfig.model_validate(
+        compose_payload(
+            "command=train",
+            "training=small",
+            f"paths.data_root={data_root}",
+            "training.artifacts.names=[none]",
+            "training.parallel.workers=2",
+            "training.parallel.devices=[cuda:0,cuda:1]",
+        )
+    )
+
+    def fake_fit_training_run(*args: Any, **kwargs: Any) -> TrainResult:
+        run_config = args[0]
+        train_paths = kwargs["train_paths"]
+        seen_devices.append(run_config.training.trainer.device)
+        loaded_test = ClinicalTimeSeriesDataset.load(train_paths.test_data)
+        prediction = prediction_payload_from_dataset(
+            loaded_test,
+            pred_cluster=torch.zeros(len(loaded_test), dtype=torch.long),
+            risk_score=torch.arange(len(loaded_test), dtype=torch.float32),
+        )
+        return TrainResult(
+            history=[],
+            metrics={"ari": 0.2, "cindex": 1.0, "cluster_empty_count": 0.0},
+            prediction=prediction,
+            run_dir=None,
+        )
+
+    class FakeExecutor:
+        def __init__(self, max_workers: int, **_kwargs: Any) -> None:
+            seen_max_workers.append(max_workers)
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def submit(self, fn: Any, job: Any) -> Future[Any]:
+            submitted_slots.append(job.worker_slot)
+            future: Future[Any] = Future()
+            try:
+                future.set_result(fn(job))
+            except Exception as error:
+                future.set_exception(error)
+            return future
+
+    monkeypatch.setattr(workflow, "fit_training_run", fake_fit_training_run)
+    monkeypatch.setattr(workflow, "ProcessPoolExecutor", FakeExecutor)
+
+    result = workflow.run_train_command(app_config, tmp_path / "run", ROOT)
+
+    assert seen_max_workers == [2]
+    assert submitted_slots[:2] == [0, 1]
+    assert set(seen_devices[:2]) == {"cuda:0", "cuda:1"}
+    assert [run["run_id"] for run in result["runs"]] == [
+        "base/train_6_test_2/k2/0",
+        "base/train_6_test_2/k3/0",
+        "base/train_6_test_2/k4/0",
+    ]
+    assert (tmp_path / "run" / "train_summary.json").exists()
+    assert (tmp_path / "run" / "train_metrics.csv").exists()
+
+
+def test_parallel_device_helpers_keep_same_device_without_device_list() -> None:
+    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.workflow import config_with_training_device, device_for_worker_slot
+
+    same_device_config = ApplicationConfig.model_validate(
+        compose_payload("training=small", "training.trainer.device=cuda:0")
+    )
+    assert device_for_worker_slot(same_device_config, 0) is None
+    assert same_device_config.training.trainer.device == "cuda:0"
+
+    rotated_config = ApplicationConfig.model_validate(
+        compose_payload("training=small", "training.parallel.devices=[cuda:0,cuda:1]")
+    )
+    assert device_for_worker_slot(rotated_config, 0) == "cuda:0"
+    assert device_for_worker_slot(rotated_config, 1) == "cuda:1"
+    assert device_for_worker_slot(rotated_config, 2) == "cuda:0"
+    assert config_with_training_device(rotated_config, "cuda:1").training.trainer.device == "cuda:1"
 
 
 def test_train_progress_time_formatting() -> None:
@@ -439,6 +560,47 @@ def test_fit_training_run_resolves_auto_batch_size_and_records_effective_value(
     assert seen_batch_sizes == [8]
     assert config_payload["config"]["trainer"]["batch_size"] == 8
     assert config_payload["train_args"]["batch_size"] == 8
+
+
+def test_resolve_batch_size_uses_logging(caplog) -> None:
+    from trails.config import resolve_batch_size
+
+    caplog.set_level(logging.INFO)
+
+    assert resolve_batch_size(8, None) == 8
+    assert "Resolving batch size to 8" in caplog.text
+
+
+def test_progress_context_assigns_tqdm_positions(monkeypatch) -> None:
+    from trails import progress
+
+    calls: list[dict[str, Any]] = []
+
+    class FakeTqdm:
+        def __init__(self, iterable: Any, **kwargs: Any) -> None:
+            self.iterable = iterable
+            calls.append(kwargs)
+
+        def __iter__(self) -> Any:
+            return iter(self.iterable)
+
+    monkeypatch.setattr(progress, "tqdm", FakeTqdm)
+
+    with progress.progress_context(
+        outer_position=3,
+        inner_position=4,
+        leave=False,
+        description_prefix="run-a",
+    ):
+        list(progress.progress_bar(range(1), desc="Epoch", level="outer"))
+        list(progress.progress_bar(range(1), desc="Train", level="inner"))
+
+    assert calls[0]["position"] == 3
+    assert calls[0]["leave"] is False
+    assert calls[0]["desc"] == "run-a Epoch"
+    assert calls[1]["position"] == 4
+    assert calls[1]["leave"] is False
+    assert calls[1]["desc"] == "run-a Train"
 
 
 def test_baseline_command_infers_k_per_split(tmp_path: Path) -> None:

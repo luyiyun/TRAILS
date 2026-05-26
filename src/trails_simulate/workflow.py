@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import logging
+import multiprocessing as mp
 import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +13,7 @@ from tqdm import tqdm
 
 from trails.artifacts import save_json
 from trails.data import ClinicalTimeSeriesDataset
+from trails.progress import configure_tqdm_lock, configure_tqdm_logging, progress_context
 
 from .baselines import make_baseline
 from .config import ApplicationConfig
@@ -30,6 +35,33 @@ from .path import (
 )
 from .result_summary import run_summary_command
 from .training import fit_training_run
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TrainRunJob:
+    config: ApplicationConfig
+    hydra_run_dir: Path
+    index: int
+    project_root: Path
+    run_paths: DatasetRunPaths
+    total_runs: int
+    worker_slot: int
+    device: str | None
+
+
+@dataclass(frozen=True)
+class TrainRunResult:
+    duration_seconds: float
+    index: int
+    metric_row: dict[str, Any]
+    metrics: dict[str, float]
+    n_clusters: int
+    prediction_path: Path
+    run_id: str
+    run_payload: dict[str, Any]
+    seed: int
 
 
 def simulation_summary(
@@ -189,81 +221,9 @@ def run_train_command(
     project_root: Path,
 ) -> dict[str, Any]:
     runs = discover_dataset_runs(config, hydra_run_dir, project_root)
-    metric_rows: list[dict[str, Any]] = []
-    run_payloads: list[dict[str, Any]] = []
-    command_started_at = time.perf_counter()
-    completed_durations: list[float] = []
-    for index, run_paths in enumerate(runs):
-        tqdm.write(
-            format_start_train_run(
-                index=index,
-                total=len(runs),
-                run_id=run_paths.run_id,
-                elapsed_seconds=time.perf_counter() - command_started_at,
-                remaining_seconds=estimate_remaining_seconds(
-                    completed_durations,
-                    remaining_runs=len(runs) - index,
-                ),
-            )
-        )
-        run_started_at = time.perf_counter()
-        seed = config.training.trainer.seed + index
-        run_config = config_for_dataset_clusters(config, run_paths.train_data)
-        train_paths = TrainPaths(
-            data=run_paths.train_data,
-            test_data=run_paths.test_data,
-            train_root=hydra_run_dir / run_paths.run_id,
-            save=checkpoint_path_for_run(
-                run_config,
-                hydra_run_dir=hydra_run_dir,
-                project_root=project_root,
-                run_id=run_paths.run_id,
-                n_runs=len(runs),
-            ),
-        )
-        train_result = fit_training_run(
-            run_config,
-            train_paths=train_paths,
-            seed=seed,
-            swanlab_repeat_label=None if len(runs) == 1 else run_paths.run_id,
-        )
-        prediction_path = hydra_run_dir / run_paths.run_id / "trails.pt"
-        save_prediction_payload(prediction_path, train_result.prediction)
-        row = metric_row(
-            run_paths,
-            method="trails",
-            prediction_path=prediction_path,
-            metrics=train_result.metrics,
-        )
-        metric_rows.append(row)
-        run_duration = time.perf_counter() - run_started_at
-        completed_durations.append(run_duration)
-        tqdm.write(
-            format_completed_train_run(
-                run_id=run_paths.run_id,
-                n_clusters=run_config.training.model.n_clusters,
-                seed=seed,
-                prediction_path=prediction_path,
-                metrics=train_result.metrics,
-                run_duration_seconds=run_duration,
-                elapsed_seconds=time.perf_counter() - command_started_at,
-                remaining_seconds=estimate_remaining_seconds(
-                    completed_durations,
-                    remaining_runs=len(runs) - index - 1,
-                ),
-            )
-        )
-        run_payloads.append(
-            {
-                "history": train_result.history,
-                "metrics": json_safe_metrics(train_result.metrics),
-                "prediction_path": str(prediction_path),
-                "run_dir": None if train_result.run_dir is None else str(train_result.run_dir),
-                "run_id": run_paths.run_id,
-                "seed": seed,
-                "n_clusters": run_config.training.model.n_clusters,
-            }
-        )
+    train_results = run_train_jobs(config, runs, hydra_run_dir, project_root)
+    metric_rows = [result.metric_row for result in train_results]
+    run_payloads = [result.run_payload for result in train_results]
 
     summary_path = hydra_run_dir / "train_summary.json"
     metrics_csv_path = hydra_run_dir / "train_metrics.csv"
@@ -283,6 +243,320 @@ def run_train_command(
     save_json(summary_path, summary)
     save_metrics_csv(metrics_csv_path, metric_rows)
     return summary
+
+
+def run_train_jobs(
+    config: ApplicationConfig,
+    runs: list[DatasetRunPaths],
+    hydra_run_dir: Path,
+    project_root: Path,
+) -> list[TrainRunResult]:
+    if not runs:
+        return []
+
+    workers = effective_train_workers(config, n_runs=len(runs))
+    command_started_at = time.perf_counter()
+    completed_durations: list[float] = []
+    results: list[TrainRunResult] = []
+
+    if workers > 1:
+        context = mp.get_context("spawn")
+        tqdm_lock = context.RLock()
+        configure_tqdm_lock(tqdm_lock)
+    else:
+        context = None
+        tqdm_lock = None
+
+    with tqdm(desc="Train splits", total=len(runs), position=0) as run_bar:
+        if workers == 1:
+            for index, run_paths in enumerate(runs):
+                job = build_train_run_job(
+                    config,
+                    hydra_run_dir=hydra_run_dir,
+                    index=index,
+                    project_root=project_root,
+                    run_paths=run_paths,
+                    total_runs=len(runs),
+                    worker_slot=0,
+                )
+                log_start_train_job(job, command_started_at, completed_durations)
+                result = run_train_split_job(job)
+                record_train_result(
+                    result,
+                    command_started_at=command_started_at,
+                    completed_durations=completed_durations,
+                    results=results,
+                    run_bar=run_bar,
+                    total_runs=len(runs),
+                )
+        else:
+            assert context is not None
+            assert tqdm_lock is not None
+            results.extend(
+                run_train_jobs_parallel(
+                    config,
+                    runs,
+                    hydra_run_dir=hydra_run_dir,
+                    project_root=project_root,
+                    workers=workers,
+                    command_started_at=command_started_at,
+                    completed_durations=completed_durations,
+                    run_bar=run_bar,
+                    mp_context=context,
+                    tqdm_lock=tqdm_lock,
+                )
+            )
+
+    return sorted(results, key=lambda result: result.index)
+
+
+def run_train_jobs_parallel(
+    config: ApplicationConfig,
+    runs: list[DatasetRunPaths],
+    *,
+    hydra_run_dir: Path,
+    project_root: Path,
+    workers: int,
+    command_started_at: float,
+    completed_durations: list[float],
+    run_bar: tqdm[Any],
+    mp_context: Any,
+    tqdm_lock: Any,
+) -> list[TrainRunResult]:
+    results: list[TrainRunResult] = []
+    next_index = 0
+    futures: dict[Future[TrainRunResult], TrainRunJob] = {}
+
+    def submit_next(executor: ProcessPoolExecutor, worker_slot: int) -> None:
+        nonlocal next_index
+        if next_index >= len(runs):
+            return
+        index = next_index
+        next_index += 1
+        job = build_train_run_job(
+            config,
+            hydra_run_dir=hydra_run_dir,
+            index=index,
+            project_root=project_root,
+            run_paths=runs[index],
+            total_runs=len(runs),
+            worker_slot=worker_slot,
+        )
+        log_start_train_job(job, command_started_at, completed_durations)
+        futures[executor.submit(run_train_split_job, job)] = job
+
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=mp_context,
+        initializer=initialize_train_worker,
+        initargs=(tqdm_lock,),
+    ) as executor:
+        for worker_slot in range(workers):
+            submit_next(executor, worker_slot)
+
+        while futures:
+            done, _pending = wait(set(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                job = futures.pop(future)
+                try:
+                    result = future.result()
+                except Exception:
+                    LOGGER.exception("Train run failed: %s", job.run_paths.run_id)
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    raise
+                record_train_result(
+                    result,
+                    command_started_at=command_started_at,
+                    completed_durations=completed_durations,
+                    results=results,
+                    run_bar=run_bar,
+                    total_runs=len(runs),
+                )
+                submit_next(executor, job.worker_slot)
+
+    return results
+
+
+def initialize_train_worker(tqdm_lock: Any) -> None:
+    configure_tqdm_lock(tqdm_lock)
+    configure_tqdm_logging()
+
+
+def build_train_run_job(
+    config: ApplicationConfig,
+    *,
+    hydra_run_dir: Path,
+    index: int,
+    project_root: Path,
+    run_paths: DatasetRunPaths,
+    total_runs: int,
+    worker_slot: int,
+) -> TrainRunJob:
+    return TrainRunJob(
+        config=config,
+        hydra_run_dir=hydra_run_dir,
+        index=index,
+        project_root=project_root,
+        run_paths=run_paths,
+        total_runs=total_runs,
+        worker_slot=worker_slot,
+        device=device_for_worker_slot(config, worker_slot),
+    )
+
+
+def run_train_split_job(job: TrainRunJob) -> TrainRunResult:
+    configure_torch_threads(job.config.training.parallel.torch_threads)
+    run_started_at = time.perf_counter()
+    seed = job.config.training.trainer.seed + job.index
+    run_config = config_for_dataset_clusters(job.config, job.run_paths.train_data)
+    if job.device is not None:
+        run_config = config_with_training_device(run_config, job.device)
+    train_paths = TrainPaths(
+        data=job.run_paths.train_data,
+        test_data=job.run_paths.test_data,
+        train_root=job.hydra_run_dir / job.run_paths.run_id,
+        save=checkpoint_path_for_run(
+            run_config,
+            hydra_run_dir=job.hydra_run_dir,
+            project_root=job.project_root,
+            run_id=job.run_paths.run_id,
+            n_runs=job.total_runs,
+        ),
+    )
+    with progress_context(
+        outer_position=worker_outer_position(job.worker_slot),
+        inner_position=worker_inner_position(job.worker_slot),
+        leave=False,
+        description_prefix=short_run_label(job.run_paths.run_id),
+    ):
+        train_result = fit_training_run(
+            run_config,
+            train_paths=train_paths,
+            seed=seed,
+            swanlab_repeat_label=None if job.total_runs == 1 else job.run_paths.run_id,
+        )
+    prediction_path = job.hydra_run_dir / job.run_paths.run_id / "trails.pt"
+    save_prediction_payload(prediction_path, train_result.prediction)
+    row = metric_row(
+        job.run_paths,
+        method="trails",
+        prediction_path=prediction_path,
+        metrics=train_result.metrics,
+    )
+    return TrainRunResult(
+        duration_seconds=time.perf_counter() - run_started_at,
+        index=job.index,
+        metric_row=row,
+        metrics=train_result.metrics,
+        n_clusters=run_config.training.model.n_clusters,
+        prediction_path=prediction_path,
+        run_id=job.run_paths.run_id,
+        run_payload={
+            "history": train_result.history,
+            "metrics": json_safe_metrics(train_result.metrics),
+            "prediction_path": str(prediction_path),
+            "run_dir": None if train_result.run_dir is None else str(train_result.run_dir),
+            "run_id": job.run_paths.run_id,
+            "seed": seed,
+            "n_clusters": run_config.training.model.n_clusters,
+        },
+        seed=seed,
+    )
+
+
+def record_train_result(
+    result: TrainRunResult,
+    *,
+    command_started_at: float,
+    completed_durations: list[float],
+    results: list[TrainRunResult],
+    run_bar: tqdm[Any],
+    total_runs: int,
+) -> None:
+    completed_durations.append(result.duration_seconds)
+    results.append(result)
+    run_bar.update()
+    run_bar.set_postfix(completed=f"{len(results)}/{total_runs}")
+    LOGGER.info(
+        format_completed_train_run(
+            run_id=result.run_id,
+            n_clusters=result.n_clusters,
+            seed=result.seed,
+            prediction_path=result.prediction_path,
+            metrics=result.metrics,
+            run_duration_seconds=result.duration_seconds,
+            elapsed_seconds=time.perf_counter() - command_started_at,
+            remaining_seconds=estimate_remaining_seconds(
+                completed_durations,
+                remaining_runs=total_runs - len(results),
+            ),
+        )
+    )
+
+
+def log_start_train_job(
+    job: TrainRunJob,
+    command_started_at: float,
+    completed_durations: Sequence[float],
+) -> None:
+    LOGGER.info(
+        format_start_train_run(
+            index=job.index,
+            total=job.total_runs,
+            run_id=job.run_paths.run_id,
+            elapsed_seconds=time.perf_counter() - command_started_at,
+            remaining_seconds=estimate_remaining_seconds(
+                completed_durations,
+                remaining_runs=job.total_runs - len(completed_durations),
+            ),
+        )
+    )
+
+
+def effective_train_workers(config: ApplicationConfig, *, n_runs: int) -> int:
+    return min(config.training.parallel.workers, max(1, n_runs))
+
+
+def device_for_worker_slot(config: ApplicationConfig, worker_slot: int) -> str | None:
+    devices = config.training.parallel.devices
+    if not devices:
+        return None
+    return devices[worker_slot % len(devices)]
+
+
+def config_with_training_device(config: ApplicationConfig, device: str) -> ApplicationConfig:
+    return config.model_copy(
+        update={
+            "training": config.training.model_copy(
+                update={"trainer": config.training.trainer.model_copy(update={"device": device})}
+            )
+        }
+    )
+
+
+def configure_torch_threads(torch_threads: int | None) -> None:
+    if torch_threads is None:
+        return
+    import torch
+
+    torch.set_num_threads(torch_threads)
+
+
+def worker_outer_position(worker_slot: int) -> int:
+    return 1 + worker_slot * 2
+
+
+def worker_inner_position(worker_slot: int) -> int:
+    return worker_outer_position(worker_slot) + 1
+
+
+def short_run_label(run_id: str) -> str:
+    parts = Path(run_id).parts
+    label = "/".join(parts[-3:])
+    if len(label) <= 36:
+        return label
+    return f"...{label[-33:]}"
 
 
 def run_baseline_command(

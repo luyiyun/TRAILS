@@ -9,7 +9,6 @@ import torch
 from torch import Tensor
 from torchmetrics import Metric
 from torchmetrics.clustering import AdjustedRandScore, NormalizedMutualInfoScore
-from tqdm import tqdm
 
 from .config import TrainerConfig
 from .data import Batch, ClinicalTimeSeriesDataset, make_data_loader
@@ -19,6 +18,7 @@ from .metrics import (
     cluster_assignment_diagnostics,
 )
 from .model import TrailsLossBreakdown, TrailsModelOutput, TrailsSurvVaderModel
+from .progress import progress_bar
 
 
 class HistoryEntry(TypedDict):
@@ -139,7 +139,11 @@ class TrailsTrainer:
         history: list[HistoryEntry] = []
 
         if self.config.warmup_epochs > 0:
-            for epoch in tqdm(range(self.config.warmup_epochs), desc="Warmup"):
+            for epoch in progress_bar(
+                range(self.config.warmup_epochs),
+                desc="Warmup",
+                level="outer",
+            ):
                 losses, scores = self._epoch_loop(loader, phase="train", include_vade_kl=False)
                 entry: HistoryEntry = {  # type: ignore
                     "epoch": epoch + 1,
@@ -182,7 +186,7 @@ class TrailsTrainer:
         else:
             early_stopper = None
 
-        for epoch in tqdm(range(self.config.max_epochs), desc="Epoch"):
+        for epoch in progress_bar(range(self.config.max_epochs), desc="Epoch", level="outer"):
             losses, scores = self._epoch_loop(
                 loader,
                 phase="train",
@@ -312,7 +316,7 @@ class TrailsTrainer:
             self.model.eval()
 
         with torch.set_grad_enabled(phase == "train"):
-            for batch in tqdm(loader, desc=phase.capitalize(), leave=False):
+            for batch in progress_bar(loader, desc=phase.capitalize(), level="inner"):
                 device_batch = self._move_batch(batch)
                 output = self._model_output(device_batch)
                 loss = self.model.compute_loss(

@@ -142,6 +142,13 @@ clean reusable method library.
   command-level metrics CSV and summary JSON.
 - Train command progress reports include split index, elapsed time, per-split
   duration, and estimated remaining time.
+- Train command split execution is configurable with `training.parallel.workers`.
+  The default is serial (`1`); `workers > 1` uses spawn-based process parallelism
+  across discovered train/test splits. If `training.parallel.devices` is empty,
+  every worker keeps `training.trainer.device`, including same-GPU concurrency;
+  otherwise worker slots rotate through the configured device list.
+- CLI terminal messages use logging with tqdm-compatible output. Train progress
+  keeps a total split bar plus per-worker training bars with fixed positions.
 - `command=baseline` lives in `trails_simulate` and runs lightweight simulation
   comparators on existing train/test splits: summary-feature k-means and
   risk-stratified summary-feature k-means, plus FPCA-KMeans via `scikit-fda`. It

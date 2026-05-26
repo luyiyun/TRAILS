@@ -99,6 +99,14 @@ class SwanLabConfig(BaseModel):
     mode: str | None = None
 
 
+class ParallelTrainingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workers: int = Field(default=1, gt=0)
+    devices: tuple[str, ...] = ()
+    torch_threads: int | None = Field(default=None, gt=0)
+
+
 class TrainingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -106,6 +114,7 @@ class TrainingConfig(BaseModel):
     trainer: TrainerConfig = Field(default_factory=TrainerConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
+    parallel: ParallelTrainingConfig = Field(default_factory=ParallelTrainingConfig)
     swanlab: SwanLabConfig = Field(default_factory=SwanLabConfig)
 
 

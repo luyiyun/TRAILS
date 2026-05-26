@@ -44,6 +44,10 @@ artifacts:
 diagnostics:
   latent_embeddings:
     enabled: false
+parallel:
+  workers: 1
+  devices: []
+  torch_threads: null
 swanlab:
   enabled: false
   project: TRAILS

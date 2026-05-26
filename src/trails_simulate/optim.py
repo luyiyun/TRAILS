@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -16,6 +17,8 @@ from .config import (
 )
 from .path import DatasetRunPaths, TrainPaths, discover_dataset_runs, resolve_path
 from .training import fit_training_run
+
+LOGGER = logging.getLogger(__name__)
 
 
 def run_optim_command(
@@ -83,9 +86,9 @@ def select_optim_run(
 def interactive_select_optim_run(
     runs: Sequence[DatasetRunPaths],
 ) -> tuple[DatasetRunPaths, int, str]:
-    print("Multiple dataset splits discovered for command=optim. Select one split:")
+    LOGGER.info("Multiple dataset splits discovered for command=optim. Select one split:")
     for index, run in enumerate(runs, start=1):
-        print(
+        LOGGER.info(
             f"  [{index}] {run.run_id}\n      train: {run.train_data}\n      test:  {run.test_data}"
         )
     try:

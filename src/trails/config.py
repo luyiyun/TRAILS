@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import math
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from tqdm import tqdm
+
+LOGGER = logging.getLogger(__name__)
 
 AUTO_BATCH_TARGET_UPDATES = 10
 AUTO_BATCH_MIN_SIZE = 16
@@ -21,7 +23,7 @@ def resolve_batch_size(n_samples: int, configured_batch_size: int | None) -> int
     power_of_two_size = 1 << (target_size - 1).bit_length()
     bounded_size = min(max(power_of_two_size, AUTO_BATCH_MIN_SIZE), AUTO_BATCH_MAX_SIZE)
     used_batch_size = min(n_samples, bounded_size)
-    tqdm.write(f"Resolving batch size to {used_batch_size}")
+    LOGGER.info("Resolving batch size to %s", used_batch_size)
     return used_batch_size
 
 
