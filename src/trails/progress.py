@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
+import textwrap
 import warnings
 from collections.abc import Iterable, Iterator
 from typing import Any
@@ -31,6 +32,13 @@ class CompactTqdmFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         if record.levelno == logging.INFO:
             return record.getMessage()
+        if record.name == "py.warnings":
+            message = " ".join(record.getMessage().split())
+            return textwrap.shorten(
+                f"WARNING:{message}",
+                width=240,
+                placeholder=" ...",
+            )
         return super().format(record)
 
 
@@ -73,6 +81,12 @@ def configure_tqdm_lock(lock: Any) -> None:
 
 def _configure_warnings() -> None:
     logging.captureWarnings(True)
+    # 并行 tqdm 下超长 warning 会折行并留下残影；这条 PyTorch 原型提示不影响训练结果。
+    warnings.filterwarnings(
+        "ignore",
+        message=".*The PyTorch API of nested tensors is in prototype stage.*",
+        category=UserWarning,
+    )
     warnings.filterwarnings(
         "ignore",
         message=".*constrained_layout not applied.*",

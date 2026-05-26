@@ -696,8 +696,16 @@ def format_completed_train_run(
     )
     return (
         f"Completed train run: {run_id} "
-        f"k={n_clusters} seed={seed} {timing_text} {metric_text} prediction={prediction_path}"
+        f"k={n_clusters} seed={seed} {timing_text} {metric_text} "
+        f"prediction={compact_log_path(prediction_path)}"
     )
+
+
+def compact_log_path(path: Path, *, keep_parts: int = 4) -> str:
+    parts = path.parts
+    if len(parts) <= keep_parts:
+        return str(path)
+    return str(Path("...").joinpath(*parts[-keep_parts:]))
 
 
 def estimate_remaining_seconds(

@@ -1,6 +1,7 @@
 import csv
 import json
 import logging
+import warnings
 from pathlib import Path
 from typing import Any, cast
 
@@ -601,6 +602,29 @@ def test_progress_context_assigns_tqdm_positions(monkeypatch) -> None:
     assert calls[1]["position"] == 4
     assert calls[1]["leave"] is False
     assert calls[1]["desc"] == "run-a Train"
+
+
+def test_progress_logging_suppresses_nested_tensor_warning() -> None:
+    from trails.progress import configure_tqdm_logging
+
+    root_logger = logging.getLogger()
+    original_handlers = list(root_logger.handlers)
+    original_level = root_logger.level
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            configure_tqdm_logging()
+            warnings.warn(
+                "The PyTorch API of nested tensors is in prototype stage and will change in the "
+                "near future.",
+                UserWarning,
+                stacklevel=1,
+            )
+    finally:
+        root_logger.handlers[:] = original_handlers
+        root_logger.setLevel(original_level)
+        logging.captureWarnings(False)
+
+    assert caught == []
 
 
 def test_baseline_command_infers_k_per_split(tmp_path: Path) -> None:
