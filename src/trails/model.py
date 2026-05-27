@@ -188,17 +188,25 @@ class MTANInputLayer(nn.Module):
         self.input_size = input_size
         self.hidden_size = config.hidden_dim
         self.num_ref_points = config.num_ref_points
+
         time_embedding_dim = config.time_embedding_dim or config.hidden_dim
-        self.value_projection = nn.Linear(1, config.hidden_dim)
-        self.time_embedding = TimeEmbedding(
-            embedding_dim=time_embedding_dim,
-            learn_embedding=config.learn_time_embedding,
-            frequency=config.time_embedding_frequency,
-        )
+        if config.time_embedding_kind == "mtan":
+            self.time_embedding = TimeEmbedding(
+                embedding_dim=time_embedding_dim,
+                learn_embedding=config.learn_time_embedding,
+                frequency=config.time_embedding_frequency,
+            )
+        elif config.time_embedding_kind == "project":
+            self.time_embedding = nn.Linear(1, time_embedding_dim)
+        else:
+            raise ValueError(f"Unknown time embedding kind: {config.time_embedding_kind}")
+        self.value_projection = nn.Linear(1, config.value_projection_dim)
+
         self.attention = MultiTimeAttention(
-            input_dim=config.hidden_dim,
+            query_dim=time_embedding_dim,
+            key_dim=time_embedding_dim,
+            value_dim=config.value_projection_dim,
             hidden_dim=config.hidden_dim,
-            time_embedding_dim=time_embedding_dim,
             n_heads=config.n_heads,
             dropout=dropout,
         )
@@ -325,23 +333,24 @@ class MultiTimeAttention(nn.Module):
     def __init__(
         self,
         *,
-        input_dim: int,
+        query_dim: int,
+        key_dim: int,
+        value_dim: int,
         hidden_dim: int,
-        time_embedding_dim: int,
         n_heads: int,
         dropout: float,
     ) -> None:
         super().__init__()
-        if time_embedding_dim % n_heads != 0:
-            raise ValueError("time_embedding_dim must be divisible by n_heads.")
-        self.input_dim = input_dim
+        if hidden_dim % n_heads != 0:
+            raise ValueError("hidden_dim must be divisible by n_heads.")
         self.hidden_dim = hidden_dim
-        self.time_embedding_dim = time_embedding_dim
         self.n_heads = n_heads
-        self.head_dim = time_embedding_dim // n_heads
-        self.query_projection = nn.Linear(time_embedding_dim, time_embedding_dim)
-        self.key_projection = nn.Linear(time_embedding_dim, time_embedding_dim)
-        self.output_projection = nn.Linear(input_dim * n_heads, hidden_dim)
+        self.head_dim = hidden_dim // n_heads
+        self.value_dim = value_dim
+        self.query_projection = nn.Linear(query_dim, hidden_dim)
+        self.key_projection = nn.Linear(key_dim, hidden_dim)
+        # self.value_projection = nn.Linear(value_dim, hidden_dim)
+        self.output_projection = nn.Linear(value_dim * n_heads, hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(
@@ -381,7 +390,7 @@ class MultiTimeAttention(nn.Module):
             .view(
                 batch_size,
                 query_length,
-                self.n_heads * self.input_dim,
+                self.n_heads * self.value_dim,
             )
         )
         return self.output_projection(attended)

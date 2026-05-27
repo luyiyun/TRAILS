@@ -10,9 +10,11 @@ model:
     cluster_weight: 0.1
   encoder:
     input:
-      kind: grud
+      kind: mtan
       hidden_dim: 64
       n_heads: 2
+      time_embedding_kind: projection
+      value_projection_dim: 1
     mapping:
       kind: transformer
       hidden_dim: 64

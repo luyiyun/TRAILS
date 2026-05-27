@@ -43,6 +43,8 @@ class EncoderInputConfig(BaseModel):
     learn_time_embedding: bool = True
     time_embedding_dim: int | None = Field(default=None, gt=0)
     time_embedding_frequency: float = Field(default=10.0, gt=0.0)
+    time_embedding_kind: Literal["mtan", "projection"] = "mtan"
+    value_projection_dim: int = Field(default=1, gt=0)
 
     @model_validator(mode="after")
     def validate_attention_heads(self) -> EncoderInputConfig:
