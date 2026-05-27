@@ -67,6 +67,7 @@ class PathsConfig(BaseModel):
     data: Path | None = None
     test_data: Path | None = None
     train_root: Path | None = None
+    save_name: str | None = None
 
 
 class ArtifactsConfig(BaseModel):

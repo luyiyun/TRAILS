@@ -188,6 +188,7 @@ class MTANInputLayer(nn.Module):
         self.input_size = input_size
         self.hidden_size = config.hidden_dim
         self.num_ref_points = config.num_ref_points
+        self.time_embedding_kind = config.time_embedding_kind
 
         time_embedding_dim = config.time_embedding_dim or config.hidden_dim
         if config.time_embedding_kind == "mtan":
@@ -259,6 +260,9 @@ class MTANInputLayer(nn.Module):
             )
         )
         values = self.value_projection(x.permute(0, 2, 1).reshape(flat_batch_size, max_length, 1))
+        if self.time_embedding_kind == "projection":
+            key_times = key_times.unsqueeze(-1)
+            query_times = query_times.unsqueeze(-1)
         key_embedding = self.time_embedding(key_times)
         query_embedding = self.time_embedding(query_times)
         attended = self.attention(

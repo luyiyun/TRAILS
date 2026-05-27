@@ -13,12 +13,13 @@ paths:
   data: null
   test_data: null
   train_root: null
+  save_name: ${command}
 
 hydra:
   job:
     chdir: false
   run:
-    dir: outputs/${command}-${now:%Y%m%d-%H%M%S-%f}
+    dir: outputs/${paths.save_name}-${now:%Y%m%d-%H%M%S-%f}
   sweep:
-    dir: multirun/${command}-${now:%Y%m%d-%H%M%S-%f}
+    dir: multirun/${paths.save_name}-${now:%Y%m%d-%H%M%S-%f}
     subdir: ${hydra.job.num}

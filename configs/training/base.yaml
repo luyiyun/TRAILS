@@ -2,7 +2,7 @@ model:
   latent_dim: 32
   n_clusters: 4
   dropout: 0.0
-  survival_head_hidden_layers: 2
+  survival_head_hidden_layers: 1  # 1/2都可以
   loss:
     weighting: uncertainty
     reconstruction_weight: 1.0
@@ -33,7 +33,7 @@ trainer:
   learning_rate: 5.0e-4
   warmup_epochs: 20
   gmm_init_iters: 20
-  gradient_clip_norm: null
+  gradient_clip_norm: 1.0
   device: cuda:0
   seed: 20260517
   valid_size: 0.2
