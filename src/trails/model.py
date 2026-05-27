@@ -196,7 +196,7 @@ class MTANInputLayer(nn.Module):
                 learn_embedding=config.learn_time_embedding,
                 frequency=config.time_embedding_frequency,
             )
-        elif config.time_embedding_kind == "project":
+        elif config.time_embedding_kind == "projection":
             self.time_embedding = nn.Linear(1, time_embedding_dim)
         else:
             raise ValueError(f"Unknown time embedding kind: {config.time_embedding_kind}")
