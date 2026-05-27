@@ -125,6 +125,10 @@ clean reusable method library.
 - The phase-one model uses a modular encoder: an asynchronous input layer (`grud` or
   standard mTAN-style multi-time attention) followed by a nonlinear mapping layer
   (`gru`, `lstm`, or `transformer`) and SeqPool.
+- The mTAN input path consumes compact `(B, T, D)` batches by attending separately
+  over each sample-feature observation stream, using a training-set global
+  reference-time grid, then concatenating per-feature embeddings into
+  `(B, reference_points, D * feature_embedding_dim)` before the mapping layer.
 - The reconstruction decoder is configurable as `gru`, `lstm`, or
   `transformer`; recurrent decoders support latent-initialized hidden state or
   repeated latent plus visit-time input, while transformer decoding only uses

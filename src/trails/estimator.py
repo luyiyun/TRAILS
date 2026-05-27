@@ -32,6 +32,9 @@ class TrailsEstimator:
     ) -> TrailsEstimator:
         self._validate_data_config(data)
         self.model.set_feature_means(data.feature_means)
+        if self.config.model.encoder.input.kind == "mtan":
+            min_time, max_time = observed_time_range(data)
+            self.model.set_reference_time_range(min_time, max_time)
         self.history = self.trainer.fit(
             data,
             history_callback=history_callback,
@@ -93,3 +96,21 @@ class TrailsEstimator:
                 "Data shape does not match estimator config: "
                 f"expected {self.config.data}, got {inferred}."
             )
+
+
+def observed_time_range(data: ClinicalTimeSeriesDataset) -> tuple[float, float]:
+    compact_data = data.with_return_kind("compact")
+    min_time: float | None = None
+    max_time: float | None = None
+    for sample in compact_data.samples:
+        observed_times = sample.times[sample.mask > 0].float()
+        if observed_times.numel() == 0:
+            continue
+        sample_min = float(observed_times.min().item())
+        sample_max = float(observed_times.max().item())
+        min_time = sample_min if min_time is None else min(min_time, sample_min)
+        max_time = sample_max if max_time is None else max(max_time, sample_max)
+
+    if min_time is None or max_time is None:
+        raise ValueError("mTAN reference time grid requires at least one observed time.")
+    return min_time, max_time

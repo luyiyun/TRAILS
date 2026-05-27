@@ -32,6 +32,7 @@ from trails.metrics import (
     weibull_mixture_negative_log_likelihood,
 )
 from trails.model import (
+    MTANInputLayer,
     MultiTimeAttention,
     SequencePool,
     TimeEmbedding,
@@ -159,6 +160,9 @@ def test_compact_dataset_view_and_collate() -> None:
     assert isinstance(compact_dataset.samples[0], CompactClinicalSample)
     assert isinstance(compact_dataset[0], CompactClinicalSample)
     assert compact_sample.x.shape == compact_sample.times.shape == compact_sample.mask.shape
+    assert compact_sample.x.ndim == 2
+    assert compact_sample.x.shape[1] == dataset.n_features
+    assert compact_sample.feature_lengths.shape == (dataset.n_features,)
     assert torch.equal(compact_sample.feature_lengths, aligned_sample.mask.sum(dim=0).long())
     for feature_index in range(dataset.n_features):
         observed = aligned_sample.mask[:, feature_index] > 0
@@ -176,6 +180,9 @@ def test_compact_dataset_view_and_collate() -> None:
     batch = clinical_collate_fn([compact_dataset[0], compact_dataset[1]])
     assert "feature_lengths" in batch
     assert "delta_time" not in batch
+    assert batch["x"].ndim == 3
+    assert batch["x"].shape == batch["times"].shape == batch["mask"].shape
+    assert batch["x"].shape[0] == 2
     assert batch["x"].shape[-1] == dataset.n_features
 
     with pytest.raises(ValueError, match="cannot mix aligned and compact"):
@@ -248,6 +255,29 @@ def test_compact_to_aligned_rejects_duplicate_feature_times() -> None:
         cluster_label=torch.tensor(0),
     )
 
+    with pytest.raises(ValueError, match="duplicate feature-time"):
+        compact_sample.to_aligned()
+
+
+def test_compact_dataset_allows_duplicate_feature_times_for_feature_means() -> None:
+    compact_sample = CompactClinicalSample(
+        times=torch.tensor([[0.0, 1.0], [0.0, 2.0], [0.0, 0.0]]),
+        x=torch.tensor([[1.0, 2.0], [3.0, 4.0], [0.0, 0.0]]),
+        mask=torch.tensor([[1.0, 1.0], [1.0, 1.0], [0.0, 0.0]]),
+        feature_lengths=torch.tensor([2, 2]),
+        survival_time=torch.tensor(5.0),
+        event=torch.tensor(1.0),
+        cluster_label=torch.tensor(0),
+    )
+
+    compact_dataset = ClinicalTimeSeriesDataset(
+        [compact_sample],
+        feature_names=["a", "b"],
+        return_kind="compact",
+    )
+
+    assert isinstance(compact_dataset.samples[0], CompactClinicalSample)
+    assert torch.allclose(compact_dataset.feature_means, torch.tensor([2.0, 3.0]))
     with pytest.raises(ValueError, match="duplicate feature-time"):
         compact_sample.to_aligned()
 
@@ -587,6 +617,51 @@ def test_mtan_time_embedding_and_attention_shapes_without_nan() -> None:
 
     assert output.shape == (1, 4, 7)
     assert torch.isfinite(output).all()
+
+
+def test_mtan_learned_time_embedding_is_linear_projection() -> None:
+    time_embedding = TimeEmbedding(embedding_dim=6, learn_embedding=True, frequency=10.0)
+    times = torch.linspace(0.0, 1.0, 4).reshape(2, 2)
+
+    output = time_embedding(times)
+
+    assert output.shape == (2, 2, 6)
+    assert torch.isfinite(output).all()
+
+
+def test_mtan_input_layer_uses_per_feature_attention_shape() -> None:
+    config = EncoderInputConfig(
+        kind="mtan",
+        hidden_dim=4,
+        n_heads=2,
+        num_ref_points=5,
+        learn_time_embedding=True,
+        time_embedding_dim=6,
+    )
+    layer = MTANInputLayer(input_size=3, config=config, dropout=0.0)
+    layer.set_reference_time_range(0.0, 4.0)
+    times = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 2.0, 0.0], [2.0, 4.0, 0.0]],
+            [[0.0, 0.5, 0.0], [1.5, 1.0, 0.0], [3.0, 2.0, 0.0]],
+        ]
+    )
+    x = torch.randn(2, 3, 3)
+    mask = torch.tensor(
+        [
+            [[1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            [[1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+        ]
+    )
+
+    output, query_times, sequence_lengths = layer(times=times, x=x, mask=mask)
+
+    assert output.shape == (2, 5, 12)
+    assert query_times.shape == (2, 5)
+    assert torch.allclose(query_times[0], torch.linspace(0.0, 4.0, 5))
+    assert torch.equal(sequence_lengths, torch.full((2,), 5))
+    assert torch.isfinite(output).all()
+    assert torch.allclose(output[:, :, 8:12], torch.zeros_like(output[:, :, 8:12]))
 
 
 def test_clustering_accuracy_matches_permuted_labels() -> None:

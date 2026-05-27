@@ -189,14 +189,14 @@ class MTANInputLayer(nn.Module):
         self.hidden_size = config.hidden_dim
         self.num_ref_points = config.num_ref_points
         time_embedding_dim = config.time_embedding_dim or config.hidden_dim
-        self.feature_embedding = nn.Embedding(input_size, config.hidden_dim)
+        self.value_projection = nn.Linear(1, config.hidden_dim)
         self.time_embedding = TimeEmbedding(
             embedding_dim=time_embedding_dim,
             learn_embedding=config.learn_time_embedding,
             frequency=config.time_embedding_frequency,
         )
         self.attention = MultiTimeAttention(
-            input_dim=config.hidden_dim + 2,
+            input_dim=config.hidden_dim,
             hidden_dim=config.hidden_dim,
             time_embedding_dim=time_embedding_dim,
             n_heads=config.n_heads,
@@ -214,6 +214,18 @@ class MTANInputLayer(nn.Module):
             torch.linspace(0.0, 1.0, config.num_ref_points, dtype=torch.float32)
         )
 
+    def set_reference_time_range(self, min_time: float, max_time: float) -> None:
+        if max_time < min_time:
+            raise ValueError("max_time must be greater than or equal to min_time.")
+        reference_times = torch.linspace(
+            min_time,
+            max_time,
+            self.num_ref_points,
+            dtype=self.reference_times.dtype,
+            device=self.reference_times.device,
+        )
+        self.reference_times.copy_(reference_times)
+
     def forward(
         self,
         *,
@@ -227,31 +239,18 @@ class MTANInputLayer(nn.Module):
         if times.ndim == 2:
             times = times.unsqueeze(-1).expand_as(x)
 
-        token_mask = mask.reshape(batch_size, max_length * n_features) > 0
-        max_observed_time = (times * mask).reshape(batch_size, -1).max(dim=1).values.clamp_min(1e-6)
-        normalized_times = times / max_observed_time.view(batch_size, 1, 1)
-        key_times = normalized_times.reshape(batch_size, max_length * n_features)
+        flat_batch_size = batch_size * n_features
+        key_times = times.permute(0, 2, 1).reshape(flat_batch_size, max_length)
+        token_mask = mask.permute(0, 2, 1).reshape(flat_batch_size, max_length) > 0
         query_times = (
             self.reference_times.to(device=x.device, dtype=x.dtype)
             .unsqueeze(0)
             .expand(
-                batch_size,
+                flat_batch_size,
                 -1,
             )
         )
-
-        feature_index = torch.arange(n_features, device=x.device).repeat(max_length)
-        feature_tokens = (
-            self.feature_embedding(feature_index).unsqueeze(0).expand(batch_size, -1, -1)
-        )
-        values = torch.cat(
-            [
-                x.reshape(batch_size, max_length * n_features, 1),
-                mask.reshape(batch_size, max_length * n_features, 1),
-                feature_tokens,
-            ],
-            dim=-1,
-        )
+        values = self.value_projection(x.permute(0, 2, 1).reshape(flat_batch_size, max_length, 1))
         key_embedding = self.time_embedding(key_times)
         query_embedding = self.time_embedding(query_times)
         attended = self.attention(
@@ -260,15 +259,32 @@ class MTANInputLayer(nn.Module):
             value=values,
             mask=token_mask,
         )
+        feature_has_observation = token_mask.any(dim=1).to(dtype=attended.dtype).view(-1, 1, 1)
+        attended = attended * feature_has_observation
         encoded = self.attention_norm(attended)
         encoded = self.ffn_norm(encoded + self.ffn(encoded))
+        encoded = encoded * feature_has_observation
+        encoded = (
+            encoded.reshape(batch_size, n_features, self.num_ref_points, self.hidden_size)
+            .transpose(1, 2)
+            .contiguous()
+            .reshape(batch_size, self.num_ref_points, n_features * self.hidden_size)
+        )
+        mapping_times = (
+            self.reference_times.to(device=x.device, dtype=x.dtype)
+            .unsqueeze(0)
+            .expand(
+                batch_size,
+                -1,
+            )
+        )
         sequence_lengths = torch.full(
             (batch_size,),
             self.num_ref_points,
             dtype=torch.long,
             device=x.device,
         )
-        return encoded, query_times, sequence_lengths
+        return encoded, mapping_times, sequence_lengths
 
 
 class TimeEmbedding(nn.Module):
@@ -278,20 +294,13 @@ class TimeEmbedding(nn.Module):
         self.learn_embedding = learn_embedding
         self.frequency = frequency
         if learn_embedding:
-            self.linear = nn.Linear(1, 1)
-            self.periodic = nn.Linear(1, embedding_dim - 1) if embedding_dim > 1 else None
+            self.linear = nn.Linear(1, embedding_dim)
         else:
             self.linear = None
-            self.periodic = None
 
     def forward(self, times: Tensor) -> Tensor:
         if self.learn_embedding:
-            expanded = times.unsqueeze(-1)
-            linear = self._required_linear(expanded)
-            if self.embedding_dim == 1:
-                return linear
-            periodic = self._required_periodic(expanded)
-            return torch.cat([linear, torch.sin(periodic)], dim=-1)
+            return self._required_linear(times.unsqueeze(-1))
         return self.fixed_time_embedding(times)
 
     def fixed_time_embedding(self, times: Tensor) -> Tensor:
@@ -310,11 +319,6 @@ class TimeEmbedding(nn.Module):
         if self.linear is None:
             raise RuntimeError("learned time embedding linear layer is not initialized.")
         return self.linear(times)
-
-    def _required_periodic(self, times: Tensor) -> Tensor:
-        if self.periodic is None:
-            raise RuntimeError("learned time embedding periodic layer is not initialized.")
-        return self.periodic(times)
 
 
 class MultiTimeAttention(nn.Module):
@@ -481,17 +485,22 @@ class TrailsEncoder(nn.Module):
             )
 
         mapping_config = encoder_config.mapping
+        mapping_input_dim = (
+            data_config.n_features * encoder_config.input.hidden_dim
+            if encoder_config.input.kind == "mtan"
+            else encoder_config.input.hidden_dim
+        )
         if mapping_config.kind in {"gru", "lstm"}:
             self.mapping = RecurrentMappingLayer(
                 kind=mapping_config.kind,
-                input_dim=encoder_config.input.hidden_dim,
+                input_dim=mapping_input_dim,
                 hidden_dim=mapping_config.hidden_dim,
                 n_layers=mapping_config.n_layers,
                 dropout=dropout,
             )
         else:
             self.mapping = TransformerMappingLayer(
-                input_dim=encoder_config.input.hidden_dim,
+                input_dim=mapping_input_dim,
                 hidden_dim=mapping_config.hidden_dim,
                 n_layers=mapping_config.n_layers,
                 n_heads=mapping_config.n_heads,
@@ -499,6 +508,16 @@ class TrailsEncoder(nn.Module):
             )
 
         self.seq_pool = SequencePool(encoder_config.mapping.hidden_dim)
+
+    def set_reference_time_range(self, min_time: float, max_time: float) -> None:
+        if isinstance(self.input_layer, MTANInputLayer):
+            self.input_layer.set_reference_time_range(min_time, max_time)
+
+    @property
+    def reference_times(self) -> Tensor | None:
+        if isinstance(self.input_layer, MTANInputLayer):
+            return self.input_layer.reference_times
+        return None
 
     def forward(
         self,
@@ -711,6 +730,13 @@ class TrailsSurvVaderModel(nn.Module):
     @property
     def feature_means(self) -> Tensor:
         return cast(Tensor, self._buffers["_feature_means"])
+
+    def set_reference_time_range(self, min_time: float, max_time: float) -> None:
+        self.encoder.set_reference_time_range(min_time, max_time)
+
+    @property
+    def reference_times(self) -> Tensor | None:
+        return self.encoder.reference_times
 
     def set_mixture_parameters(
         self,

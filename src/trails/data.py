@@ -411,9 +411,8 @@ def compute_feature_means(samples: Sequence[DatasetSample]) -> Tensor:
     numerator = torch.zeros(n_features, dtype=torch.float32)
     denominator = torch.zeros(n_features, dtype=torch.float32)
     for sample in samples:
-        aligned_sample = sample.to_aligned()
-        numerator += (aligned_sample.x * aligned_sample.mask).sum(dim=0)
-        denominator += aligned_sample.mask.sum(dim=0)
+        numerator += (sample.x * sample.mask).sum(dim=0).float()
+        denominator += sample.mask.sum(dim=0).float()
     return numerator / denominator.clamp_min(1.0)
 
 

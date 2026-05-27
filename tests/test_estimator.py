@@ -13,7 +13,7 @@ from trails.config import (
     TrainerConfig,
 )
 from trails.data import ClinicalTimeSeriesDataset, make_clinical_sample
-from trails.estimator import TrailsEstimator
+from trails.estimator import TrailsEstimator, observed_time_range
 from trails_simulate import (
     ClinicalTimeSeriesDatasetGenerator,
     ClinicalTimeSeriesDatasetGeneratorConfig,
@@ -29,6 +29,34 @@ def tiny_config(n_features: int) -> TrailsConfig:
             encoder=EncoderConfig(
                 input=EncoderInputConfig(hidden_dim=8),
                 mapping=EncoderMappingConfig(hidden_dim=8),
+            ),
+            decoder=DecoderConfig(hidden_dim=8),
+        ),
+        trainer=TrainerConfig(
+            max_epochs=1,
+            warmup_epochs=1,
+            batch_size=None,
+            gmm_init_iters=2,
+            valid_size=0.0,
+        ),
+        seed=13,
+    )
+
+
+def tiny_mtan_config(n_features: int) -> TrailsConfig:
+    return TrailsConfig(
+        data=DataConfig(n_features=n_features),
+        model=ModelConfig(
+            n_clusters=2,
+            latent_dim=4,
+            encoder=EncoderConfig(
+                input=EncoderInputConfig(
+                    kind="mtan",
+                    hidden_dim=4,
+                    n_heads=2,
+                    num_ref_points=5,
+                ),
+                mapping=EncoderMappingConfig(kind="gru", hidden_dim=8),
             ),
             decoder=DecoderConfig(hidden_dim=8),
         ),
@@ -101,6 +129,29 @@ def test_estimator_fit_predict_test() -> None:
     assert "cluster_max_fraction" in metrics
     assert "cluster_entropy" in metrics
     assert 0.0 <= metrics["cluster_entropy"] <= 1.0
+
+
+def test_mtan_estimator_sets_training_reference_time_grid() -> None:
+    data = simulate_dataset(seed=37)
+    config = tiny_mtan_config(data.n_features)
+    estimator = TrailsEstimator(config).fit(data)
+    min_time, max_time = observed_time_range(data)
+    reference_times = estimator.model.reference_times
+    assert reference_times is not None
+    expected = torch.linspace(
+        min_time,
+        max_time,
+        config.model.encoder.input.num_ref_points,
+        dtype=reference_times.dtype,
+        device=reference_times.device,
+    )
+
+    assert torch.allclose(reference_times, expected)
+    saved_reference_times = reference_times.clone()
+    estimator.predict(data)
+    prediction_reference_times = estimator.model.reference_times
+    assert prediction_reference_times is not None
+    assert torch.allclose(prediction_reference_times, saved_reference_times)
 
 
 def test_estimator_latent_diagnostics_exports_labels_and_embeddings() -> None:
