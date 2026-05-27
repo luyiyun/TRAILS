@@ -1,5 +1,7 @@
 from pathlib import Path
+from typing import Literal
 
+import pytest
 import torch
 
 from trails.config import (
@@ -43,7 +45,7 @@ def tiny_config(n_features: int) -> TrailsConfig:
     )
 
 
-def tiny_mtan_config(n_features: int) -> TrailsConfig:
+def tiny_mtan_config(n_features: int, kind: Literal["mtan", "mtan2"] = "mtan") -> TrailsConfig:
     return TrailsConfig(
         data=DataConfig(n_features=n_features),
         model=ModelConfig(
@@ -51,7 +53,7 @@ def tiny_mtan_config(n_features: int) -> TrailsConfig:
             latent_dim=4,
             encoder=EncoderConfig(
                 input=EncoderInputConfig(
-                    kind="mtan",
+                    kind=kind,
                     hidden_dim=4,
                     n_heads=2,
                     num_ref_points=5,
@@ -131,9 +133,10 @@ def test_estimator_fit_predict_test() -> None:
     assert 0.0 <= metrics["cluster_entropy"] <= 1.0
 
 
-def test_mtan_estimator_sets_training_reference_time_grid() -> None:
+@pytest.mark.parametrize("kind", ["mtan", "mtan2"])
+def test_mtan_estimator_sets_training_reference_time_grid(kind: Literal["mtan", "mtan2"]) -> None:
     data = simulate_dataset(seed=37)
-    config = tiny_mtan_config(data.n_features)
+    config = tiny_mtan_config(data.n_features, kind=kind)
     estimator = TrailsEstimator(config).fit(data)
     min_time, max_time = observed_time_range(data)
     reference_times = estimator.model.reference_times

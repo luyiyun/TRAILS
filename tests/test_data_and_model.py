@@ -32,6 +32,7 @@ from trails.metrics import (
     weibull_mixture_negative_log_likelihood,
 )
 from trails.model import (
+    MTAN2InputLayer,
     MTANInputLayer,
     MultiTimeAttention,
     SequencePool,
@@ -44,7 +45,7 @@ from trails_simulate import (
     ClinicalTimeSeriesDatasetGeneratorConfig,
 )
 
-EncoderInputKind = Literal["grud", "mtan"]
+EncoderInputKind = Literal["grud", "mtan", "mtan2"]
 EncoderMappingKind = Literal["gru", "lstm", "transformer"]
 DecoderKind = Literal["gru", "lstm", "transformer"]
 DecoderConditioning = Literal["initial_state", "concat_time"]
@@ -112,6 +113,14 @@ def test_data_loader_accepts_auto_batch_size() -> None:
     batch = next(iter(loader))
 
     assert batch["x"].shape[0] == 8
+
+
+def test_encoder_input_config_accepts_supported_kinds_and_rejects_unknown() -> None:
+    for kind in ("grud", "mtan", "mtan2"):
+        assert EncoderInputConfig(kind=kind).kind == kind
+
+    with pytest.raises(ValidationError):
+        EncoderInputConfig.model_validate({"kind": "unknown"})
 
 
 def test_clinical_dataset_and_collate_shapes() -> None:
@@ -629,7 +638,7 @@ def test_mtan_learned_time_embedding_is_linear_projection() -> None:
     assert torch.isfinite(output).all()
 
 
-def test_mtan_input_layer_uses_per_feature_attention_shape() -> None:
+def test_mtan_input_layer_uses_aligned_attention_shape() -> None:
     config = EncoderInputConfig(
         kind="mtan",
         hidden_dim=4,
@@ -639,6 +648,35 @@ def test_mtan_input_layer_uses_per_feature_attention_shape() -> None:
         time_embedding_dim=6,
     )
     layer = MTANInputLayer(input_size=3, config=config, dropout=0.0)
+    layer.set_reference_time_range(0.0, 4.0)
+    times = torch.tensor([[0.0, 1.0, 2.0], [0.0, 1.5, 3.0]])
+    x = torch.randn(2, 3, 3)
+    mask = torch.tensor(
+        [
+            [[1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            [[1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+        ]
+    )
+
+    output, query_times, sequence_lengths = layer(times=times, x=x, mask=mask)
+
+    assert output.shape == (2, 5, 4)
+    assert query_times.shape == (2, 5)
+    assert torch.allclose(query_times[0], torch.linspace(0.0, 4.0, 5))
+    assert torch.equal(sequence_lengths, torch.full((2,), 5))
+    assert torch.isfinite(output).all()
+
+
+def test_mtan2_input_layer_uses_per_feature_attention_shape() -> None:
+    config = EncoderInputConfig(
+        kind="mtan2",
+        hidden_dim=4,
+        n_heads=2,
+        num_ref_points=5,
+        learn_time_embedding=True,
+        time_embedding_dim=6,
+    )
+    layer = MTAN2InputLayer(input_size=3, config=config, dropout=0.0)
     layer.set_reference_time_range(0.0, 4.0)
     times = torch.tensor(
         [
@@ -710,7 +748,7 @@ def assert_model_forward_shapes(model_config: ModelConfig) -> None:
     )
     model_dataset = (
         dataset.with_return_kind("compact")
-        if model_config.encoder.input.kind == "mtan"
+        if model_config.encoder.input.kind == "mtan2"
         else dataset.with_return_kind("aligned")
     )
     batch = clinical_collate_fn(
@@ -930,8 +968,10 @@ def test_model_forward_shapes_for_decoder_architectures(
     [
         ("grud", "gru"),
         ("mtan", "gru"),
+        ("mtan2", "gru"),
         ("grud", "lstm"),
         ("mtan", "transformer"),
+        ("mtan2", "transformer"),
     ],
 )
 def test_model_forward_shapes_for_encoder_architectures(

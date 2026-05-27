@@ -3,7 +3,7 @@ run_id: null
 study_name: optim
 storage: null
 search:
-  encoder_input_kind: [grud, mtan]
+  encoder_input_kind: [grud, mtan, mtan2]
   encoder_mapping_kind: [gru, lstm, transformer]
   decoder_kind: [gru, lstm, transformer]
   decoder_conditioning: [initial_state, concat_time]

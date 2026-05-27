@@ -124,9 +124,7 @@ class TrailsTrainer:
         history_callback: HistoryCallback | None = None,
     ) -> list[HistoryEntry]:
         # 根据我们使用的input调整数据格式
-        data = data.with_return_kind(
-            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
-        )
+        data = data.with_return_kind(self._model_return_kind())
         if self.config.valid_size > 0:
             data, validation_data = data.split([1 - self.config.valid_size, self.config.valid_size])
             valid_loader = make_data_loader(validation_data, self.config, shuffle=False)
@@ -232,30 +230,22 @@ class TrailsTrainer:
         return history
 
     def predict(self, data: ClinicalTimeSeriesDataset) -> Tensor:
-        data = data.with_return_kind(
-            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
-        )
+        data = data.with_return_kind(self._model_return_kind())
         outputs, _batch = self._collect_outputs(data)
         return torch.argmax(outputs.cluster_probabilities, dim=-1).cpu()
 
     def predict_proba(self, data: ClinicalTimeSeriesDataset) -> Tensor:
-        data = data.with_return_kind(
-            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
-        )
+        data = data.with_return_kind(self._model_return_kind())
         outputs, _batch = self._collect_outputs(data)
         return outputs.cluster_probabilities.cpu()
 
     def predict_risk(self, data: ClinicalTimeSeriesDataset) -> Tensor:
-        data = data.with_return_kind(
-            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
-        )
+        data = data.with_return_kind(self._model_return_kind())
         outputs, _batch = self._collect_outputs(data)
         return self._risk_score(outputs).cpu()
 
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
-        data = data.with_return_kind(
-            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
-        )
+        data = data.with_return_kind(self._model_return_kind())
         loader = make_data_loader(data, self.config, shuffle=False)
         survival_metrics: dict[str, Metric] = {"cindex": Cindex()}
         cluster_metrics: dict[str, Metric] = (
@@ -365,9 +355,7 @@ class TrailsTrainer:
         }
 
     def _collect_outputs(self, data: ClinicalTimeSeriesDataset) -> tuple[TrailsModelOutput, Batch]:
-        data = data.with_return_kind(
-            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
-        )
+        data = data.with_return_kind(self._model_return_kind())
         loader = make_data_loader(data, self.config, shuffle=False)
         outputs: list[TrailsModelOutput] = []
         batches: list[Batch] = []
@@ -387,9 +375,7 @@ class TrailsTrainer:
         return -expected_scale
 
     def _collect_latent_means(self, data: ClinicalTimeSeriesDataset) -> Tensor:
-        data = data.with_return_kind(
-            "compact" if self.model.model_config.encoder.input.kind == "mtan" else "aligned"
-        )
+        data = data.with_return_kind(self._model_return_kind())
         loader = make_data_loader(data, self.config, shuffle=False)
         latent_means: list[Tensor] = []
         self.model.eval()
@@ -417,6 +403,9 @@ class TrailsTrainer:
                 feature_lengths=batch["feature_lengths"],
             )
         raise ValueError("Batch must contain either aligned or compact time-series fields.")
+
+    def _model_return_kind(self) -> Literal["aligned", "compact"]:
+        return "compact" if self.model.model_config.encoder.input.kind == "mtan2" else "aligned"
 
 
 def concatenate_batches(batches: list[Batch]) -> Batch:

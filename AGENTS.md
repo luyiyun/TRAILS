@@ -122,13 +122,15 @@ clean reusable method library.
   `mask`, and `feature_lengths`.
 - Dataset metadata preserves latent profiles, cluster parameters, survival
   coefficients, and generation parameters for simulation-study evaluation.
-- The phase-one model uses a modular encoder: an asynchronous input layer (`grud` or
-  standard mTAN-style multi-time attention) followed by a nonlinear mapping layer
-  (`gru`, `lstm`, or `transformer`) and SeqPool.
-- The mTAN input path consumes compact `(B, T, D)` batches by attending separately
-  over each sample-feature observation stream, using a training-set global
-  reference-time grid, then concatenating per-feature embeddings into
-  `(B, reference_points, D * feature_embedding_dim)` before the mapping layer.
+- The phase-one model uses a modular encoder: an asynchronous input layer (`grud`,
+  original aligned `mtan`, or compact per-feature `mtan2`) followed by a nonlinear
+  mapping layer (`gru`, `lstm`, or `transformer`) and SeqPool.
+- The original `mtan` input path consumes aligned `(B, T, D)` batches, concatenates
+  `x` and `mask` as the attention value, and maps observations onto a training-set
+  global reference-time grid before the mapping layer.
+- The legacy `mtan2` input path consumes compact `(B, T, D)` batches by attending
+  separately over each sample-feature observation stream, then concatenates
+  per-feature embeddings into `(B, reference_points, D * feature_embedding_dim)`.
 - The reconstruction decoder is configurable as `gru`, `lstm`, or
   `transformer`; recurrent decoders support latent-initialized hidden state or
   repeated latent plus visit-time input, while transformer decoding only uses

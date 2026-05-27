@@ -10,7 +10,8 @@ Subtypes** 的缩写。项目目标是构建面向非同步多变量医学纵向
 - 模拟器采用 VaDeSC-EHR 风格的数据生成主线：cluster-specific latent profile -> 随机非线性轨迹生成 -> pseudo attention -> 观测序列 -> Weibull 生存结局。
 - 输入是非同步采样的多变量医学检查序列，包括血液检查、肝肾功能、炎症指标、肿瘤标志物和肿瘤负荷等连续变量。
 - 数据保留 `mask` 和 `delta_time`，用于表达变量级缺失和距离上次观测的时间间隔。
-- 编码器支持 GRU-D 或标准 mTAN-style 多时间注意力输入层，显式建模缺失模式和时间间隔。
+- 编码器支持 GRU-D、原始 aligned mTAN 多时间注意力输入层，并保留旧的 compact
+  per-feature `mtan2` 输入层用于对照。
 - 解码器支持 GRU/LSTM/Transformer，从患者级 latent representation 重构纵向轨迹。
 - 聚类模块使用 VaDE 风格的可学习 Gaussian mixture latent prior。
 - 生存模块使用 cluster-specific Weibull mixture survival head，混合权重来自 VaDE posterior。
@@ -170,7 +171,7 @@ uv run main.py command=train training=mtan paths.data_root=data/simulated/censor
 阶段一：模块化 Surv-VaDER 基础版
 
 - 完成 VaDeSC-EHR 风格的连续型多变量非同步采样模拟器。
-- 使用 GRU-D 或 mTAN-style encoder 处理 `x/mask/delta_time`。
+- 使用 GRU-D、原始 aligned mTAN 或旧 compact `mtan2` encoder 处理 `x/mask/delta_time`。
 - 使用 GRU/LSTM/Transformer decoder 重构纵向轨迹。
 - 加入 VaDE Gaussian mixture latent prior、warmup 后 deterministic k-means 初始化，以及 Weibull survival head。
 - 比较是否加入 survival loss 对聚类风险区分度的影响。
@@ -178,7 +179,7 @@ uv run main.py command=train training=mtan paths.data_root=data/simulated/censor
 阶段二：mTAN-Surv-VaDER 主模型
 
 - 将输入从固定访问序列扩展为 observation-level irregular events。
-- 使用 mTAN-style reference time attention 将非同步观测映射到 reference grid。
+- 使用原始 mTAN reference time attention 将 aligned 非同步观测映射到 reference grid。
 - 与固定时间窗、插值、GRU-D、Latent ODE/ODE-RNN 等方法比较。
 - 系统评估 reference time points 数量和设置方式。
 

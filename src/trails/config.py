@@ -36,7 +36,7 @@ class DataConfig(BaseModel):
 class EncoderInputConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    kind: Literal["grud", "mtan"] = "grud"
+    kind: Literal["grud", "mtan", "mtan2"] = "grud"
     hidden_dim: int = Field(default=32, gt=0)
     n_heads: int = Field(default=2, gt=0)
     num_ref_points: int = Field(default=16, gt=0)
@@ -48,12 +48,12 @@ class EncoderInputConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_attention_heads(self) -> EncoderInputConfig:
-        if self.kind == "mtan" and self.hidden_dim % self.n_heads != 0:
+        if self.kind == "mtan2" and self.hidden_dim % self.n_heads != 0:
             raise ValueError("model.encoder.input.hidden_dim must be divisible by n_heads.")
         resolved_time_dim = (
             self.hidden_dim if self.time_embedding_dim is None else self.time_embedding_dim
         )
-        if self.kind == "mtan" and resolved_time_dim % self.n_heads != 0:
+        if self.kind in {"mtan", "mtan2"} and resolved_time_dim % self.n_heads != 0:
             raise ValueError("model.encoder.input.time_embedding_dim must be divisible by n_heads.")
         return self
 

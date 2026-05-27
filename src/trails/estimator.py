@@ -32,7 +32,7 @@ class TrailsEstimator:
     ) -> TrailsEstimator:
         self._validate_data_config(data)
         self.model.set_feature_means(data.feature_means)
-        if self.config.model.encoder.input.kind == "mtan":
+        if self.config.model.encoder.input.kind in {"mtan", "mtan2"}:
             min_time, max_time = observed_time_range(data)
             self.model.set_reference_time_range(min_time, max_time)
         self.history = self.trainer.fit(

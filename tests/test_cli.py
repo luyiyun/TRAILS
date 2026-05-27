@@ -159,7 +159,7 @@ def test_training_configs_validate() -> None:
 
     expected_input = {
         "small": "grud",
-        "base": "grud",
+        "base": "mtan2",
         "large": "grud",
         "mtan": "mtan",
     }

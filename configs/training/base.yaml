@@ -10,7 +10,7 @@ model:
     cluster_weight: 0.1
   encoder:
     input:
-      kind: mtan
+      kind: mtan2
       hidden_dim: 64
       n_heads: 2
       time_embedding_kind: projection

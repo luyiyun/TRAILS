@@ -172,8 +172,8 @@ class IntSearchRangeConfig(BaseModel):
 class OptimSearchSpaceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    encoder_input_kind: tuple[Literal["grud", "mtan"], ...] = Field(
-        default=("grud", "mtan"),
+    encoder_input_kind: tuple[Literal["grud", "mtan", "mtan2"], ...] = Field(
+        default=("grud", "mtan", "mtan2"),
         min_length=1,
     )
     encoder_mapping_kind: tuple[Literal["gru", "lstm", "transformer"], ...] = Field(
