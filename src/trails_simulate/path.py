@@ -25,11 +25,8 @@ def data_root(
     hydra_run_dir: Path,
     project_root: Path,
 ) -> Path:
-    if config.paths.data_root is not None:
-        return resolve_path(config.paths.data_root, project_root)
-    if config.command == "simulate":
-        return hydra_run_dir
-    return hydra_run_dir / "data"
+    del hydra_run_dir
+    return resolve_path(config.paths.data_root, project_root)
 
 
 def checkpoint_path_for_run(
@@ -61,11 +58,9 @@ def discover_dataset_runs(
     hydra_run_dir: Path,
     project_root: Path,
 ) -> list[DatasetRunPaths]:
-    if config.paths.data is not None:
-        if config.paths.test_data is None:
-            raise ValueError("Split commands require paths.test_data=... when paths.data is set.")
-        data_path = resolve_path(config.paths.data, project_root)
-        test_path = resolve_path(config.paths.test_data, project_root)
+    if config.paths.explicit_split.enabled:
+        data_path = resolve_path(config.paths.explicit_split.train_data, project_root)
+        test_path = resolve_path(config.paths.explicit_split.test_data, project_root)
         return [
             DatasetRunPaths(
                 run_id="0",
@@ -75,14 +70,7 @@ def discover_dataset_runs(
             )
         ]
 
-    root = (
-        None if config.paths.data_root is None else data_root(config, hydra_run_dir, project_root)
-    )
-    if root is None:
-        raise ValueError(
-            f"command={config.command} requires paths.data_root=... or explicit "
-            "paths.data/test_data."
-        )
+    root = data_root(config, hydra_run_dir, project_root)
 
     single_train = root / "train.pt"
     single_test = root / "test.pt"

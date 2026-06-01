@@ -1,7 +1,13 @@
 n_trials: 30
-run_id: null
+run_ids: []
 study_name: optim
 storage: null
+resume: false
+parallel:
+  workers: 1
+  max_active_trials: 1
+  devices: []
+  torch_threads: null
 search:
   encoder_input_kind: [grud, mtan, mtan2]
   encoder_mapping_kind: [gru, lstm, transformer]

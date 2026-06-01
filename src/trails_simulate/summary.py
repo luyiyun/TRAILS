@@ -78,29 +78,33 @@ def format_train_summary(result: Mapping[str, Any]) -> str:
 
 def format_optim_summary(result: Mapping[str, Any]) -> str:
     paths = dict(result["paths"])
-    runs = [dict(run) for run in result["runs"]]
+    selected_run_ids = [str(run_id) for run_id in result.get("selected_run_ids", [])]
+    outputs = dict(result.get("outputs", {}))
     lines = [
         "TRAILS optim complete",
         f"Hydra run: {result['hydra_run_dir']}",
-        f"Runs: {len(runs)}",
-        f"Trials per run: {result['n_trials_requested']}",
+        f"Splits: {len(selected_run_ids)}",
+        f"Trials added: {result['n_trials_requested']}",
+        (
+            "Completed trials: "
+            f"{result.get('completed_before', 0)}->{result.get('completed_after', 0)}"
+        ),
         "",
         "Saved summaries:",
         f"  summary: {paths['optim_summary']}",
     ]
-    if runs:
+    if "trials_csv" in outputs:
+        lines.append(f"  trials csv: {outputs['trials_csv']}")
+    figures = dict(outputs.get("figures", {}))
+    if figures:
+        lines.append(f"  pareto figure: {figures.get('pareto_png', 'not written')}")
+    if selected_run_ids:
         lines.append("")
-        lines.append("Optim runs:")
-        for run in runs[:8]:
-            outputs = dict(run["outputs"])
-            lines.append(
-                "  "
-                f"{run['run_id']:<30} "
-                f"trials={run['n_completed_before']}->{run['n_completed_after']} "
-                f"summary={outputs['optim_summary']}"
-            )
-        if len(runs) > 8:
-            lines.append(f"  ... {len(runs) - 8} more")
+        lines.append("Optim splits:")
+        for run_id in selected_run_ids[:8]:
+            lines.append(f"  {run_id}")
+        if len(selected_run_ids) > 8:
+            lines.append(f"  ... {len(selected_run_ids) - 8} more")
     return "\n".join(lines)
 
 

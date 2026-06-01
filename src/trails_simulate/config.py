@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
+from omegaconf import OmegaConf
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from trails.config import ModelConfig, TrainerConfig
@@ -27,6 +28,28 @@ OPTIM_PARAM_NAMES = (
     "warmup_epochs",
     "gmm_init_iters",
 )
+
+
+def infer_run_prefix(command: str, simulation_name: str, data_root: str) -> str:
+    if command == "simulate":
+        return sanitize_run_name(simulation_name or command)
+    if command == "summary":
+        return "summary"
+    if command in {"train", "baseline", "optim"}:
+        name = Path(str(data_root)).name
+        return sanitize_run_name(name or command)
+    return sanitize_run_name(command)
+
+
+def sanitize_run_name(value: str) -> str:
+    normalized = "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in str(value).strip()
+    ).strip("._-")
+    return normalized or "run"
+
+
+OmegaConf.register_new_resolver("trails_run_prefix", infer_run_prefix, replace=True)
 
 
 class SimulationConfig(BaseModel):
@@ -60,14 +83,27 @@ class SimulationConfig(BaseModel):
         return self
 
 
+class ExplicitSplitConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    train_data: Path = Path("data/simulated/train.pt")
+    test_data: Path = Path("data/simulated/test.pt")
+
+
 class PathsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    data_root: Path | None = None
-    data: Path | None = None
-    test_data: Path | None = None
-    train_root: Path | None = None
-    save_name: str | None = None
+    data_root: Path = Path("data/simulated")
+    explicit_split: ExplicitSplitConfig = Field(default_factory=ExplicitSplitConfig)
+
+
+class RunConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    output_root: Path = Path("outputs")
+    prefix: str = Field(default="quick", min_length=1)
+    name: str = Field(default="quick", min_length=1)
 
 
 class ArtifactsConfig(BaseModel):
@@ -214,13 +250,24 @@ class OptimSearchSpaceConfig(BaseModel):
         return self
 
 
+class OptimParallelConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workers: int = Field(default=1, gt=0)
+    max_active_trials: int = Field(default=1, gt=0)
+    devices: tuple[str, ...] = ()
+    torch_threads: int | None = Field(default=None, gt=0)
+
+
 class OptimConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     n_trials: int = Field(default=30, gt=0)
-    run_id: str | None = None
+    run_ids: tuple[str, ...] = ()
     study_name: str = Field(default="optim", min_length=1)
     storage: str | None = None
+    resume: bool = False
+    parallel: OptimParallelConfig = Field(default_factory=OptimParallelConfig)
     search: OptimSearchSpaceConfig = Field(default_factory=OptimSearchSpaceConfig)
 
 
@@ -248,6 +295,7 @@ class ApplicationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     command: Command = "simulate"
+    run: RunConfig = Field(default_factory=RunConfig)
     simulation: SimulationConfig = Field(default_factory=SimulationConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)

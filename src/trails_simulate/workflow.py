@@ -108,16 +108,16 @@ def run_simulate_command(
     hydra_run_dir: Path,
     project_root: Path,
 ) -> dict[str, Any]:
-    if config.paths.data is not None or config.paths.test_data is not None:
+    if config.paths.explicit_split.enabled:
         raise ValueError(
-            "command=simulate writes split data under paths.data_root, not paths.data."
+            "command=simulate writes split data under paths.data_root, not paths.explicit_split."
         )
-    if config.paths.train_root is not None:
-        raise ValueError("command=simulate does not use paths.train_root.")
 
     out_root = data_root(config, hydra_run_dir, project_root) / config.simulation.name
-    manifest_path = out_root / "simulation_manifest.csv"
-    summary_path = out_root / "simulation_summary.json"
+    data_manifest_path = out_root / "simulation_manifest.csv"
+    data_summary_path = out_root / "simulation_summary.json"
+    manifest_path = hydra_run_dir / "simulation_manifest.csv"
+    summary_path = hydra_run_dir / "simulation_summary.json"
     runs: list[dict[str, Any]] = []
 
     n_iter = (
@@ -204,13 +204,17 @@ def run_simulate_command(
         "data_root": str(out_root),
         "hydra_run_dir": str(hydra_run_dir),
         "outputs": {
+            "data_manifest": str(data_manifest_path),
+            "data_summary": str(data_summary_path),
             "manifest": str(manifest_path),
             "summary": str(summary_path),
         },
         "runs": runs,
         "simulation": config.simulation.model_dump(mode="json"),
     }
+    save_metrics_csv(data_manifest_path, runs)
     save_metrics_csv(manifest_path, runs)
+    save_json(data_summary_path, summary)
     save_json(summary_path, summary)
     return summary
 
@@ -739,25 +743,16 @@ def dataset_source_payload(
 ) -> dict[str, Any]:
     if not runs:
         return {"data_root": None, "source": "empty"}
-    if config.paths.data is not None:
+    if config.paths.explicit_split.enabled:
         root = runs[0].data_root
         source = "explicit split"
-    elif config.paths.data_root is not None:
+    else:
         root = config.paths.data_root
         source = "data root"
-    else:
-        root = common_dataset_root(runs)
-        source = "discovered split"
     return {
         "data_root": str(root),
         "source": source,
     }
-
-
-def common_dataset_root(runs: list[DatasetRunPaths]) -> Path:
-    if runs[0].run_id.isdigit() and runs[0].data_root.name == runs[0].run_id:
-        return runs[0].data_root.parent
-    return runs[0].data_root if len(runs) == 1 else runs[0].data_root.parent
 
 
 def generator_config_for_cluster(

@@ -3,6 +3,7 @@ import json
 import logging
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -154,12 +155,29 @@ def test_baseline_config_includes_fpca_and_rejects_duplicate_methods() -> None:
         ApplicationConfig.model_validate(payload)
 
 
+def test_run_config_defaults_infer_prefix_and_keep_paths_explicit() -> None:
+    from trails_simulate.config import ApplicationConfig
+
+    simulate_config = ApplicationConfig.model_validate(compose_payload("simulation=base"))
+    train_config = ApplicationConfig.model_validate(
+        compose_payload("command=train", "paths.data_root=data/simulated/base")
+    )
+
+    assert simulate_config.run.output_root == Path("outputs")
+    assert simulate_config.run.prefix == "base"
+    assert simulate_config.run.name.startswith("base-")
+    assert simulate_config.paths.data_root == Path("data/simulated")
+    assert not simulate_config.paths.explicit_split.enabled
+    assert simulate_config.paths.explicit_split.train_data == Path("data/simulated/train.pt")
+    assert train_config.run.prefix == "base"
+
+
 def test_training_configs_validate() -> None:
     from trails_simulate.config import ApplicationConfig
 
     expected_input = {
         "small": "grud",
-        "base": "mtan2",
+        "base": "grud",
         "large": "grud",
         "mtan": "mtan",
     }
@@ -259,6 +277,8 @@ def test_simulate_command_writes_grid_manifest_and_splits(tmp_path: Path) -> Non
     train_path = scenario_root / "train_6_test_2" / "k2" / "0" / "train.pt"
     test_path = scenario_root / "train_6_test_2" / "k2" / "0" / "test.pt"
     manifest_path = scenario_root / "simulation_manifest.csv"
+    hydra_manifest_path = tmp_path / "run" / "simulation_manifest.csv"
+    hydra_summary_path = tmp_path / "run" / "simulation_summary.json"
 
     assert result["command"] == "simulate"
     assert result["data_root"] == str(scenario_root)
@@ -266,6 +286,10 @@ def test_simulate_command_writes_grid_manifest_and_splits(tmp_path: Path) -> Non
     assert train_path.exists()
     assert test_path.exists()
     assert manifest_path.exists()
+    assert hydra_manifest_path.exists()
+    assert hydra_summary_path.exists()
+    assert result["outputs"]["manifest"] == str(hydra_manifest_path)
+    assert result["outputs"]["data_manifest"] == str(manifest_path)
 
     train_data = ClinicalTimeSeriesDataset.load(train_path)
     test_data = ClinicalTimeSeriesDataset.load(test_path)
@@ -834,7 +858,7 @@ def test_summary_command_plots_scenarioless_train_run_ids(tmp_path: Path) -> Non
     }
 
 
-def test_optim_command_filters_configured_run_id_with_shared_storage(
+def test_optim_command_filters_configured_run_ids_with_shared_storage(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -847,9 +871,24 @@ def test_optim_command_filters_configured_run_id_with_shared_storage(
             self.datetime_start = None
             self.number = number
             self.params: dict[str, Any] = {}
-            self.state = type("TrialState", (), {"name": "COMPLETE"})()
+            self.state = SimpleNamespace(name="RUNNING")
             self.user_attrs: dict[str, Any] = {}
             self.values: list[float] | None = None
+
+        def suggest_categorical(self, name: str, choices: list[Any]) -> Any:
+            value = choices[0]
+            self.params[name] = value
+            return value
+
+        def suggest_float(self, name: str, low: float, high: float, *, log: bool) -> float:
+            del high, log
+            self.params[name] = low
+            return low
+
+        def suggest_int(self, name: str, low: int, high: int) -> int:
+            del high
+            self.params[name] = low
+            return low
 
         def set_user_attr(self, name: str, value: Any) -> None:
             self.user_attrs[name] = value
@@ -861,11 +900,14 @@ def test_optim_command_filters_configured_run_id_with_shared_storage(
             self.study_name = study_name
             self.trials: list[FakeTrial] = []
 
-        def optimize(self, objective: Any, n_trials: int) -> None:
-            for number in range(n_trials):
-                trial = FakeTrial(number)
-                trial.values = list(objective(trial))
-                self.trials.append(trial)
+        def ask(self) -> FakeTrial:
+            trial = FakeTrial(len(self.trials))
+            self.trials.append(trial)
+            return trial
+
+        def tell(self, trial: FakeTrial, *, values: tuple[float, float]) -> None:
+            trial.values = list(values)
+            trial.state = SimpleNamespace(name="COMPLETE")
             self.best_trials = list(self.trials)
 
     class FakeSamplers:
@@ -891,73 +933,98 @@ def test_optim_command_filters_configured_run_id_with_shared_storage(
             "command=optim",
             "optim.n_trials=1",
             f"paths.data_root={data_root}",
-            "optim.run_id=base/train_6_test_2/k3/0",
+            "optim.run_ids=[base/train_6_test_2/k3/0]",
             f"optim.storage={tmp_path / 'shared.db'}",
         )
     )
     fake_optuna = FakeOptuna()
     monkeypatch.setattr(optim, "load_optuna", lambda: fake_optuna)
 
-    def fake_run_optim_trial(trial: FakeTrial, **kwargs: Any) -> tuple[float, float]:
-        trial.set_user_attr("seed", kwargs["seed"])
-        return 0.7, 0.2
+    def fake_run_optim_split_job(job: optim.OptimSplitJob) -> optim.OptimSplitResult:
+        return optim.OptimSplitResult(
+            metrics={"ari": 0.2, "cindex": 0.7},
+            run_id=job.run_paths.run_id,
+            seed=job.seed,
+            split_index=job.split_index,
+            trial_number=job.trial_number,
+        )
 
-    monkeypatch.setattr(optim, "run_optim_trial", fake_run_optim_trial)
+    monkeypatch.setattr(optim, "run_optim_split_job", fake_run_optim_split_job)
 
     result = optim.run_optim_command(app_config, tmp_path / "run", ROOT)
 
-    assert len(result["runs"]) == 1
-    assert result["selection"]["run_id"] == "base/train_6_test_2/k3/0"
+    assert result["selected_run_ids"] == ["base/train_6_test_2/k3/0"]
     assert result["selection"]["source"] == "configured"
-    assert fake_optuna.created[0].study_name == "optim-base-train_6_test_2-k3-0"
+    assert fake_optuna.created[0].study_name == "optim"
     assert fake_optuna.created[0].storage.endswith("shared.db")
-    assert (tmp_path / "run" / "base" / "train_6_test_2" / "k3" / "0" / "trials.csv").exists()
+    assert (tmp_path / "run" / "trials.csv").exists()
     assert (tmp_path / "run" / "optim_summary.json").exists()
+    assert (tmp_path / "run" / "dataset_fingerprint.json").exists()
+    assert (tmp_path / "run" / "figures" / "pareto_front.png").exists()
 
 
-def test_optim_command_interactively_selects_one_split(monkeypatch, tmp_path: Path) -> None:
-    from trails_simulate import optim
-    from trails_simulate.config import ApplicationConfig
-
-    data_root = tmp_path / "data"
-    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
-    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
-    app_config = ApplicationConfig.model_validate(
-        compose_payload("command=optim", "optim.n_trials=1", f"paths.data_root={data_root}")
-    )
-
-    selected: list[str] = []
-
-    def fake_run_optim_dataset(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        run_paths = kwargs["run_paths"]
-        selected.append(run_paths.run_id)
-        run_root = kwargs["run_root"]
-        run_root.mkdir(parents=True, exist_ok=True)
-        return {
-            "n_completed_after": 1,
-            "n_completed_before": 0,
-            "outputs": {"optim_summary": str(run_root / "optim_summary.json")},
-            "run_id": run_paths.run_id,
-        }
-
-    monkeypatch.setattr(optim, "load_optuna", lambda: object())
-    monkeypatch.setattr(optim, "run_optim_dataset", fake_run_optim_dataset)
-    monkeypatch.setattr("builtins.input", lambda _prompt: "2")
-
-    result = optim.run_optim_command(app_config, tmp_path / "run", ROOT)
-
-    assert selected == ["base/train_6_test_2/k3/0"]
-    assert result["selection"]["source"] == "interactive"
-    assert result["selection"]["run_id"] == "base/train_6_test_2/k3/0"
-
-
-def test_optim_command_raises_when_interactive_selection_is_unavailable(
+def test_optim_command_runs_all_splits_and_aggregates_mean_metrics(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     from trails_simulate import optim
     from trails_simulate.config import ApplicationConfig
 
+    class FakeTrial:
+        def __init__(self, number: int) -> None:
+            self.datetime_complete = None
+            self.datetime_start = None
+            self.number = number
+            self.params: dict[str, Any] = {}
+            self.state = SimpleNamespace(name="RUNNING")
+            self.user_attrs: dict[str, Any] = {}
+            self.values: list[float] | None = None
+
+        def suggest_categorical(self, name: str, choices: list[Any]) -> Any:
+            value = choices[0]
+            self.params[name] = value
+            return value
+
+        def suggest_float(self, name: str, low: float, high: float, *, log: bool) -> float:
+            del high, log
+            self.params[name] = low
+            return low
+
+        def suggest_int(self, name: str, low: int, high: int) -> int:
+            del high
+            self.params[name] = low
+            return low
+
+        def set_user_attr(self, name: str, value: Any) -> None:
+            self.user_attrs[name] = value
+
+    class FakeStudy:
+        def __init__(self) -> None:
+            self.best_trials: list[FakeTrial] = []
+            self.study_name = "optim"
+            self.trials: list[FakeTrial] = []
+
+        def ask(self) -> FakeTrial:
+            trial = FakeTrial(len(self.trials))
+            self.trials.append(trial)
+            return trial
+
+        def tell(self, trial: FakeTrial, *, values: tuple[float, float]) -> None:
+            trial.values = list(values)
+            trial.state = SimpleNamespace(name="COMPLETE")
+            self.best_trials = list(self.trials)
+
+    class FakeSamplers:
+        class TPESampler:
+            def __init__(self, *, seed: int) -> None:
+                self.seed = seed
+
+    class FakeOptuna:
+        samplers = FakeSamplers
+
+        def create_study(self, **_kwargs: Any) -> FakeStudy:
+            return FakeStudy()
+
     data_root = tmp_path / "data"
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
@@ -965,11 +1032,256 @@ def test_optim_command_raises_when_interactive_selection_is_unavailable(
         compose_payload("command=optim", "optim.n_trials=1", f"paths.data_root={data_root}")
     )
 
-    monkeypatch.setattr(optim, "load_optuna", lambda: object())
-    monkeypatch.setattr("builtins.input", lambda _prompt: (_ for _ in ()).throw(EOFError()))
+    def fake_run_optim_split_job(job: optim.OptimSplitJob) -> optim.OptimSplitResult:
+        metrics = (
+            {"ari": 0.2, "cindex": 0.8}
+            if "k2" in job.run_paths.run_id
+            else {"ari": 0.4, "cindex": 0.6}
+        )
+        return optim.OptimSplitResult(
+            metrics=metrics,
+            run_id=job.run_paths.run_id,
+            seed=job.seed,
+            split_index=job.split_index,
+            trial_number=job.trial_number,
+        )
 
-    with pytest.raises(ValueError, match="optim.run_id"):
-        optim.run_optim_command(app_config, tmp_path / "run", ROOT)
+    monkeypatch.setattr(optim, "load_optuna", lambda: FakeOptuna())
+    monkeypatch.setattr(optim, "run_optim_split_job", fake_run_optim_split_job)
+
+    result = optim.run_optim_command(app_config, tmp_path / "run", ROOT)
+
+    assert result["selected_run_ids"] == [
+        "base/train_6_test_2/k2/0",
+        "base/train_6_test_2/k3/0",
+    ]
+    assert result["selection"]["source"] == "all"
+    assert result["trials"][0]["values"] == pytest.approx([0.7, 0.3])
+    with (tmp_path / "run" / "trials.csv").open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert float(rows[0]["mean_cindex"]) == pytest.approx(0.7)
+    assert float(rows[0]["mean_ari"]) == pytest.approx(0.3)
+    assert float(rows[0]["std_cindex"]) == pytest.approx(0.1)
+    assert float(rows[0]["std_ari"]) == pytest.approx(0.1)
+    assert float(rows[0]["mean_objective"]) == pytest.approx(0.5)
+
+
+def test_optim_parallel_uses_shared_pool_and_rotates_devices(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from concurrent.futures import Future
+
+    from trails_simulate import optim
+    from trails_simulate.config import ApplicationConfig
+
+    class FakeTrial:
+        def __init__(self, number: int) -> None:
+            self.datetime_complete = None
+            self.datetime_start = None
+            self.number = number
+            self.params: dict[str, Any] = {}
+            self.state = SimpleNamespace(name="RUNNING")
+            self.user_attrs: dict[str, Any] = {}
+            self.values: list[float] | None = None
+
+        def suggest_categorical(self, name: str, choices: list[Any]) -> Any:
+            value = choices[0]
+            self.params[name] = value
+            return value
+
+        def suggest_float(self, name: str, low: float, high: float, *, log: bool) -> float:
+            del high, log
+            self.params[name] = low
+            return low
+
+        def suggest_int(self, name: str, low: int, high: int) -> int:
+            del high
+            self.params[name] = low
+            return low
+
+        def set_user_attr(self, name: str, value: Any) -> None:
+            self.user_attrs[name] = value
+
+    class FakeStudy:
+        def __init__(self) -> None:
+            self.best_trials: list[FakeTrial] = []
+            self.study_name = "optim"
+            self.trials: list[FakeTrial] = []
+
+        def ask(self) -> FakeTrial:
+            trial = FakeTrial(len(self.trials))
+            self.trials.append(trial)
+            return trial
+
+        def tell(self, trial: FakeTrial, *, values: tuple[float, float]) -> None:
+            trial.values = list(values)
+            trial.state = SimpleNamespace(name="COMPLETE")
+            self.best_trials = list(self.trials)
+
+    class FakeSamplers:
+        class TPESampler:
+            def __init__(self, *, seed: int) -> None:
+                self.seed = seed
+
+    class FakeOptuna:
+        samplers = FakeSamplers
+
+        def create_study(self, **_kwargs: Any) -> FakeStudy:
+            return FakeStudy()
+
+    data_root = tmp_path / "data"
+    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
+    write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
+    app_config = ApplicationConfig.model_validate(
+        compose_payload(
+            "command=optim",
+            "optim.n_trials=2",
+            f"paths.data_root={data_root}",
+            "optim.parallel.workers=2",
+            "optim.parallel.max_active_trials=2",
+            "optim.parallel.devices=[cuda:0,cuda:1]",
+        )
+    )
+    seen_max_workers: list[int] = []
+    submitted_devices: list[str] = []
+    submitted_trials: list[int] = []
+
+    class FakeExecutor:
+        def __init__(self, max_workers: int, **_kwargs: Any) -> None:
+            seen_max_workers.append(max_workers)
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def submit(self, fn: Any, job: optim.OptimSplitJob) -> Future[Any]:
+            submitted_devices.append(job.device)
+            submitted_trials.append(job.trial_number)
+            future: Future[Any] = Future()
+            try:
+                future.set_result(fn(job))
+            except Exception as error:
+                future.set_exception(error)
+            return future
+
+    def fake_run_optim_split_job(job: optim.OptimSplitJob) -> optim.OptimSplitResult:
+        return optim.OptimSplitResult(
+            metrics={"ari": 0.2, "cindex": 0.7},
+            run_id=job.run_paths.run_id,
+            seed=job.seed,
+            split_index=job.split_index,
+            trial_number=job.trial_number,
+        )
+
+    monkeypatch.setattr(optim, "load_optuna", lambda: FakeOptuna())
+    monkeypatch.setattr(optim, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(optim, "run_optim_split_job", fake_run_optim_split_job)
+
+    result = optim.run_optim_command(app_config, tmp_path / "run", ROOT)
+
+    assert seen_max_workers == [2]
+    assert len(submitted_devices) == 4
+    assert submitted_devices == ["cuda:0", "cuda:1", "cuda:0", "cuda:1"]
+    assert sorted(set(submitted_trials)) == [0, 1]
+    assert result["completed_after"] == 2
+
+
+def test_optim_resume_rejects_changed_dataset_fingerprint(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from trails_simulate import optim
+    from trails_simulate.config import ApplicationConfig
+
+    class FakeTrial:
+        def __init__(self, number: int) -> None:
+            self.datetime_complete = None
+            self.datetime_start = None
+            self.number = number
+            self.params: dict[str, Any] = {}
+            self.state = SimpleNamespace(name="RUNNING")
+            self.user_attrs: dict[str, Any] = {}
+            self.values: list[float] | None = None
+
+        def suggest_categorical(self, name: str, choices: list[Any]) -> Any:
+            value = choices[0]
+            self.params[name] = value
+            return value
+
+        def suggest_float(self, name: str, low: float, high: float, *, log: bool) -> float:
+            del high, log
+            self.params[name] = low
+            return low
+
+        def suggest_int(self, name: str, low: int, high: int) -> int:
+            del high
+            self.params[name] = low
+            return low
+
+        def set_user_attr(self, name: str, value: Any) -> None:
+            self.user_attrs[name] = value
+
+    class FakeStudy:
+        def __init__(self) -> None:
+            self.best_trials: list[FakeTrial] = []
+            self.study_name = "optim"
+            self.trials: list[FakeTrial] = []
+
+        def ask(self) -> FakeTrial:
+            trial = FakeTrial(len(self.trials))
+            self.trials.append(trial)
+            return trial
+
+        def tell(self, trial: FakeTrial, *, values: tuple[float, float]) -> None:
+            trial.values = list(values)
+            trial.state = SimpleNamespace(name="COMPLETE")
+            self.best_trials = list(self.trials)
+
+    class FakeSamplers:
+        class TPESampler:
+            def __init__(self, *, seed: int) -> None:
+                self.seed = seed
+
+    class FakeOptuna:
+        samplers = FakeSamplers
+
+        def create_study(self, **_kwargs: Any) -> FakeStudy:
+            return FakeStudy()
+
+    data_root = tmp_path / "data"
+    split_root = data_root / "base" / "train_6_test_2" / "k2" / "0"
+    write_synthetic_split(split_root, n_clusters=2, seed=43)
+    app_config = ApplicationConfig.model_validate(
+        compose_payload("command=optim", "optim.n_trials=1", f"paths.data_root={data_root}")
+    )
+
+    def fake_run_optim_split_job(job: optim.OptimSplitJob) -> optim.OptimSplitResult:
+        return optim.OptimSplitResult(
+            metrics={"ari": 0.2, "cindex": 0.7},
+            run_id=job.run_paths.run_id,
+            seed=job.seed,
+            split_index=job.split_index,
+            trial_number=job.trial_number,
+        )
+
+    monkeypatch.setattr(optim, "load_optuna", lambda: FakeOptuna())
+    monkeypatch.setattr(optim, "run_optim_split_job", fake_run_optim_split_job)
+    optim.run_optim_command(app_config, tmp_path / "run", ROOT)
+
+    write_synthetic_split(split_root, n_clusters=2, seed=99)
+    resume_config = ApplicationConfig.model_validate(
+        compose_payload(
+            "command=optim",
+            "optim.n_trials=1",
+            "optim.resume=true",
+            f"paths.data_root={data_root}",
+        )
+    )
+    with pytest.raises(ValueError, match="fingerprint"):
+        optim.run_optim_command(resume_config, tmp_path / "run", ROOT)
 
 
 def test_paths_reject_removed_validation_data_field() -> None:

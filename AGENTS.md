@@ -46,7 +46,7 @@ clean reusable method library.
 - Train with mTAN-style input: `uv run main.py command=train training=mtan paths.data_root=data/simulated/base`
 - Run lightweight baselines on existing splits: `uv run main.py command=baseline paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run main.py command=optim paths.data_root=data/simulated/base`
-- Summarize train and baseline results: `uv run main.py command=summary 'summary.train_roots=[outputs/train-base,outputs/train-mtan]' 'summary.baseline_roots=[outputs/baseline-kmeans,outputs/baseline-fpca]' 'summary.train_labels=[base,mtan]' 'summary.baseline_labels=[kmeans,fpca]'`
+- Summarize train and baseline results: `uv run main.py command=summary 'summary.train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'summary.baseline_roots=[outputs/baseline/base-...]' 'summary.train_labels=[base,mtan]' 'summary.baseline_labels=[kmeans]'`
 - Format: `uv run ruff format`
 - Lint: `uv run ruff check --fix`
 - Type check: `UV_CACHE_DIR=/tmp/uv-cache uv run pyright`
@@ -81,12 +81,12 @@ clean reusable method library.
   the other four are paper simulation scenes.
 - Training model presets live under `configs/training/`: `small`, `base`,
   `large`, and `mtan`. Training scene selection comes from `paths.data_root` or
-  explicit `paths.data` plus `paths.test_data`, not from simulation config.
+  `paths.explicit_split`, not from simulation config.
 - `training.trainer.batch_size: null` means the trainer resolves batch size from
   the loaded training split size using a conservative automatic rule; explicit
   integer overrides keep their exact value.
 - Command-level config namespaces are `simulation`, `training`, `baseline`,
-  `optim`, `summary`, and shared `paths`; generator parameters live under
+  `optim`, `summary`, shared `paths`, and shared `run`; generator parameters live under
   `simulation.generator`, while TRAILS model/trainer/artifacts/diagnostics/SwanLab
   parameters live under `training`.
 - `simulation.train_size` and `simulation.test_size` are equal-length lists that
@@ -107,9 +107,13 @@ clean reusable method library.
 - Validation data is cut internally from `train.pt` by `training.trainer.valid_size`, is
   not saved as a separate `val.pt`, and is used for early stopping; if no validation
   split is requested, early stopping monitors the training metric instead.
-- Hydra outputs go under `outputs/` by default and are ignored by git. Command run
-  directories are named `command-<timestamp>`. Train, baseline, and optim outputs
-  mirror the relative data split path discovered under `paths.data_root`.
+- Hydra metadata and command outputs go under one run directory by default:
+  `outputs/<command>/<run.name>`. `run.output_root` defaults to `outputs`,
+  `run.prefix` defaults to the simulation scenario for `simulate`, the final
+  `paths.data_root` component for `train`/`baseline`/`optim`, and `summary` for
+  summaries. `paths` controls data locations only; do not use it to name output
+  runs. Train, baseline, and optim outputs mirror the relative data split path
+  discovered under `paths.data_root`.
 - Simulation uses a VaDeSC-EHR-style latent-cluster generator adapted to
   continuous asynchronous clinical measurements.
 - Simulation outputs a `ClinicalTimeSeriesDataset` saved via `torch.save`.
@@ -159,9 +163,12 @@ clean reusable method library.
   comparators on existing train/test splits: summary-feature k-means and
   risk-stratified summary-feature k-means, plus FPCA-KMeans via `scikit-fda`. It
   writes baseline summary JSON and metrics CSV under the Hydra run directory.
-- `command=optim` recursively discovers existing train/test splits but runs only
-  one split per invocation. Use `optim.run_id` for reproducible batch execution;
-  otherwise the command interactively lists discovered split numbers for selection.
+- `command=optim` recursively discovers existing train/test splits and optimizes
+  one shared hyperparameter trial over all selected splits by averaging C-index
+  and ARI. Use `optim.run_ids` to select a subset; an empty list means all splits.
+  `optim.parallel` controls the shared process pool across trial/split jobs.
+  Use `optim.resume=true run.name=<existing-run-name>` to append trials to an
+  existing study; dataset fingerprints are checked before resume.
 - `command=summary` accepts any number of train and baseline Hydra run directories
   via `summary.train_roots` and `summary.baseline_roots`, adds source-aware
   method labels when repeated method names appear across roots, aggregates by

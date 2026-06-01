@@ -72,7 +72,7 @@ uv run main.py command=simulate simulation=base paths.data_root=data/simulated
 输出路径为
 `<data_root>/<simulation.name>/train_<train>_test_<test>/k<K>/<repeat>/train.pt`
 和对应 `test.pt`，并在场景目录下写出 `simulation_manifest.csv` 与
-`simulation_summary.json`。
+`simulation_summary.json`；同一份 manifest/summary 也会写入本次 Hydra run 目录。
 
 训练已有的 train/test split：
 
@@ -84,7 +84,7 @@ uv run main.py command=train training=mtan paths.data_root=data/simulated/high_d
 训练显式指定的 train/test `.pt` 数据：
 
 ```bash
-uv run main.py command=train training=small paths.data=data/simulated/base/train_500_test_300/k2/0/train.pt paths.test_data=data/simulated/base/train_500_test_300/k2/0/test.pt
+uv run main.py command=train training=small paths.explicit_split.enabled=true paths.explicit_split.train_data=data/simulated/base/train_500_test_300/k2/0/train.pt paths.explicit_split.test_data=data/simulated/base/train_500_test_300/k2/0/test.pt
 ```
 
 对已有 train/test split 运行轻量基线方法：
@@ -97,25 +97,30 @@ uv run main.py command=baseline paths.data_root=data/simulated/base
 
 ```bash
 uv run main.py command=optim paths.data_root=data/simulated/base optim.n_trials=20
-uv run main.py command=optim paths.data_root=data/simulated/base optim.run_id=base/train_500_test_300/k2/0 optim.n_trials=20
+uv run main.py command=optim paths.data_root=data/simulated/base 'optim.run_ids=[base/train_500_test_300/k2/0]' optim.n_trials=20
+uv run main.py command=optim paths.data_root=data/simulated/base run.name=base-optim-round1 optim.n_trials=20
+uv run main.py command=optim paths.data_root=data/simulated/base run.name=base-optim-round1 optim.resume=true optim.n_trials=20
 ```
 
 合并训练与基线结果并生成图表：
 
 ```bash
-uv run main.py command=summary 'summary.train_roots=[outputs/train-base,outputs/train-mtan]' 'summary.baseline_roots=[outputs/baseline-kmeans,outputs/baseline-fpca]' 'summary.train_labels=[base,mtan]' 'summary.baseline_labels=[kmeans,fpca]'
+uv run main.py command=summary 'summary.train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'summary.baseline_roots=[outputs/baseline/base-...]' 'summary.train_labels=[base,mtan]' 'summary.baseline_labels=[kmeans]'
 ```
 
 单次运行也使用列表形式：
 
 ```bash
-uv run main.py command=summary 'summary.train_roots=[outputs/train-...]' 'summary.baseline_roots=[outputs/baseline-...]'
+uv run main.py command=summary 'summary.train_roots=[outputs/train/base-...]' 'summary.baseline_roots=[outputs/baseline/base-...]'
 ```
 
 `command=train`、`command=baseline` 和 `command=optim` 都会递归扫描
 `paths.data_root` 下所有 sibling `train.pt`/`test.pt` 目录；也可以用
-`paths.data + paths.test_data` 显式指定单个 split。输出会镜像数据相对路径，例如
-`outputs/.../train_500_test_300/k2/0/trails.pt`。训练和基线会优先从 dataset metadata
+`paths.explicit_split.enabled=true` 加 `paths.explicit_split.train_data/test_data`
+显式指定单个 split。Hydra 元数据和命令输出保存在同一 run 目录，默认形如
+`outputs/<command>/<run.name>/`；`run.prefix` 默认使用 scenario，`run.name`
+默认是 `<run.prefix>-<timestamp>`，也可以手动覆盖。输出会镜像数据相对路径，例如
+`outputs/train/base-.../train_500_test_300/k2/0/trails.pt`。训练和基线会优先从 dataset metadata
 中的 `generation_params.n_clusters` 推断 K，metadata 缺失时才回退到 YAML 默认值。
 
 `command=train` 会在每个 split 开始和结束时打印已耗时与剩余时间估计，并在
@@ -123,9 +128,12 @@ Hydra run 目录下保存 `train_summary.json`、`train_metrics.csv`
 和 `<run_id>/trails.pt`。`command=baseline` 会保存
 `baseline_summary.json`、`baseline_metrics.csv` 和
 `<run_id>/<method>.pt`，用于比较 summary-feature KMeans、risk-stratified
-summary-feature KMeans 和 FPCA-KMeans。`command=optim` 一次只对一个数据 split
-创建 study；当 `paths.data_root` 下有多个 split 且未提供 `optim.run_id` 时，会在终端
-列出编号让用户选择一个。`command=summary` 读取显式 train/baseline run 目录下的
+summary-feature KMeans 和 FPCA-KMeans。`command=optim` 会对所有选中 split
+共享同一组超参数 trial，并以平均 C-index 与平均 ARI 作为多目标；`optim.run_ids`
+为空表示使用全部 split，非空时只选择指定 split。`optim.parallel` 提供共享进程池，
+`optim.resume=true run.name=<已有运行名>` 会在数据 fingerprint 一致时继续追加 trials。
+每次 optim 会写出 `trials.csv`、`pareto_trials.json`、`top_trials.csv` 和 `figures/`
+下的 Pareto、目标历史、split heatmap 等图表。`command=summary` 读取显式 train/baseline run 目录下的
 metrics CSV，保存合并 CSV、聚合 CSV、summary JSON，并为每个 simulation scenario
 生成一张按 `metrics × K` 排布的带误差条总图 PNG/PDF。
 

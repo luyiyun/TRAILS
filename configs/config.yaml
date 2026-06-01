@@ -8,18 +8,23 @@ defaults:
 
 command: simulate
 
+run:
+  output_root: outputs
+  prefix: ${trails_run_prefix:${command},${simulation.name},${paths.data_root}}
+  name: ${run.prefix}-${now:%Y%m%d-%H%M%S-%f}
+
 paths:
-  data_root: null
-  data: null
-  test_data: null
-  train_root: null
-  save_name: ${command}
+  data_root: data/simulated
+  explicit_split:
+    enabled: false
+    train_data: data/simulated/train.pt
+    test_data: data/simulated/test.pt
 
 hydra:
   job:
     chdir: false
   run:
-    dir: outputs/${paths.save_name}-${now:%Y%m%d-%H%M%S-%f}
+    dir: ${run.output_root}/${command}/${run.name}
   sweep:
-    dir: multirun/${paths.save_name}-${now:%Y%m%d-%H%M%S-%f}
+    dir: ${run.output_root}/multirun/${command}/${run.name}
     subdir: ${hydra.job.num}
