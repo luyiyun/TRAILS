@@ -110,9 +110,10 @@ def run_simulate_command(
             "command=simulate writes split data under paths.data_root, not paths.explicit_split."
         )
 
-    out_root = data_root(config, hydra_run_dir, project_root) / config.simulation.name
-    data_manifest_path = out_root / "simulation_manifest.csv"
-    data_summary_path = out_root / "simulation_summary.json"
+    out_root = hydra_run_dir
+    # out_root = data_root(config, hydra_run_dir, project_root) / config.simulation.name
+    # data_manifest_path = out_root / "simulation_manifest.csv"
+    # data_summary_path = out_root / "simulation_summary.json"
     manifest_path = hydra_run_dir / "simulation_manifest.csv"
     summary_path = hydra_run_dir / "simulation_summary.json"
     runs: list[dict[str, Any]] = []
