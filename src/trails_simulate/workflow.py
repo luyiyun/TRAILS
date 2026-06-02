@@ -27,7 +27,7 @@ from .path import (
     DatasetRunPaths,
     TrainPaths,
     checkpoint_path_for_run,
-    data_root,
+    # data_root,
     discover_dataset_runs,
 )
 from .result_summary import run_summary_command
@@ -202,17 +202,17 @@ def run_simulate_command(
         "data_root": str(out_root),
         "hydra_run_dir": str(hydra_run_dir),
         "outputs": {
-            "data_manifest": str(data_manifest_path),
-            "data_summary": str(data_summary_path),
+            # "data_manifest": str(data_manifest_path),
+            # "data_summary": str(data_summary_path),
             "manifest": str(manifest_path),
             "summary": str(summary_path),
         },
         "runs": runs,
         "simulation": config.simulation.model_dump(mode="json"),
     }
-    save_metrics_csv(data_manifest_path, runs)
+    # save_metrics_csv(data_manifest_path, runs)
     save_metrics_csv(manifest_path, runs)
-    save_json(data_summary_path, summary)
+    # save_json(data_summary_path, summary)
     save_json(summary_path, summary)
     return summary
 
