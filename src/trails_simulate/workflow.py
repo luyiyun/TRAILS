@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
@@ -9,11 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from tqdm import tqdm
-
 from trails.artifacts import save_json
 from trails.data import ClinicalTimeSeriesDataset
-from trails.progress import configure_tqdm_lock, configure_tqdm_logging, progress_context
+from trails.progress import ProgressBar, ProgressManager
 
 from .baselines import make_baseline
 from .config import ApplicationConfig
@@ -125,7 +122,7 @@ def run_simulate_command(
         * len(config.simulation.train_size)
         * config.simulation.repeats
     )
-    iter_bar = tqdm(desc="Simulation", total=n_iter)
+    iter_bar = ProgressBar(desc="Simulation", total=n_iter)
 
     for cluster_index, n_clusters in enumerate(config.simulation.generator.n_clusters_tuple_):
         generator_config = generator_config_for_cluster(
@@ -263,16 +260,8 @@ def run_train_jobs(
     completed_durations: list[float] = []
     results: list[TrainRunResult] = []
 
-    if workers > 1:
-        context = mp.get_context("spawn")
-        tqdm_lock = context.RLock()
-        configure_tqdm_lock(tqdm_lock)
-    else:
-        context = None
-        tqdm_lock = None
-
-    with tqdm(desc="Train splits", total=len(runs), position=0) as run_bar:
-        if workers == 1:
+    if workers == 1:
+        with ProgressBar(desc="Train splits", total=len(runs)) as run_bar:
             for index, run_paths in enumerate(runs):
                 job = build_train_run_job(
                     config,
@@ -293,23 +282,22 @@ def run_train_jobs(
                     run_bar=run_bar,
                     total_runs=len(runs),
                 )
-        else:
-            assert context is not None
-            assert tqdm_lock is not None
-            results.extend(
-                run_train_jobs_parallel(
-                    config,
-                    runs,
-                    hydra_run_dir=hydra_run_dir,
-                    project_root=project_root,
-                    workers=workers,
-                    command_started_at=command_started_at,
-                    completed_durations=completed_durations,
-                    run_bar=run_bar,
-                    mp_context=context,
-                    tqdm_lock=tqdm_lock,
+    else:
+        with ProgressManager(workers=workers) as progress_manager:
+            with ProgressBar(desc="Train splits", total=len(runs)) as run_bar:
+                results.extend(
+                    run_train_jobs_parallel(
+                        config,
+                        runs,
+                        hydra_run_dir=hydra_run_dir,
+                        project_root=project_root,
+                        workers=workers,
+                        command_started_at=command_started_at,
+                        completed_durations=completed_durations,
+                        run_bar=run_bar,
+                        progress_manager=progress_manager,
+                    )
                 )
-            )
 
     return sorted(results, key=lambda result: result.index)
 
@@ -323,9 +311,8 @@ def run_train_jobs_parallel(
     workers: int,
     command_started_at: float,
     completed_durations: list[float],
-    run_bar: tqdm[Any],
-    mp_context: Any,
-    tqdm_lock: Any,
+    run_bar: ProgressBar[Any],
+    progress_manager: ProgressManager,
 ) -> list[TrainRunResult]:
     results: list[TrainRunResult] = []
     next_index = 0
@@ -351,9 +338,9 @@ def run_train_jobs_parallel(
 
     with ProcessPoolExecutor(
         max_workers=workers,
-        mp_context=mp_context,
-        initializer=initialize_train_worker,
-        initargs=(tqdm_lock,),
+        mp_context=progress_manager.mp_context,
+        initializer=ProgressManager.initialize_worker,
+        initargs=progress_manager.worker_initargs(),
     ) as executor:
         for worker_slot in range(workers):
             submit_next(executor, worker_slot)
@@ -380,11 +367,6 @@ def run_train_jobs_parallel(
                 submit_next(executor, job.worker_slot)
 
     return results
-
-
-def initialize_train_worker(tqdm_lock: Any) -> None:
-    configure_tqdm_lock(tqdm_lock)
-    configure_tqdm_logging()
 
 
 def build_train_run_job(
@@ -428,11 +410,10 @@ def run_train_split_job(job: TrainRunJob) -> TrainRunResult:
             n_runs=job.total_runs,
         ),
     )
-    with progress_context(
-        outer_position=worker_outer_position(job.worker_slot),
-        inner_position=worker_inner_position(job.worker_slot),
-        leave=False,
+    with ProgressManager.worker_scope(
+        worker_slot=job.worker_slot,
         description_prefix=short_run_label(job.run_paths.run_id),
+        leave=False,
     ):
         train_result = fit_training_run(
             run_config,
@@ -475,7 +456,7 @@ def record_train_result(
     command_started_at: float,
     completed_durations: list[float],
     results: list[TrainRunResult],
-    run_bar: tqdm[Any],
+    run_bar: ProgressBar[Any],
     total_runs: int,
 ) -> None:
     completed_durations.append(result.duration_seconds)
@@ -547,14 +528,6 @@ def configure_torch_threads(torch_threads: int | None) -> None:
     torch.set_num_threads(torch_threads)
 
 
-def worker_outer_position(worker_slot: int) -> int:
-    return 1 + worker_slot * 2
-
-
-def worker_inner_position(worker_slot: int) -> int:
-    return worker_outer_position(worker_slot) + 1
-
-
 def short_run_label(run_id: str) -> str:
     parts = Path(run_id).parts
     label = "/".join(parts[-3:])
@@ -572,7 +545,7 @@ def run_baseline_command(
     metric_rows: list[dict[str, Any]] = []
     run_payloads: list[dict[str, Any]] = []
 
-    iter_bar = tqdm(desc="Baseline", total=len(runs) * len(config.baseline.methods))
+    iter_bar = ProgressBar(desc="Baseline", total=len(runs) * len(config.baseline.methods))
 
     for index, run_paths in enumerate(runs):
         seed = config.training.trainer.seed + index

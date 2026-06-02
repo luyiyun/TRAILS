@@ -66,6 +66,8 @@ clean reusable method library.
   不要给显而易见的赋值或样板代码写流水账式注释。
 - 如果一段代码只在局部流程中使用一次，不需要为了形式拆成额外函数；在相关
   内容附近添加简洁中文注释说明意图即可。
+- 对于较为复杂的基础设施逻辑（例如多进程进度条），优先使用内聚的面向对象
+  封装，避免将状态、上下文和协调逻辑分散在多个松散 helper 中。
 - Avoid `try/except` unless the code can recover or add useful diagnostics.
 - Add or update tests for every substantial behavior change.
 - Update this file when architecture decisions change.

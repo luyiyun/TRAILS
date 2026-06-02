@@ -18,7 +18,7 @@ from .metrics import (
     cluster_assignment_diagnostics,
 )
 from .model import TrailsLossBreakdown, TrailsModelOutput, TrailsSurvVaderModel
-from .progress import progress_bar
+from .progress import ProgressBar
 
 
 class HistoryEntry(TypedDict):
@@ -137,11 +137,7 @@ class TrailsTrainer:
         history: list[HistoryEntry] = []
 
         if self.config.warmup_epochs > 0:
-            for epoch in progress_bar(
-                range(self.config.warmup_epochs),
-                desc="Warmup",
-                level="outer",
-            ):
+            for epoch in ProgressBar(range(self.config.warmup_epochs), desc="Warmup", leave=False):
                 losses, scores = self._epoch_loop(loader, phase="train", include_vade_kl=False)
                 entry: HistoryEntry = {  # type: ignore
                     "epoch": epoch + 1,
@@ -184,7 +180,7 @@ class TrailsTrainer:
         else:
             early_stopper = None
 
-        for epoch in progress_bar(range(self.config.max_epochs), desc="Epoch", level="outer"):
+        for epoch in ProgressBar(range(self.config.max_epochs), desc="Epoch", leave=False):
             losses, scores = self._epoch_loop(
                 loader,
                 phase="train",
@@ -306,7 +302,7 @@ class TrailsTrainer:
             self.model.eval()
 
         with torch.set_grad_enabled(phase == "train"):
-            for batch in progress_bar(loader, desc=phase.capitalize(), level="inner"):
+            for batch in ProgressBar(loader, desc=phase.capitalize(), leave=False):
                 device_batch = self._move_batch(batch)
                 output = self._model_output(device_batch)
                 loss = self.model.compute_loss(

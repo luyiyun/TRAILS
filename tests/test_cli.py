@@ -596,36 +596,211 @@ def test_resolve_batch_size_uses_logging(caplog) -> None:
     assert "Resolving batch size to 8" in caplog.text
 
 
-def test_progress_context_assigns_tqdm_positions(monkeypatch) -> None:
+def install_fake_tqdm(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[Any]]:
     from trails import progress
 
-    calls: list[dict[str, Any]] = []
+    bars: list[Any] = []
 
     class FakeTqdm:
-        def __init__(self, iterable: Any, **kwargs: Any) -> None:
-            self.iterable = iterable
-            calls.append(kwargs)
+        def __init__(self, iterable: Any = None, **kwargs: Any) -> None:
+            self.iterable = [] if iterable is None else iterable
+            self.kwargs = kwargs
+            self.updates: list[int | float] = []
+            self.postfixes: list[dict[str, Any]] = []
+            self.closed = False
+            self.entered = False
+            bars.append(self)
 
         def __iter__(self) -> Any:
             return iter(self.iterable)
 
-    monkeypatch.setattr(progress, "tqdm", FakeTqdm)
+        def __enter__(self) -> "FakeTqdm":
+            self.entered = True
+            return self
 
-    with progress.progress_context(
-        outer_position=3,
-        inner_position=4,
-        leave=False,
+        def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+            self.closed = True
+
+        def update(self, n: int | float = 1) -> bool:
+            self.updates.append(n)
+            return True
+
+        def set_postfix(
+            self,
+            ordered_dict: Any = None,
+            refresh: bool = True,
+            **kwargs: Any,
+        ) -> None:
+            self.postfixes.append({"ordered_dict": ordered_dict, "refresh": refresh, **kwargs})
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(progress, "tqdm", FakeTqdm)
+    return progress, bars
+
+
+def test_progress_bar_infers_nested_positions(monkeypatch: pytest.MonkeyPatch) -> None:
+    progress, bars = install_fake_tqdm(monkeypatch)
+
+    for _epoch in progress.ProgressBar(range(1), desc="Epoch"):
+        list(progress.ProgressBar(range(1), desc="Train"))
+
+    assert bars[0].kwargs["position"] == 0
+    assert bars[0].kwargs["leave"] is True
+    assert bars[0].kwargs["desc"] == "Epoch"
+    assert bars[1].kwargs["position"] == 1
+    assert bars[1].kwargs["leave"] is False
+    assert bars[1].kwargs["desc"] == "Train"
+
+
+def test_progress_manager_worker_scope_assigns_depth_grid_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress, bars = install_fake_tqdm(monkeypatch)
+
+    with progress.ProgressManager.worker_scope(
+        worker_slot=1,
+        workers=2,
         description_prefix="run-a",
     ):
-        list(progress.progress_bar(range(1), desc="Epoch", level="outer"))
-        list(progress.progress_bar(range(1), desc="Train", level="inner"))
+        for _epoch in progress.ProgressBar(range(1), desc="Epoch"):
+            list(progress.ProgressBar(range(1), desc="Train"))
 
-    assert calls[0]["position"] == 3
-    assert calls[0]["leave"] is False
-    assert calls[0]["desc"] == "run-a Epoch"
-    assert calls[1]["position"] == 4
-    assert calls[1]["leave"] is False
-    assert calls[1]["desc"] == "run-a Train"
+    assert bars[0].kwargs["position"] == 2
+    assert bars[0].kwargs["leave"] is False
+    assert bars[0].kwargs["desc"] == "run-a Epoch"
+    assert bars[1].kwargs["position"] == 4
+    assert bars[1].kwargs["leave"] is False
+    assert bars[1].kwargs["desc"] == "run-a Train"
+
+
+def test_progress_bar_supports_manual_context_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress, bars = install_fake_tqdm(monkeypatch)
+
+    with progress.ProgressBar(desc="Train splits", total=2) as bar:
+        bar.update()
+        bar.set_postfix(completed="1/2")
+
+    assert bars[0].kwargs["position"] == 0
+    assert bars[0].kwargs["leave"] is True
+    assert bars[0].kwargs["desc"] == "Train splits"
+    assert bars[0].kwargs["total"] == 2
+    assert bars[0].entered is True
+    assert bars[0].closed is True
+    assert bars[0].updates == [1]
+    assert bars[0].postfixes == [{"ordered_dict": None, "refresh": True, "completed": "1/2"}]
+
+
+def test_progress_logging_shortens_info_to_single_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from os import terminal_size
+
+    from trails import progress
+
+    messages: list[str] = []
+    monkeypatch.setattr(progress.tqdm, "write", messages.append)
+    monkeypatch.setattr(
+        progress.shutil,
+        "get_terminal_size",
+        lambda fallback: terminal_size((48, 20)),
+    )
+    handler = progress.TqdmLoggingHandler()
+    handler.setFormatter(progress.CompactTqdmFormatter("%(levelname)s:%(name)s:%(message)s"))
+    record = logging.LogRecord(
+        "tests.progress",
+        logging.INFO,
+        __file__,
+        1,
+        "Completed train run:\n%s",
+        ("metric=value " * 20,),
+        None,
+    )
+
+    handler.emit(record)
+
+    assert len(messages) == 1
+    assert "\n" not in messages[0]
+    assert len(messages[0]) <= 47
+    assert messages[0].endswith("...")
+
+
+def test_progress_logging_prefixes_worker_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trails import progress
+
+    messages: list[str] = []
+    monkeypatch.setattr(progress.tqdm, "write", messages.append)
+    root_logger = logging.getLogger()
+    original_handlers = list(root_logger.handlers)
+    original_level = root_logger.level
+    try:
+        configure_logger = progress.configure_tqdm_logging
+        configure_logger()
+        with progress.ProgressManager.worker_scope(
+            worker_slot=0,
+            workers=1,
+            description_prefix="run-a",
+        ):
+            logging.getLogger("tests.progress").info("Resolving\nbatch size to %s", 128)
+    finally:
+        root_logger.handlers[:] = original_handlers
+        root_logger.setLevel(original_level)
+        logging.captureWarnings(False)
+
+    assert messages == ["run-a Resolving batch size to 128"]
+
+
+def test_progress_manager_worker_initargs_include_log_queue() -> None:
+    from trails import progress
+
+    with progress.ProgressManager(workers=2) as manager:
+        tqdm_lock, workers, log_queue = manager.worker_initargs()
+
+    assert tqdm_lock is not None
+    assert workers == 2
+    assert log_queue is not None
+
+
+def test_progress_manager_initialize_worker_uses_queue_logging() -> None:
+    import logging.handlers
+    import queue
+
+    from trails import progress
+
+    log_queue: queue.Queue[Any] = queue.Queue()
+    root_logger = logging.getLogger()
+    original_handlers = list(root_logger.handlers)
+    original_level = root_logger.level
+    try:
+        progress.ProgressManager.initialize_worker(progress.tqdm.get_lock(), 2, log_queue)
+        handlers = list(root_logger.handlers)
+
+        assert any(isinstance(handler, logging.handlers.QueueHandler) for handler in handlers)
+        assert not any(isinstance(handler, progress.TqdmLoggingHandler) for handler in handlers)
+        assert not any(
+            isinstance(handler, logging.StreamHandler)
+            and not isinstance(handler, logging.FileHandler)
+            for handler in handlers
+        )
+
+        with progress.ProgressManager.worker_scope(
+            worker_slot=1,
+            description_prefix="run-b",
+        ):
+            logging.getLogger("tests.progress.worker").info("hello")
+        record = log_queue.get_nowait()
+    finally:
+        root_logger.handlers[:] = original_handlers
+        root_logger.setLevel(original_level)
+        logging.captureWarnings(False)
+
+    assert record.progress_description_prefix == "run-b"
+    assert record.getMessage() == "hello"
 
 
 def test_progress_logging_suppresses_nested_tensor_warning() -> None:
