@@ -4,7 +4,6 @@ import csv
 import hashlib
 import logging
 import math
-import multiprocessing as mp
 from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -16,6 +15,7 @@ import matplotlib
 
 from trails.artifacts import save_json
 from trails.data import ClinicalTimeSeriesDataset
+from trails.progress import ProgressBar, ProgressManager
 
 from .config import (
     OPTIM_PARAM_NAMES,
@@ -41,6 +41,7 @@ class OptimSplitJob:
     split_index: int
     total_splits: int
     trial_number: int
+    worker_slot: int
 
 
 @dataclass(frozen=True)
@@ -54,9 +55,21 @@ class OptimSplitResult:
 
 @dataclass
 class ActiveOptimTrial:
+    config: ApplicationConfig
     trial: Any
     results: list[OptimSplitResult] = field(default_factory=list)
     futures: set[Future[OptimSplitResult]] = field(default_factory=set)
+    next_split_index: int = 0
+    task_offset: int = 0
+
+
+@dataclass
+class OptimProgress:
+    run_bar: ProgressBar[Any]
+    total_split_jobs: int
+    total_trials: int
+    completed_split_jobs: int = 0
+    completed_trials: int = 0
 
 
 def run_optim_command(
@@ -181,65 +194,136 @@ def run_optim_study(
     selected_runs: Sequence[DatasetRunPaths],
     optim_root: Path,
 ) -> None:
+    total_split_jobs = config.optim.n_trials * len(selected_runs)
     if config.optim.parallel.workers == 1:
-        run_optim_study_serial(
-            study, config=config, selected_runs=selected_runs, optim_root=optim_root
-        )
+        with ProgressBar(desc="Optim splits", total=total_split_jobs) as run_bar:
+            progress = OptimProgress(
+                run_bar=run_bar,
+                total_split_jobs=total_split_jobs,
+                total_trials=config.optim.n_trials,
+            )
+            run_optim_study_serial(
+                study,
+                config=config,
+                selected_runs=selected_runs,
+                optim_root=optim_root,
+                progress=progress,
+            )
         return
 
-    context = mp.get_context("spawn")
-    futures: dict[Future[OptimSplitResult], ActiveOptimTrial] = {}
+    workers = config.optim.parallel.workers
+    with ProgressManager(workers=workers) as progress_manager:
+        with ProgressBar(desc="Optim splits", total=total_split_jobs) as run_bar:
+            progress = OptimProgress(
+                run_bar=run_bar,
+                total_split_jobs=total_split_jobs,
+                total_trials=config.optim.n_trials,
+            )
+            run_optim_study_parallel(
+                study,
+                config=config,
+                selected_runs=selected_runs,
+                optim_root=optim_root,
+                progress=progress,
+                progress_manager=progress_manager,
+                workers=workers,
+            )
+
+
+def run_optim_study_parallel(
+    study: Any,
+    *,
+    config: ApplicationConfig,
+    selected_runs: Sequence[DatasetRunPaths],
+    optim_root: Path,
+    progress: OptimProgress,
+    progress_manager: ProgressManager,
+    workers: int,
+) -> None:
+    futures: dict[Future[OptimSplitResult], tuple[ActiveOptimTrial, int]] = {}
     active_trials: dict[int, ActiveOptimTrial] = {}
+    idle_worker_slots = list(range(workers))
     started_trials = 0
     next_task_slot = 0
 
-    def submit_trial(executor: ProcessPoolExecutor) -> None:
+    def start_trials() -> None:
         nonlocal started_trials, next_task_slot
-        trial = study.ask()
-        trial_config = optim_trial_config(config, trial)
-        active_trial = ActiveOptimTrial(trial=trial)
-        active_trials[int(trial.number)] = active_trial
-        for split_index, run_paths in enumerate(selected_runs):
-            job = build_optim_split_job(
-                trial_config,
-                optim_root=optim_root,
-                run_paths=run_paths,
-                split_index=split_index,
-                task_slot=next_task_slot,
-                total_splits=len(selected_runs),
-                trial_number=int(trial.number),
-            )
-            next_task_slot += 1
-            future = executor.submit(run_optim_split_job, job)
-            active_trial.futures.add(future)
-            futures[future] = active_trial
-        started_trials += 1
-
-    with ProcessPoolExecutor(
-        max_workers=config.optim.parallel.workers, mp_context=context
-    ) as executor:
         while started_trials < config.optim.n_trials and len(
             active_trials
         ) < effective_active_trials(config):
-            submit_trial(executor)
+            trial = study.ask()
+            trial_config = optim_trial_config(config, trial)
+            active_trials[int(trial.number)] = ActiveOptimTrial(
+                config=trial_config,
+                task_offset=next_task_slot,
+                trial=trial,
+            )
+            next_task_slot += len(selected_runs)
+            started_trials += 1
+
+    def next_ready_trial() -> ActiveOptimTrial | None:
+        ready_trials = [
+            active_trial
+            for active_trial in active_trials.values()
+            if active_trial.next_split_index < len(selected_runs)
+        ]
+        if not ready_trials:
+            return None
+        return min(ready_trials, key=lambda item: int(item.trial.number))
+
+    def submit_ready_jobs(executor: ProcessPoolExecutor) -> None:
+        while idle_worker_slots:
+            active_trial = next_ready_trial()
+            if active_trial is None:
+                return
+            worker_slot = idle_worker_slots.pop(0)
+            split_index = active_trial.next_split_index
+            active_trial.next_split_index += 1
+            job = build_optim_split_job(
+                active_trial.config,
+                optim_root=optim_root,
+                run_paths=selected_runs[split_index],
+                split_index=split_index,
+                task_slot=active_trial.task_offset + split_index,
+                total_splits=len(selected_runs),
+                trial_number=int(active_trial.trial.number),
+                worker_slot=worker_slot,
+            )
+            future = executor.submit(run_optim_split_job, job)
+            active_trial.futures.add(future)
+            futures[future] = (active_trial, worker_slot)
+
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=progress_manager.mp_context,
+        initializer=ProgressManager.initialize_worker,
+        initargs=progress_manager.worker_initargs(),
+    ) as executor:
+        start_trials()
+        submit_ready_jobs(executor)
 
         while futures:
             done, _pending = wait(set(futures), return_when=FIRST_COMPLETED)
-            for future in done:
-                active_trial = futures.pop(future)
+            for future in sorted(done, key=lambda item: futures[item][1]):
+                active_trial, worker_slot = futures.pop(future)
                 active_trial.futures.remove(future)
                 try:
-                    active_trial.results.append(future.result())
+                    result = future.result()
                 except Exception:
                     LOGGER.exception("Optim split failed.")
                     for pending_future in futures:
                         pending_future.cancel()
                     raise
-                if not active_trial.futures:
+                active_trial.results.append(result)
+                record_optim_split_progress(progress)
+                idle_worker_slots.append(worker_slot)
+                idle_worker_slots.sort()
+                if active_trial.next_split_index >= len(selected_runs) and not active_trial.futures:
                     active_trials.pop(int(active_trial.trial.number), None)
                     complete_optim_trial(study, active_trial)
-                    if started_trials < config.optim.n_trials:
-                        submit_trial(executor)
+                    record_optim_trial_progress(progress)
+            start_trials()
+            submit_ready_jobs(executor)
 
 
 def run_optim_study_serial(
@@ -248,11 +332,12 @@ def run_optim_study_serial(
     config: ApplicationConfig,
     selected_runs: Sequence[DatasetRunPaths],
     optim_root: Path,
+    progress: OptimProgress,
 ) -> None:
     for _trial_index in range(config.optim.n_trials):
         trial = study.ask()
         trial_config = optim_trial_config(config, trial)
-        active_trial = ActiveOptimTrial(trial=trial)
+        active_trial = ActiveOptimTrial(config=trial_config, trial=trial)
         for split_index, run_paths in enumerate(selected_runs):
             job = build_optim_split_job(
                 trial_config,
@@ -262,9 +347,30 @@ def run_optim_study_serial(
                 task_slot=split_index,
                 total_splits=len(selected_runs),
                 trial_number=int(trial.number),
+                worker_slot=0,
             )
             active_trial.results.append(run_optim_split_job(job))
+            record_optim_split_progress(progress)
         complete_optim_trial(study, active_trial)
+        record_optim_trial_progress(progress)
+
+
+def record_optim_split_progress(progress: OptimProgress) -> None:
+    progress.completed_split_jobs += 1
+    progress.run_bar.update()
+    update_optim_progress_postfix(progress)
+
+
+def record_optim_trial_progress(progress: OptimProgress) -> None:
+    progress.completed_trials += 1
+    update_optim_progress_postfix(progress)
+
+
+def update_optim_progress_postfix(progress: OptimProgress) -> None:
+    progress.run_bar.set_postfix(
+        completed=f"{progress.completed_split_jobs}/{progress.total_split_jobs}",
+        trials=f"{progress.completed_trials}/{progress.total_trials}",
+    )
 
 
 def effective_active_trials(config: ApplicationConfig) -> int:
@@ -280,6 +386,7 @@ def build_optim_split_job(
     task_slot: int,
     total_splits: int,
     trial_number: int,
+    worker_slot: int,
 ) -> OptimSplitJob:
     return OptimSplitJob(
         config=config,
@@ -290,6 +397,7 @@ def build_optim_split_job(
         split_index=split_index,
         total_splits=total_splits,
         trial_number=trial_number,
+        worker_slot=worker_slot,
     )
 
 
@@ -313,12 +421,17 @@ def run_optim_split_job(job: OptimSplitJob) -> OptimSplitResult:
         / job.run_paths.run_id,
         save=None,
     )
-    result = fit_training_run(
-        run_config,
-        train_paths=train_paths,
-        seed=job.seed,
-        swanlab_repeat_label=None,
-    )
+    with ProgressManager.worker_scope(
+        worker_slot=job.worker_slot,
+        description_prefix=f"t{job.trial_number} {short_run_label(job.run_paths.run_id)}",
+        leave=False,
+    ):
+        result = fit_training_run(
+            run_config,
+            train_paths=train_paths,
+            seed=job.seed,
+            swanlab_repeat_label=None,
+        )
     required_metric(result.metrics, "cindex", job.trial_number)
     required_metric(result.metrics, "ari", job.trial_number)
     return OptimSplitResult(

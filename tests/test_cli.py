@@ -583,6 +583,8 @@ def install_fake_tqdm(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[Any]]:
     bars: list[Any] = []
 
     class FakeTqdm:
+        _lock: Any = None
+
         def __init__(self, iterable: Any = None, **kwargs: Any) -> None:
             self.iterable = [] if iterable is None else iterable
             self.kwargs = kwargs
@@ -616,6 +618,18 @@ def install_fake_tqdm(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[Any]]:
 
         def close(self) -> None:
             self.closed = True
+
+        @classmethod
+        def get_lock(cls) -> Any:
+            return cls._lock
+
+        @classmethod
+        def set_lock(cls, lock: Any) -> None:
+            cls._lock = lock
+
+        @staticmethod
+        def write(_message: str) -> None:
+            return None
 
     monkeypatch.setattr(progress, "tqdm", FakeTqdm)
     return progress, bars
@@ -1184,6 +1198,7 @@ def test_optim_command_runs_all_splits_and_aggregates_mean_metrics(
     data_root = tmp_path / "data"
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
+    _progress, bars = install_fake_tqdm(monkeypatch)
     app_config = ApplicationConfig.model_validate(
         compose_payload("command=optim", "optim.n_trials=1", f"paths.data_root={data_root}")
     )
@@ -1207,6 +1222,16 @@ def test_optim_command_runs_all_splits_and_aggregates_mean_metrics(
 
     result = optim.run_optim_command(app_config, tmp_path / "run", ROOT)
 
+    optim_bars = [bar for bar in bars if bar.kwargs["desc"] == "Optim splits"]
+    assert len(optim_bars) == 1
+    assert optim_bars[0].kwargs["total"] == 2
+    assert optim_bars[0].updates == [1, 1]
+    assert optim_bars[0].postfixes[-1] == {
+        "ordered_dict": None,
+        "refresh": True,
+        "completed": "2/2",
+        "trials": "1/1",
+    }
     assert result["selected_run_ids"] == [
         "base/train_6_test_2/k2/0",
         "base/train_6_test_2/k3/0",
@@ -1302,6 +1327,8 @@ def test_optim_parallel_uses_shared_pool_and_rotates_devices(
     seen_max_workers: list[int] = []
     submitted_devices: list[str] = []
     submitted_trials: list[int] = []
+    submitted_worker_slots: list[int] = []
+    _progress, bars = install_fake_tqdm(monkeypatch)
 
     class FakeExecutor:
         def __init__(self, max_workers: int, **_kwargs: Any) -> None:
@@ -1316,6 +1343,7 @@ def test_optim_parallel_uses_shared_pool_and_rotates_devices(
         def submit(self, fn: Any, job: optim.OptimSplitJob) -> Future[Any]:
             submitted_devices.append(job.device)
             submitted_trials.append(job.trial_number)
+            submitted_worker_slots.append(job.worker_slot)
             future: Future[Any] = Future()
             try:
                 future.set_result(fn(job))
@@ -1338,10 +1366,21 @@ def test_optim_parallel_uses_shared_pool_and_rotates_devices(
 
     result = optim.run_optim_command(app_config, tmp_path / "run", ROOT)
 
+    optim_bars = [bar for bar in bars if bar.kwargs["desc"] == "Optim splits"]
+    assert len(optim_bars) == 1
+    assert optim_bars[0].kwargs["total"] == 4
+    assert optim_bars[0].updates == [1, 1, 1, 1]
+    assert optim_bars[0].postfixes[-1] == {
+        "ordered_dict": None,
+        "refresh": True,
+        "completed": "4/4",
+        "trials": "2/2",
+    }
     assert seen_max_workers == [2]
     assert len(submitted_devices) == 4
     assert submitted_devices == ["cuda:0", "cuda:1", "cuda:0", "cuda:1"]
     assert sorted(set(submitted_trials)) == [0, 1]
+    assert submitted_worker_slots == [0, 1, 0, 1]
     assert result["completed_after"] == 2
 
 
