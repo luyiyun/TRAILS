@@ -40,8 +40,8 @@ clean reusable method library.
 
 ## Commands
 
-- Quick simulation split generation: `uv run main.py command=simulate simulation=quick paths.data_root=data/simulated`
-- Paper simulation grid generation for one scene: `uv run main.py command=simulate simulation=base paths.data_root=data/simulated`
+- Quick simulation split generation: `uv run main.py command=simulate simulation=quick`
+- Paper simulation grid generation for one scene: `uv run main.py command=simulate simulation=base`
 - Train existing splits: `uv run main.py command=train training=base paths.data_root=data/simulated/base`
 - Train with mTAN-style input: `uv run main.py command=train training=mtan paths.data_root=data/simulated/base`
 - Run lightweight baselines on existing splits: `uv run main.py command=baseline paths.data_root=data/simulated/base`
@@ -113,9 +113,11 @@ clean reusable method library.
   `outputs/<command>/<run.name>`. `run.output_root` defaults to `outputs`,
   `run.prefix` defaults to the simulation scenario for `simulate`, the final
   `paths.data_root` component for `train`/`baseline`/`optim`, and `summary` for
-  summaries. `paths` controls data locations only; do not use it to name output
-  runs. Train, baseline, and optim outputs mirror the relative data split path
-  discovered under `paths.data_root`.
+  summaries. `command=simulate` writes generated split data, manifest, and
+  summary directly under its Hydra run directory; `paths.data_root` is used by
+  `train`, `baseline`, and `optim` to read existing split data. Train, baseline,
+  and optim outputs mirror the relative data split path discovered under
+  `paths.data_root`.
 - Simulation uses a VaDeSC-EHR-style latent-cluster generator adapted to
   continuous asynchronous clinical measurements.
 - Simulation outputs a `ClinicalTimeSeriesDataset` saved via `torch.save`.

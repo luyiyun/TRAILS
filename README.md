@@ -37,17 +37,17 @@ Dataset 的 `metadata` 会保留 `latent_z`、`cluster_means`、`cluster_covaria
 实验入口使用 Hydra 配置。默认命令是生成模拟 train/test split：
 
 ```bash
-uv run main.py command=simulate simulation=quick paths.data_root=data/simulated
+uv run main.py command=simulate simulation=quick
 ```
 
 模拟场景放在 `configs/simulation/`：
 
 ```bash
-uv run main.py command=simulate simulation=quick paths.data_root=data/simulated
-uv run main.py command=simulate simulation=base paths.data_root=data/simulated
-uv run main.py command=simulate simulation=imbalance paths.data_root=data/simulated
-uv run main.py command=simulate simulation=censored paths.data_root=data/simulated
-uv run main.py command=simulate simulation=high_dimension paths.data_root=data/simulated
+uv run main.py command=simulate simulation=quick
+uv run main.py command=simulate simulation=base
+uv run main.py command=simulate simulation=imbalance
+uv run main.py command=simulate simulation=censored
+uv run main.py command=simulate simulation=high_dimension
 ```
 
 所有参数都可以通过 Hydra 覆盖，例如：
@@ -66,13 +66,13 @@ uv run main.py command=simulate simulation=base 'simulation.generator.n_clusters
 单独生成模拟数据：
 
 ```bash
-uv run main.py command=simulate simulation=base paths.data_root=data/simulated
+uv run main.py command=simulate simulation=base
 ```
 
 输出路径为
-`<data_root>/<simulation.name>/train_<train>_test_<test>/k<K>/<repeat>/train.pt`
-和对应 `test.pt`，并在场景目录下写出 `simulation_manifest.csv` 与
-`simulation_summary.json`；同一份 manifest/summary 也会写入本次 Hydra run 目录。
+`outputs/simulate/<run.name>/train_<train>_test_<test>/k<K>/<repeat>/train.pt`
+和对应 `test.pt`，并在本次 Hydra run 目录下写出 `simulation_manifest.csv` 与
+`simulation_summary.json`。
 
 训练已有的 train/test split：
 

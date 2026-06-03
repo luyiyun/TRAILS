@@ -260,7 +260,7 @@ def test_simulate_command_writes_grid_manifest_and_splits(tmp_path: Path) -> Non
     from trails_simulate import workflow
     from trails_simulate.config import ApplicationConfig
 
-    data_root = tmp_path / "data"
+    sentinel_data_root = tmp_path / "unused-data-root"
     app_config = ApplicationConfig.model_validate(
         compose_payload(
             "simulation=quick",
@@ -268,17 +268,17 @@ def test_simulate_command_writes_grid_manifest_and_splits(tmp_path: Path) -> Non
             "simulation.test_size=[2,4]",
             "simulation.generator.n_clusters=[2,3]",
             "simulation.repeats=2",
-            f"paths.data_root={data_root}",
+            f"paths.data_root={sentinel_data_root}",
         )
     )
 
-    result = workflow.run_simulate_command(app_config, tmp_path / "run", ROOT)
-    scenario_root = data_root / "quick"
+    hydra_run_dir = tmp_path / "run"
+    result = workflow.run_simulate_command(app_config, hydra_run_dir, ROOT)
+    scenario_root = hydra_run_dir
     train_path = scenario_root / "train_6_test_2" / "k2" / "0" / "train.pt"
     test_path = scenario_root / "train_6_test_2" / "k2" / "0" / "test.pt"
     manifest_path = scenario_root / "simulation_manifest.csv"
-    hydra_manifest_path = tmp_path / "run" / "simulation_manifest.csv"
-    hydra_summary_path = tmp_path / "run" / "simulation_summary.json"
+    summary_path = scenario_root / "simulation_summary.json"
 
     assert result["command"] == "simulate"
     assert result["data_root"] == str(scenario_root)
@@ -286,10 +286,12 @@ def test_simulate_command_writes_grid_manifest_and_splits(tmp_path: Path) -> Non
     assert train_path.exists()
     assert test_path.exists()
     assert manifest_path.exists()
-    assert hydra_manifest_path.exists()
-    assert hydra_summary_path.exists()
-    assert result["outputs"]["manifest"] == str(hydra_manifest_path)
-    assert result["outputs"]["data_manifest"] == str(manifest_path)
+    assert summary_path.exists()
+    assert not sentinel_data_root.exists()
+    assert result["outputs"] == {
+        "manifest": str(manifest_path),
+        "summary": str(summary_path),
+    }
 
     train_data = ClinicalTimeSeriesDataset.load(train_path)
     test_data = ClinicalTimeSeriesDataset.load(test_path)
@@ -490,29 +492,8 @@ def test_parallel_device_helpers_keep_same_device_without_device_list() -> None:
     assert config_with_training_device(rotated_config, "cuda:1").training.trainer.device == "cuda:1"
 
 
-def test_train_progress_time_formatting() -> None:
-    from trails_simulate.workflow import (
-        estimate_remaining_seconds,
-        format_completed_train_run,
-        format_duration,
-        format_start_train_run,
-    )
-
-    assert format_duration(None) == "estimating"
-    assert format_duration(12.34) == "12.3s"
-    assert format_duration(65.0) == "1m05s"
-    assert estimate_remaining_seconds([10.0, 20.0], remaining_runs=2) == pytest.approx(30.0)
-
-    start_message = format_start_train_run(
-        index=1,
-        total=3,
-        run_id="base/train_500_test_300/k3/0",
-        elapsed_seconds=65.0,
-        remaining_seconds=130.0,
-    )
-    assert "Training run 2/3" in start_message
-    assert "elapsed=1m05s" in start_message
-    assert "remaining=2m10s" in start_message
+def test_completed_train_run_log_omits_timing_fields() -> None:
+    from trails_simulate.workflow import format_completed_train_run
 
     completed_message = format_completed_train_run(
         run_id="base/train_500_test_300/k3/0",
@@ -520,14 +501,14 @@ def test_train_progress_time_formatting() -> None:
         seed=7,
         prediction_path=Path("trails.pt"),
         metrics={"cindex": 0.9, "ari": 0.5},
-        run_duration_seconds=10.0,
-        elapsed_seconds=75.0,
-        remaining_seconds=20.0,
     )
-    assert "duration=10.0s" in completed_message
-    assert "elapsed=1m15s" in completed_message
-    assert "remaining=20.0s" in completed_message
+    assert "Completed train run: base/train_500_test_300/k3/0" in completed_message
+    assert "duration=" not in completed_message
+    assert "elapsed=" not in completed_message
+    assert "remaining=" not in completed_message
     assert "cindex=0.9" in completed_message
+    assert "ari=0.5" in completed_message
+    assert "prediction=trails.pt" in completed_message
 
 
 def test_fit_training_run_resolves_auto_batch_size_and_records_effective_value(

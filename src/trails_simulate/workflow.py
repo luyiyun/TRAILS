@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import logging
-import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +26,6 @@ from .path import (
     DatasetRunPaths,
     TrainPaths,
     checkpoint_path_for_run,
-    # data_root,
     discover_dataset_runs,
 )
 from .result_summary import run_summary_command
@@ -50,7 +48,6 @@ class TrainRunJob:
 
 @dataclass(frozen=True)
 class TrainRunResult:
-    duration_seconds: float
     index: int
     metric_row: dict[str, Any]
     metrics: dict[str, float]
@@ -107,13 +104,11 @@ def run_simulate_command(
 ) -> dict[str, Any]:
     if config.paths.explicit_split.enabled:
         raise ValueError(
-            "command=simulate writes split data under paths.data_root, not paths.explicit_split."
+            "command=simulate generates new split data in the Hydra run directory; "
+            "paths.explicit_split is only for commands that read existing split data."
         )
 
     out_root = hydra_run_dir
-    # out_root = data_root(config, hydra_run_dir, project_root) / config.simulation.name
-    # data_manifest_path = out_root / "simulation_manifest.csv"
-    # data_summary_path = out_root / "simulation_summary.json"
     manifest_path = hydra_run_dir / "simulation_manifest.csv"
     summary_path = hydra_run_dir / "simulation_summary.json"
     runs: list[dict[str, Any]] = []
@@ -202,17 +197,13 @@ def run_simulate_command(
         "data_root": str(out_root),
         "hydra_run_dir": str(hydra_run_dir),
         "outputs": {
-            # "data_manifest": str(data_manifest_path),
-            # "data_summary": str(data_summary_path),
             "manifest": str(manifest_path),
             "summary": str(summary_path),
         },
         "runs": runs,
         "simulation": config.simulation.model_dump(mode="json"),
     }
-    # save_metrics_csv(data_manifest_path, runs)
     save_metrics_csv(manifest_path, runs)
-    # save_json(data_summary_path, summary)
     save_json(summary_path, summary)
     return summary
 
@@ -257,8 +248,6 @@ def run_train_jobs(
         return []
 
     workers = effective_train_workers(config, n_runs=len(runs))
-    command_started_at = time.perf_counter()
-    completed_durations: list[float] = []
     results: list[TrainRunResult] = []
 
     if workers == 1:
@@ -273,12 +262,9 @@ def run_train_jobs(
                     total_runs=len(runs),
                     worker_slot=0,
                 )
-                log_start_train_job(job, command_started_at, completed_durations)
                 result = run_train_split_job(job)
                 record_train_result(
                     result,
-                    command_started_at=command_started_at,
-                    completed_durations=completed_durations,
                     results=results,
                     run_bar=run_bar,
                     total_runs=len(runs),
@@ -293,8 +279,6 @@ def run_train_jobs(
                         hydra_run_dir=hydra_run_dir,
                         project_root=project_root,
                         workers=workers,
-                        command_started_at=command_started_at,
-                        completed_durations=completed_durations,
                         run_bar=run_bar,
                         progress_manager=progress_manager,
                     )
@@ -310,8 +294,6 @@ def run_train_jobs_parallel(
     hydra_run_dir: Path,
     project_root: Path,
     workers: int,
-    command_started_at: float,
-    completed_durations: list[float],
     run_bar: ProgressBar[Any],
     progress_manager: ProgressManager,
 ) -> list[TrainRunResult]:
@@ -334,7 +316,6 @@ def run_train_jobs_parallel(
             total_runs=len(runs),
             worker_slot=worker_slot,
         )
-        log_start_train_job(job, command_started_at, completed_durations)
         futures[executor.submit(run_train_split_job, job)] = job
 
     with ProcessPoolExecutor(
@@ -359,8 +340,6 @@ def run_train_jobs_parallel(
                     raise
                 record_train_result(
                     result,
-                    command_started_at=command_started_at,
-                    completed_durations=completed_durations,
                     results=results,
                     run_bar=run_bar,
                     total_runs=len(runs),
@@ -394,7 +373,6 @@ def build_train_run_job(
 
 def run_train_split_job(job: TrainRunJob) -> TrainRunResult:
     configure_torch_threads(job.config.training.parallel.torch_threads)
-    run_started_at = time.perf_counter()
     seed = job.config.training.trainer.seed + job.index
     run_config = config_for_dataset_clusters(job.config, job.run_paths.train_data)
     if job.device is not None:
@@ -431,7 +409,6 @@ def run_train_split_job(job: TrainRunJob) -> TrainRunResult:
         metrics=train_result.metrics,
     )
     return TrainRunResult(
-        duration_seconds=time.perf_counter() - run_started_at,
         index=job.index,
         metric_row=row,
         metrics=train_result.metrics,
@@ -454,13 +431,10 @@ def run_train_split_job(job: TrainRunJob) -> TrainRunResult:
 def record_train_result(
     result: TrainRunResult,
     *,
-    command_started_at: float,
-    completed_durations: list[float],
     results: list[TrainRunResult],
     run_bar: ProgressBar[Any],
     total_runs: int,
 ) -> None:
-    completed_durations.append(result.duration_seconds)
     results.append(result)
     run_bar.update()
     run_bar.set_postfix(completed=f"{len(results)}/{total_runs}")
@@ -471,31 +445,6 @@ def record_train_result(
             seed=result.seed,
             prediction_path=result.prediction_path,
             metrics=result.metrics,
-            run_duration_seconds=result.duration_seconds,
-            elapsed_seconds=time.perf_counter() - command_started_at,
-            remaining_seconds=estimate_remaining_seconds(
-                completed_durations,
-                remaining_runs=total_runs - len(results),
-            ),
-        )
-    )
-
-
-def log_start_train_job(
-    job: TrainRunJob,
-    command_started_at: float,
-    completed_durations: Sequence[float],
-) -> None:
-    LOGGER.info(
-        format_start_train_run(
-            index=job.index,
-            total=job.total_runs,
-            run_id=job.run_paths.run_id,
-            elapsed_seconds=time.perf_counter() - command_started_at,
-            remaining_seconds=estimate_remaining_seconds(
-                completed_durations,
-                remaining_runs=job.total_runs - len(completed_durations),
-            ),
         )
     )
 
@@ -635,21 +584,6 @@ def metric_row(
     }
 
 
-def format_start_train_run(
-    *,
-    index: int,
-    total: int,
-    run_id: str,
-    elapsed_seconds: float,
-    remaining_seconds: float | None,
-) -> str:
-    return (
-        f"Training run {index + 1}/{total}: {run_id} "
-        f"elapsed={format_duration(elapsed_seconds)} "
-        f"remaining={format_duration(remaining_seconds)}"
-    )
-
-
 def format_completed_train_run(
     *,
     run_id: str,
@@ -657,26 +591,16 @@ def format_completed_train_run(
     seed: int,
     prediction_path: Path,
     metrics: Mapping[str, float],
-    run_duration_seconds: float | None = None,
-    elapsed_seconds: float | None = None,
-    remaining_seconds: float | None = None,
 ) -> str:
     metric_names = ("cindex", "ari", "nmi", "acc", "cluster_empty_count")
     metric_text = " ".join(
         f"{name}={float(metrics[name]):.4g}" for name in metric_names if name in metrics
     )
-    timing_text = " ".join(
-        [
-            f"duration={format_duration(run_duration_seconds)}",
-            f"elapsed={format_duration(elapsed_seconds)}",
-            f"remaining={format_duration(remaining_seconds)}",
-        ]
-    )
-    return (
-        f"Completed train run: {run_id} "
-        f"k={n_clusters} seed={seed} {timing_text} {metric_text} "
-        f"prediction={compact_log_path(prediction_path)}"
-    )
+    fields = [f"Completed train run: {run_id}", f"k={n_clusters}", f"seed={seed}"]
+    if metric_text:
+        fields.append(metric_text)
+    fields.append(f"prediction={compact_log_path(prediction_path)}")
+    return " ".join(fields)
 
 
 def compact_log_path(path: Path, *, keep_parts: int = 4) -> str:
@@ -684,31 +608,6 @@ def compact_log_path(path: Path, *, keep_parts: int = 4) -> str:
     if len(parts) <= keep_parts:
         return str(path)
     return str(Path("...").joinpath(*parts[-keep_parts:]))
-
-
-def estimate_remaining_seconds(
-    completed_durations: Sequence[float],
-    *,
-    remaining_runs: int,
-) -> float | None:
-    if remaining_runs <= 0:
-        return 0.0
-    if not completed_durations:
-        return None
-    return (sum(completed_durations) / len(completed_durations)) * remaining_runs
-
-
-def format_duration(seconds: float | None) -> str:
-    if seconds is None:
-        return "estimating"
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    rounded_seconds = int(round(seconds))
-    hours, remainder = divmod(rounded_seconds, 3600)
-    minutes, seconds_part = divmod(remainder, 60)
-    if hours:
-        return f"{hours}h{minutes:02d}m{seconds_part:02d}s"
-    return f"{minutes}m{seconds_part:02d}s"
 
 
 def dataset_source_payload(
