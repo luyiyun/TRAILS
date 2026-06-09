@@ -66,20 +66,22 @@ def save_json(path: str | Path, payload: Mapping[str, Any] | Sequence[Any]) -> N
 def save_history_csv(path: str | Path, history: Sequence[HistoryEntry]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = _history_fieldnames(history)
+    rows = flatten_history(history)
+    fieldnames = _history_fieldnames(rows)
 
     with destination.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        for entry in history:
-            writer.writerow({name: entry.get(name, "") for name in fieldnames})
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
 
 
 def plot_history(path: str | Path, history: Sequence[HistoryEntry]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    panels = _available_panels(history)
+    rows = flatten_history(history)
+    panels = _available_panels(rows)
     if not panels:
         panels = [("History", [])]
 
@@ -93,11 +95,11 @@ def plot_history(path: str | Path, history: Sequence[HistoryEntry]) -> None:
     if len(panels) == 1:
         axes = [axes]
 
-    x_values = _x_values(history)
+    x_values = _x_values(rows)
     for ax, (title, names) in zip(axes, panels, strict=True):
         if names:
             for name in names:
-                y_values = _metric_values(history, name)
+                y_values = _metric_values(rows, name)
                 ax.plot(x_values, y_values, marker="o", linewidth=1.8, markersize=3.5, label=name)
             ax.legend(frameon=False, ncols=min(3, len(names)))
         else:
@@ -106,7 +108,7 @@ def plot_history(path: str | Path, history: Sequence[HistoryEntry]) -> None:
         ax.grid(True, alpha=0.25)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
-        _mark_stage_boundary(ax, history, x_values)
+        _mark_stage_boundary(ax, rows, x_values)
 
     axes[-1].set_xlabel("Global epoch")
     fig.suptitle("TRAILS training history", fontsize=13, fontweight="bold")
@@ -183,30 +185,78 @@ def plot_latent_embedding_projection(
     plt.close(fig)
 
 
-def _history_fieldnames(history: Sequence[HistoryEntry]) -> list[str]:
+def flatten_history(history: Sequence[HistoryEntry]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for entry in history:
+        row: dict[str, Any] = {}
+        for name in (
+            "global_epoch",
+            "epoch",
+            "stage",
+            "best_global_epoch",
+            "best_monitor",
+            "best_monitor_value",
+            "early_stopped",
+        ):
+            value = entry.get(name)
+            if value is not None:
+                row[name] = value
+        row.update(_history_metrics(entry.get("train")))
+        row.update(
+            {f"val_{name}": value for name, value in _history_metrics(entry.get("valid")).items()}
+        )
+        rows.append(row)
+    return rows
+
+
+def _history_metrics(value: object) -> dict[str, int | float]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(name): metric for name, metric in value.items() if isinstance(metric, int | float)}
+
+
+def _history_fieldnames(rows: Sequence[Mapping[str, Any]]) -> list[str]:
     preferred = [
         "global_epoch",
         "epoch",
         "stage",
+        "best_global_epoch",
+        "best_monitor",
+        "best_monitor_value",
+        "early_stopped",
         "loss",
         "reconstruction_loss",
         "survival_loss",
         "vade_kl_loss",
+        "reconstruction_loss_weight",
+        "survival_loss_weight",
+        "vade_kl_loss_weight",
+        "reconstruction_log_variance",
+        "survival_log_variance",
+        "cindex",
+        "acc",
+        "ari",
+        "nmi",
         "val_loss",
         "val_reconstruction_loss",
         "val_survival_loss",
         "val_vade_kl_loss",
-        "val_c_index",
+        "val_reconstruction_loss_weight",
+        "val_survival_loss_weight",
+        "val_vade_kl_loss_weight",
+        "val_reconstruction_log_variance",
+        "val_survival_log_variance",
+        "val_cindex",
         "val_ari",
         "val_nmi",
     ]
-    present = {key for entry in history for key in entry}
+    present = {key for row in rows for key in row}
     ordered = [name for name in preferred if name in present]
     ordered.extend(sorted(present - set(ordered)))
     return ordered
 
 
-def _available_panels(history: Sequence[HistoryEntry]) -> list[tuple[str, list[str]]]:
+def _available_panels(history: Sequence[Mapping[str, Any]]) -> list[tuple[str, list[str]]]:
     panel_candidates = [
         ("Total loss", ["loss", "val_loss"]),
         (
@@ -220,8 +270,8 @@ def _available_panels(history: Sequence[HistoryEntry]) -> list[tuple[str, list[s
                 "val_vade_kl_loss",
             ],
         ),
-        ("Validation concordance", ["val_c_index"]),
-        ("Cluster recovery", ["val_ari", "val_nmi"]),
+        ("Concordance", ["cindex", "val_cindex"]),
+        ("Cluster recovery", ["acc", "ari", "nmi", "val_acc", "val_ari", "val_nmi"]),
     ]
     return [
         (title, [name for name in names if _has_numeric_values(history, name)])
@@ -230,13 +280,13 @@ def _available_panels(history: Sequence[HistoryEntry]) -> list[tuple[str, list[s
     ]
 
 
-def _x_values(history: Sequence[HistoryEntry]) -> list[float]:
+def _x_values(history: Sequence[Mapping[str, Any]]) -> list[float]:
     if all(isinstance(entry.get("global_epoch"), int | float) for entry in history):
         return [float(entry["global_epoch"]) for entry in history]
     return [float(index + 1) for index in range(len(history))]
 
 
-def _metric_values(history: Sequence[HistoryEntry], name: str) -> list[float]:
+def _metric_values(history: Sequence[Mapping[str, Any]], name: str) -> list[float]:
     values: list[float] = []
     for entry in history:
         value = entry.get(name)
@@ -244,13 +294,13 @@ def _metric_values(history: Sequence[HistoryEntry], name: str) -> list[float]:
     return values
 
 
-def _has_numeric_values(history: Sequence[HistoryEntry], name: str) -> bool:
+def _has_numeric_values(history: Sequence[Mapping[str, Any]], name: str) -> bool:
     return any(isinstance(entry.get(name), int | float) for entry in history)
 
 
 def _mark_stage_boundary(
     ax: Any,
-    history: Sequence[HistoryEntry],
+    history: Sequence[Mapping[str, Any]],
     x_values: Sequence[float],
 ) -> None:
     stages = [entry.get("stage") for entry in history]

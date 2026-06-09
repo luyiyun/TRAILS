@@ -5,6 +5,7 @@ defaults:
   - baseline: default
   - optim: default
   - summary: default
+  - optional case: null
 
 command: simulate
 

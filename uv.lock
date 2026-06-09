@@ -2298,6 +2298,7 @@ dependencies = [
     { name = "torch" },
     { name = "torchmetrics" },
     { name = "tqdm" },
+    { name = "umap-learn" },
 ]
 
 [package.dev-dependencies]
@@ -2308,7 +2309,6 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "seaborn" },
-    { name = "umap-learn" },
 ]
 
 [package.metadata]
@@ -2322,6 +2322,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.12.0" },
     { name = "torchmetrics", specifier = ">=1.9.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
+    { name = "umap-learn", specifier = ">=0.5.12" },
 ]
 
 [package.metadata.requires-dev]
@@ -2332,7 +2333,6 @@ dev = [
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "ruff", specifier = ">=0.15.13" },
     { name = "seaborn", specifier = ">=0.13.2" },
-    { name = "umap-learn", specifier = ">=0.5.12" },
 ]
 
 [[package]]

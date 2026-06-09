@@ -14,10 +14,10 @@ items.
 ## Layout
 
 - `main.py`: all CLI commands. Use `uv run main.py ...`.
-- `configs/`: Hydra simulation, training, baseline, and optimization configuration.
+- `configs/`: Hydra simulation, training, baseline, optimization, summary, and case configuration.
 - `src/trails/`: reusable core code: data, model, trainer, estimator, metrics.
 - `src/trails_simulate/`: synthetic clinical data generation; imports `trails`.
-- `src/trails_case/`: future real-data/case-study utilities; imports `trails`.
+- `src/trails_case/`: real-data/case-study utilities; imports `trails`.
 - `tests/`: smoke, data, model, estimator, CLI, and architecture tests.
 
 ## Import Boundaries
@@ -44,6 +44,7 @@ clean reusable method library.
 - Paper simulation grid generation for one scene: `uv run main.py command=simulate simulation=base`
 - Train existing splits: `uv run main.py command=train training=base paths.data_root=data/simulated/base`
 - Train with mTAN-style input: `uv run main.py command=train training=mtan paths.data_root=data/simulated/base`
+- Run real-data case modeling: `uv run main.py case=default case.observations_csv=data/case/observations.csv case.patients_csv=data/case/patients.csv`
 - Run lightweight baselines on existing splits: `uv run main.py command=baseline paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run main.py command=optim paths.data_root=data/simulated/base`
 - Summarize train and baseline results: `uv run main.py command=summary 'summary.train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'summary.baseline_roots=[outputs/baseline/base-...]' 'summary.train_labels=[base,mtan]' 'summary.baseline_labels=[kmeans]'`
@@ -88,7 +89,7 @@ clean reusable method library.
   the loaded training split size using a conservative automatic rule; explicit
   integer overrides keep their exact value.
 - Command-level config namespaces are `simulation`, `training`, `baseline`,
-  `optim`, `summary`, shared `paths`, and shared `run`; generator parameters live under
+  `optim`, `summary`, `case`, shared `paths`, and shared `run`; generator parameters live under
   `simulation.generator`, while TRAILS model/trainer/artifacts/diagnostics/SwanLab
   parameters live under `training`.
 - `simulation.train_size` and `simulation.test_size` are equal-length lists that
@@ -178,6 +179,15 @@ clean reusable method library.
   method labels when repeated method names appear across roots, aggregates by
   scenario/sample size/K/method label, and writes CSV/JSON plus one publication-facing
   metrics-by-K PNG/PDF grid per scenario.
+- `command=case` lives in `trails_case` and reads real-data CSV inputs:
+  `patients.csv` with `patient_id`, `survival_time`, `event`, and optional
+  `cluster_label`; `observations.csv` with `patient_id`, `time`, `feature`,
+  and `value`. It trains on all patients, uses `training.trainer.valid_size`
+  only for internal early stopping, and saves the converted dataset, model,
+  history, predictions, patient-level clusters, cluster summaries, feature
+  summaries, and `case_summary.json` under `outputs/case/<run.name>`.
+- The `case=default` config selects `training=case`, which defaults to SwanLab
+  enabled, complete artifacts, and latent embedding diagnostics.
 
 ## Verification
 

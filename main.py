@@ -28,12 +28,48 @@ def load_app_config(raw_config: DictConfig) -> ApplicationConfig:
         raise ValueError(str(error)) from error
 
 
+def raw_command(raw_config: DictConfig) -> str:
+    command = OmegaConf.select(raw_config, "command", default="simulate")
+    return str(command)
+
+
+def run_case_from_raw_config(
+    raw_config: DictConfig,
+    *,
+    hydra_run_dir: Path,
+    project_root: Path,
+) -> dict[str, Any]:
+    from trails_case.config import CaseApplicationConfig
+    from trails_case.summary import format_case_summary
+    from trails_case.workflow import run_case_command
+
+    payload: Any = OmegaConf.to_container(raw_config, resolve=True)
+    if not isinstance(payload, dict):
+        raise TypeError("Hydra config must resolve to a mapping.")
+    try:
+        config = CaseApplicationConfig.model_validate(payload)
+    except ValidationError as error:
+        raise ValueError(str(error)) from error
+
+    result = run_case_command(config, hydra_run_dir=hydra_run_dir, project_root=project_root)
+    LOGGER.info(format_case_summary(result))
+    return result
+
+
 @hydra.main(config_path="configs", config_name="config", version_base="1.3")
 def main(raw_config: DictConfig) -> None:
     configure_tqdm_logging()
-    config = load_app_config(raw_config)
     project_root = Path(get_original_cwd())
     hydra_run_dir = Path(HydraConfig.get().runtime.output_dir)
+    if raw_command(raw_config) == "case":
+        run_case_from_raw_config(
+            raw_config,
+            hydra_run_dir=hydra_run_dir,
+            project_root=project_root,
+        )
+        return
+
+    config = load_app_config(raw_config)
     result = run(config, hydra_run_dir=hydra_run_dir, project_root=project_root)
     LOGGER.info(format_run_summary(result))
 

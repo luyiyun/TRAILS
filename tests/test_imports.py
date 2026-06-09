@@ -21,3 +21,9 @@ def test_trails_package_does_not_import_experiment_packages() -> None:
         assert "trails_simulate" not in text
         assert "trails_case" not in text
         assert "import main" not in text
+
+
+def test_case_package_does_not_import_simulation_package() -> None:
+    for path in Path("src/trails_case").glob("*.py"):
+        text = path.read_text()
+        assert "trails_simulate" not in text

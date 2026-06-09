@@ -87,6 +87,29 @@ uv run main.py command=train training=mtan paths.data_root=data/simulated/high_d
 uv run main.py command=train training=small paths.explicit_split.enabled=true paths.explicit_split.train_data=data/simulated/base/train_500_test_300/k2/0/train.pt paths.explicit_split.test_data=data/simulated/base/train_500_test_300/k2/0/test.pt
 ```
 
+真实数据建模使用 `command=case`。先把真实队列预处理成两个 CSV：
+
+- `patients.csv`：必需列为 `patient_id`、`survival_time`、`event`，可选列为
+  `cluster_label`。`event` 必须是 `0/1`，`survival_time` 与纵向观测时间使用同一单位。
+- `observations.csv`：必需列为 `patient_id`、`time`、`feature`、`value`。每行是一位患者
+  在某个时间点的某个变量观测；同一个 `patient_id + time + feature` 不能重复。
+
+运行示例：
+
+```bash
+uv run main.py case=default case.observations_csv=data/case/observations.csv case.patients_csv=data/case/patients.csv
+```
+
+`case=default` 会自动切到 `training=case`，默认开启 SwanLab、保存完整训练 artifacts，
+并开启 latent embedding diagnostics。命令使用全部患者训练，`training.trainer.valid_size`
+只作为内部 early stopping validation。输出默认保存在
+`outputs/case/<run.name>/`，包括 `case_dataset.pt`、`case_dataset_summary.json`、
+`config.json`、`history.json`、`history.csv`、`history.png`、`model.pt`、
+`predictions.pt`、`patient_clusters.csv`、`cluster_summary.csv`、
+`cluster_feature_summary.csv` 和 `case_summary.json`。`patient_clusters.csv`
+包含患者 ID、预测 cluster、风险分数、cluster posterior probabilities、生存结局和观测摘要，
+便于后续制作 KM 曲线、cluster composition 和变量分布图。
+
 对已有 train/test split 运行轻量基线方法：
 
 ```bash
