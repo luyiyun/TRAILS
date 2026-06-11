@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import csv
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict, cast
 
+import numpy as np
+import pandas as pd
 import torch
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from torch import Tensor
@@ -93,38 +95,192 @@ def save_prediction_payload(path: Path, payload: CasePredictionPayload) -> None:
     torch.save(payload, path)
 
 
+@dataclass(frozen=True)
+class CaseResultTables:
+    payload: CasePredictionPayload
+
+    def patient_clusters(self, patient_summaries: Sequence[CasePatientSummary]) -> pd.DataFrame:
+        if len(patient_summaries) != len(self.payload["patient_id"]):
+            raise ValueError("patient_summaries length must match prediction payload length.")
+
+        frame = pd.DataFrame(
+            {
+                "patient_id": self.payload["patient_id"],
+                "sample_index": tensor_array(self.payload["sample_index"], dtype=np.int64),
+                "pred_cluster": tensor_array(self.payload["pred_cluster"], dtype=np.int64),
+                "risk_score": tensor_array(self.payload["risk_score"], dtype=np.float64),
+                "survival_time": tensor_array(self.payload["survival_time"], dtype=np.float64),
+                "event": tensor_array(self.payload["event"], dtype=np.float64),
+            }
+        )
+        probabilities = self.payload.get("cluster_probabilities")
+        if probabilities is not None:
+            probability_values = tensor_array(probabilities, dtype=np.float64)
+            for cluster_index in range(probability_values.shape[1]):
+                frame[f"cluster_prob_{cluster_index}"] = probability_values[:, cluster_index]
+
+        summary_frame = pd.DataFrame(asdict(summary) for summary in patient_summaries)
+        for column in [
+            "n_observations",
+            "n_visits",
+            "first_time",
+            "last_time",
+            "missing_fraction",
+        ]:
+            frame[column] = summary_frame[column].to_numpy()
+        return cast(pd.DataFrame, frame[patient_cluster_columns(probabilities)])
+
+    def cluster_summary(self, *, n_clusters: int) -> pd.DataFrame:
+        frame = pd.DataFrame(
+            {
+                "pred_cluster": tensor_array(self.payload["pred_cluster"], dtype=np.int64),
+                "risk_score": tensor_array(self.payload["risk_score"], dtype=np.float64),
+                "survival_time": tensor_array(self.payload["survival_time"], dtype=np.float64),
+                "event": tensor_array(self.payload["event"], dtype=np.float64),
+            }
+        )
+        total = len(frame)
+        rows: list[dict[str, Any]] = []
+        for cluster in range(n_clusters):
+            cluster_frame = frame.loc[frame["pred_cluster"] == cluster]
+            n_patients = int(len(cluster_frame))
+            if n_patients == 0:
+                rows.append(empty_cluster_summary_row(cluster))
+                continue
+            rows.append(
+                {
+                    "pred_cluster": cluster,
+                    "n_patients": n_patients,
+                    "fraction": n_patients / float(total),
+                    "event_count": int(cluster_frame["event"].sum()),
+                    "event_rate": float(cluster_frame["event"].mean()),
+                    "mean_survival_time": float(cluster_frame["survival_time"].mean()),
+                    "median_survival_time": float(cluster_frame["survival_time"].median()),
+                    "mean_risk_score": float(cluster_frame["risk_score"].mean()),
+                    "median_risk_score": float(cluster_frame["risk_score"].median()),
+                }
+            )
+        return pd.DataFrame(rows, columns=CLUSTER_SUMMARY_COLUMNS)
+
+    def cluster_feature_summary(
+        self,
+        data: ClinicalTimeSeriesDataset,
+        *,
+        n_clusters: int,
+    ) -> pd.DataFrame:
+        observation_frame = self.observed_feature_frame(data)
+        cluster_index = pd.Index(range(n_clusters), name="pred_cluster")
+        feature_index = pd.Index(data.feature_names, name="feature")
+        full_index = pd.MultiIndex.from_product([cluster_index, feature_index])
+        n_patients = (
+            pd.Series(tensor_array(self.payload["pred_cluster"], dtype=np.int64))
+            .value_counts()
+            .reindex(range(n_clusters), fill_value=0)
+        )
+
+        if observation_frame.empty:
+            summary = pd.DataFrame(
+                index=full_index,
+                columns=[
+                    "n_patients_observed",
+                    "n_observations",
+                    "mean_value",
+                    "std_value",
+                    "min_value",
+                    "max_value",
+                    "mean_time",
+                ],
+            )
+        else:
+            summary = observation_frame.groupby(["pred_cluster", "feature"]).agg(
+                n_patients_observed=("patient_id", "nunique"),
+                n_observations=("value", "size"),
+                mean_value=("value", "mean"),
+                std_value=("value", "std"),
+                min_value=("value", "min"),
+                max_value=("value", "max"),
+                mean_time=("time", "mean"),
+            )
+            summary = summary.reindex(full_index)
+
+        result = summary.reset_index()
+        cluster_values = np.asarray(result["pred_cluster"].to_numpy(), dtype=np.int64)
+        result["n_patients"] = [int(n_patients.loc[int(cluster)]) for cluster in cluster_values]
+        result["n_patients_observed"] = result["n_patients_observed"].fillna(0).astype(int)
+        result["n_observations"] = result["n_observations"].fillna(0).astype(int)
+        result = result[
+            [
+                "pred_cluster",
+                "feature",
+                "n_patients",
+                "n_patients_observed",
+                "n_observations",
+                "mean_value",
+                "std_value",
+                "min_value",
+                "max_value",
+                "mean_time",
+            ]
+        ]
+        return cast(pd.DataFrame, result.replace({np.nan: ""}))
+
+    def observed_feature_frame(self, data: ClinicalTimeSeriesDataset) -> pd.DataFrame:
+        pred_cluster = tensor_array(self.payload["pred_cluster"], dtype=np.int64)
+        rows: list[dict[str, Any]] = []
+        for sample_index in range(len(data)):
+            sample = data[sample_index].to_aligned()
+            for feature_index, feature in enumerate(data.feature_names):
+                observed = sample.mask[:, feature_index] > 0
+                if not bool(observed.any()):
+                    continue
+                values = sample.x[observed, feature_index].detach().cpu().numpy()
+                times = sample.times[observed].detach().cpu().numpy()
+                rows.extend(
+                    {
+                        "pred_cluster": int(pred_cluster[sample_index]),
+                        "feature": feature,
+                        "patient_id": self.payload["patient_id"][sample_index],
+                        "value": float(value),
+                        "time": float(time),
+                    }
+                    for value, time in zip(values, times, strict=True)
+                )
+        return pd.DataFrame(
+            rows,
+            columns=["pred_cluster", "feature", "patient_id", "value", "time"],
+        )
+
+    def save_patient_clusters_csv(
+        self,
+        path: Path,
+        *,
+        patient_summaries: Sequence[CasePatientSummary],
+    ) -> None:
+        write_dataframe_csv(path, self.patient_clusters(patient_summaries))
+
+    def save_cluster_summary_csv(self, path: Path, *, n_clusters: int) -> None:
+        write_dataframe_csv(path, self.cluster_summary(n_clusters=n_clusters))
+
+    def save_cluster_feature_summary_csv(
+        self,
+        path: Path,
+        data: ClinicalTimeSeriesDataset,
+        *,
+        n_clusters: int,
+    ) -> None:
+        write_dataframe_csv(path, self.cluster_feature_summary(data, n_clusters=n_clusters))
+
+
 def save_patient_clusters_csv(
     path: Path,
     *,
     payload: CasePredictionPayload,
     patient_summaries: Sequence[CasePatientSummary],
 ) -> None:
-    probabilities = payload.get("cluster_probabilities")
-    probability_columns = (
-        []
-        if probabilities is None
-        else [f"cluster_prob_{index}" for index in range(probabilities.shape[1])]
-    )
-    fieldnames = [
-        "patient_id",
-        "sample_index",
-        "pred_cluster",
-        "risk_score",
-        "survival_time",
-        "event",
-        *probability_columns,
-        "n_observations",
-        "n_visits",
-        "first_time",
-        "last_time",
-        "missing_fraction",
-    ]
-    rows = patient_cluster_rows(
-        payload=payload,
+    CaseResultTables(payload).save_patient_clusters_csv(
+        path,
         patient_summaries=patient_summaries,
-        probability_columns=probability_columns,
     )
-    write_csv(path, rows, fieldnames=fieldnames)
 
 
 def patient_cluster_rows(
@@ -133,27 +289,9 @@ def patient_cluster_rows(
     patient_summaries: Sequence[CasePatientSummary],
     probability_columns: Sequence[str],
 ) -> list[dict[str, Any]]:
-    probabilities = payload.get("cluster_probabilities")
-    rows: list[dict[str, Any]] = []
-    for index, summary in enumerate(patient_summaries):
-        row: dict[str, Any] = {
-            "patient_id": payload["patient_id"][index],
-            "sample_index": int(payload["sample_index"][index].item()),
-            "pred_cluster": int(payload["pred_cluster"][index].item()),
-            "risk_score": float(payload["risk_score"][index].item()),
-            "survival_time": float(payload["survival_time"][index].item()),
-            "event": float(payload["event"][index].item()),
-            "n_observations": summary.n_observations,
-            "n_visits": summary.n_visits,
-            "first_time": summary.first_time,
-            "last_time": summary.last_time,
-            "missing_fraction": summary.missing_fraction,
-        }
-        if probabilities is not None:
-            for column_index, column in enumerate(probability_columns):
-                row[column] = float(probabilities[index, column_index].item())
-        rows.append(row)
-    return rows
+    frame = CaseResultTables(payload).patient_clusters(patient_summaries)
+    columns = [*patient_cluster_base_columns(), *probability_columns, *patient_summary_columns()]
+    return dataframe_records(cast(pd.DataFrame, frame[columns]))
 
 
 def cluster_summary_rows(
@@ -161,49 +299,7 @@ def cluster_summary_rows(
     *,
     n_clusters: int,
 ) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    pred_cluster = payload["pred_cluster"].detach().cpu().long()
-    risk_score = payload["risk_score"].detach().cpu().float()
-    survival_time = payload["survival_time"].detach().cpu().float()
-    event = payload["event"].detach().cpu().float()
-    total = int(pred_cluster.numel())
-
-    for cluster in range(n_clusters):
-        mask = pred_cluster == cluster
-        indices = torch.nonzero(mask, as_tuple=False).flatten()
-        n_patients = int(indices.numel())
-        if n_patients == 0:
-            rows.append(
-                {
-                    "pred_cluster": cluster,
-                    "n_patients": 0,
-                    "fraction": 0.0,
-                    "event_count": 0,
-                    "event_rate": "",
-                    "mean_survival_time": "",
-                    "median_survival_time": "",
-                    "mean_risk_score": "",
-                    "median_risk_score": "",
-                }
-            )
-            continue
-        cluster_events = event[indices]
-        cluster_survival = survival_time[indices]
-        cluster_risk = risk_score[indices]
-        rows.append(
-            {
-                "pred_cluster": cluster,
-                "n_patients": n_patients,
-                "fraction": n_patients / float(total),
-                "event_count": int(cluster_events.sum().item()),
-                "event_rate": float(cluster_events.mean().item()),
-                "mean_survival_time": float(cluster_survival.mean().item()),
-                "median_survival_time": float(cluster_survival.median().item()),
-                "mean_risk_score": float(cluster_risk.mean().item()),
-                "median_risk_score": float(cluster_risk.median().item()),
-            }
-        )
-    return rows
+    return dataframe_records(CaseResultTables(payload).cluster_summary(n_clusters=n_clusters))
 
 
 def cluster_feature_summary_rows(
@@ -212,75 +308,20 @@ def cluster_feature_summary_rows(
     *,
     n_clusters: int,
 ) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    pred_cluster = payload["pred_cluster"].detach().cpu().long()
-    for cluster in range(n_clusters):
-        sample_indices = [
-            index for index in range(len(data)) if int(pred_cluster[index].item()) == cluster
-        ]
-        for feature_index, feature in enumerate(data.feature_names):
-            values: list[float] = []
-            times: list[float] = []
-            observed_patient_ids: set[str] = set()
-            for sample_index in sample_indices:
-                sample = data[sample_index].to_aligned()
-                observed = sample.mask[:, feature_index] > 0
-                if bool(observed.any()):
-                    observed_patient_ids.add(str(payload["patient_id"][sample_index]))
-                    values.extend(sample.x[observed, feature_index].detach().cpu().float().tolist())
-                    times.extend(sample.times[observed].detach().cpu().float().tolist())
-            rows.append(
-                {
-                    "pred_cluster": cluster,
-                    "feature": feature,
-                    "n_patients": len(sample_indices),
-                    "n_patients_observed": len(observed_patient_ids),
-                    "n_observations": len(values),
-                    "mean_value": mean_or_empty(values),
-                    "std_value": std_or_empty(values),
-                    "min_value": min(values) if values else "",
-                    "max_value": max(values) if values else "",
-                    "mean_time": mean_or_empty(times),
-                }
-            )
-    return rows
+    frame = CaseResultTables(payload).cluster_feature_summary(data, n_clusters=n_clusters)
+    return dataframe_records(frame)
 
 
 def save_cluster_summary_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     write_csv(
         path,
         rows,
-        fieldnames=[
-            "pred_cluster",
-            "n_patients",
-            "fraction",
-            "event_count",
-            "event_rate",
-            "mean_survival_time",
-            "median_survival_time",
-            "mean_risk_score",
-            "median_risk_score",
-        ],
+        fieldnames=CLUSTER_SUMMARY_COLUMNS,
     )
 
 
 def save_cluster_feature_summary_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    write_csv(
-        path,
-        rows,
-        fieldnames=[
-            "pred_cluster",
-            "feature",
-            "n_patients",
-            "n_patients_observed",
-            "n_observations",
-            "mean_value",
-            "std_value",
-            "min_value",
-            "max_value",
-            "mean_time",
-        ],
-    )
+    write_csv(path, rows, fieldnames=CLUSTER_FEATURE_SUMMARY_COLUMNS)
 
 
 def json_safe_metrics(metrics: Mapping[str, float]) -> dict[str, float | str]:
@@ -297,23 +338,75 @@ def write_csv(
     *,
     fieldnames: Sequence[str],
 ) -> None:
+    frame = pd.DataFrame(rows, columns=list(fieldnames))
+    write_dataframe_csv(path, frame)
+
+
+def write_dataframe_csv(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({name: row.get(name, "") for name in fieldnames})
+    frame.to_csv(path, index=False)
 
 
-def mean_or_empty(values: Sequence[float]) -> float | str:
-    if not values:
-        return ""
-    return sum(values) / len(values)
+def dataframe_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    return cast(list[dict[str, Any]], frame.to_dict(orient="records"))
 
 
-def std_or_empty(values: Sequence[float]) -> float | str:
-    if len(values) <= 1:
-        return ""
-    mean = sum(values) / len(values)
-    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
-    return math.sqrt(variance)
+def tensor_array(tensor: Tensor, *, dtype: Any) -> np.ndarray:
+    return tensor.detach().cpu().numpy().astype(dtype, copy=False)
+
+
+def patient_cluster_base_columns() -> list[str]:
+    return ["patient_id", "sample_index", "pred_cluster", "risk_score", "survival_time", "event"]
+
+
+def patient_summary_columns() -> list[str]:
+    return ["n_observations", "n_visits", "first_time", "last_time", "missing_fraction"]
+
+
+def patient_cluster_columns(probabilities: Tensor | None) -> list[str]:
+    probability_columns = (
+        []
+        if probabilities is None
+        else [f"cluster_prob_{index}" for index in range(probabilities.shape[1])]
+    )
+    return [*patient_cluster_base_columns(), *probability_columns, *patient_summary_columns()]
+
+
+def empty_cluster_summary_row(cluster: int) -> dict[str, Any]:
+    return {
+        "pred_cluster": cluster,
+        "n_patients": 0,
+        "fraction": 0.0,
+        "event_count": 0,
+        "event_rate": "",
+        "mean_survival_time": "",
+        "median_survival_time": "",
+        "mean_risk_score": "",
+        "median_risk_score": "",
+    }
+
+
+CLUSTER_SUMMARY_COLUMNS = [
+    "pred_cluster",
+    "n_patients",
+    "fraction",
+    "event_count",
+    "event_rate",
+    "mean_survival_time",
+    "median_survival_time",
+    "mean_risk_score",
+    "median_risk_score",
+]
+
+CLUSTER_FEATURE_SUMMARY_COLUMNS = [
+    "pred_cluster",
+    "feature",
+    "n_patients",
+    "n_patients_observed",
+    "n_observations",
+    "mean_value",
+    "std_value",
+    "min_value",
+    "max_value",
+    "mean_time",
+]

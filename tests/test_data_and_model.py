@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Literal, cast
 
+import pandas as pd
 import pytest
 import torch
 from pydantic import ValidationError
@@ -251,6 +252,162 @@ def test_sample_view_conversion_methods_and_dataset_init(tmp_path: Path) -> None
     loaded = ClinicalTimeSeriesDataset.load(save_path, return_kind="compact")
     assert isinstance(loaded.samples[0], CompactClinicalSample)
     assert torch.allclose(loaded.samples[0].x, compact_sample.x)
+
+
+def test_clinical_dataset_loads_default_csv_format(tmp_path: Path) -> None:
+    patients_csv = tmp_path / "patients.csv"
+    observations_csv = tmp_path / "observations.csv"
+    pd.DataFrame(
+        [
+            {"patient_id": "p1", "survival_time": 5, "event": 1, "cluster_label": 0},
+            {"patient_id": "p2", "survival_time": 4, "event": 0, "cluster_label": 1},
+        ]
+    ).to_csv(patients_csv, index=False)
+    pd.DataFrame(
+        [
+            {"patient_id": "p1", "time": 0, "feature": "crp", "value": 1.0},
+            {"patient_id": "p1", "time": 2, "feature": "albumin", "value": 3.0},
+            {"patient_id": "p2", "time": 1, "feature": "crp", "value": 2.0},
+            {"patient_id": "p2", "time": 1, "feature": "albumin", "value": 4.0},
+        ]
+    ).to_csv(observations_csv, index=False)
+
+    dataset = ClinicalTimeSeriesDataset.load_from_csv(
+        patients_csv=patients_csv,
+        observations_csv=observations_csv,
+        description="csv test",
+        metadata={"source": "unit_test"},
+    )
+    first = dataset[0].to_aligned()
+
+    assert len(dataset) == 2
+    assert dataset.description == "csv test"
+    assert dataset.feature_names == ["crp", "albumin"]
+    assert dataset.has_cluster_labels
+    assert dataset.metadata["source"] == "unit_test"
+    assert dataset.metadata["patient_ids"] == ["p1", "p2"]
+    assert dataset.metadata["n_observations"] == 4
+    assert dataset.metadata["patient_summaries"][0]["missing_fraction"] == 0.5
+    assert dataset.metadata["csv_columns"]["patients"]["patient_id"] == "patient_id"
+    assert torch.allclose(first.times, torch.tensor([0.0, 2.0]))
+    assert torch.allclose(first.x, torch.tensor([[1.0, 0.0], [0.0, 3.0]]))
+    assert torch.allclose(first.mask, torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
+    assert torch.allclose(first.delta_time, torch.tensor([[0.0, 0.0], [2.0, 2.0]]))
+
+
+def test_clinical_dataset_loads_custom_csv_columns_and_compact_view(tmp_path: Path) -> None:
+    patients_csv = tmp_path / "subjects.csv"
+    observations_csv = tmp_path / "measurements.csv"
+    pd.DataFrame(
+        [
+            {"subject": "p1", "duration": 5, "status": 1},
+            {"subject": "p2", "duration": 4, "status": 0},
+        ]
+    ).to_csv(patients_csv, index=False)
+    pd.DataFrame(
+        [
+            {"subject": "p1", "visit_time": 0, "marker": "crp", "reading": 1.0},
+            {"subject": "p1", "visit_time": 2, "marker": "albumin", "reading": 3.0},
+            {"subject": "p2", "visit_time": 1, "marker": "crp", "reading": 2.0},
+            {"subject": "p2", "visit_time": 1, "marker": "albumin", "reading": 4.0},
+        ]
+    ).to_csv(observations_csv, index=False)
+
+    dataset = ClinicalTimeSeriesDataset.load_from_csv(
+        patients_csv=patients_csv,
+        observations_csv=observations_csv,
+        patient_id_col="subject",
+        survival_time_col="duration",
+        event_col="status",
+        observation_id_col="subject",
+        time_col="visit_time",
+        feature_col="marker",
+        value_col="reading",
+        use_features=["albumin", "crp"],
+        return_kind="compact",
+    )
+    first = cast(CompactClinicalSample, dataset[0])
+
+    assert dataset.return_kind == "compact"
+    assert dataset.feature_names == ["albumin", "crp"]
+    assert not dataset.has_cluster_labels
+    assert torch.equal(first.feature_lengths, torch.tensor([1, 1]))
+    assert torch.allclose(first.x, torch.tensor([[3.0, 1.0]]))
+    assert dataset.metadata["csv_columns"]["observations"]["value"] == "reading"
+
+
+def test_clinical_dataset_save_to_csv_roundtrips_compact_dataset(tmp_path: Path) -> None:
+    first = make_clinical_sample(
+        times=torch.tensor([0.0, 1.0]),
+        x=torch.tensor([[1.0, 0.0], [2.0, 3.0]]),
+        mask=torch.tensor([[1.0, 0.0], [1.0, 1.0]]),
+        delta_time=torch.tensor([[0.0, 0.0], [1.0, 1.0]]),
+        survival_time=5.0,
+        event=1.0,
+        cluster_label=0,
+    )
+    second = make_clinical_sample(
+        times=torch.tensor([2.0]),
+        x=torch.tensor([[0.0, 4.0]]),
+        mask=torch.tensor([[0.0, 1.0]]),
+        delta_time=torch.tensor([[0.0, 0.0]]),
+        survival_time=6.0,
+        event=0.0,
+        cluster_label=1,
+    )
+    source = ClinicalTimeSeriesDataset(
+        [first, second],
+        feature_names=["crp", "albumin"],
+        metadata={"patient_ids": ["alpha", "beta"]},
+        return_kind="compact",
+    )
+    patients_csv = tmp_path / "patients.csv"
+    observations_csv = tmp_path / "observations.csv"
+
+    source.save_to_csv(patients_csv=patients_csv, observations_csv=observations_csv)
+    patient_rows = pd.read_csv(patients_csv, keep_default_na=False, dtype=str).to_dict("records")
+    observation_rows = pd.read_csv(
+        observations_csv,
+        keep_default_na=False,
+        dtype=str,
+    ).to_dict("records")
+    loaded = ClinicalTimeSeriesDataset.load_from_csv(
+        patients_csv=patients_csv,
+        observations_csv=observations_csv,
+    )
+
+    assert patient_rows[0]["patient_id"] == "alpha"
+    assert patient_rows[1]["patient_id"] == "beta"
+    assert len(observation_rows) == 4
+    assert loaded.metadata["patient_ids"] == ["alpha", "beta"]
+    assert loaded.has_cluster_labels
+    assert torch.allclose(loaded[0].to_aligned().x, first.x)
+    assert torch.allclose(loaded[0].to_aligned().mask, first.mask)
+    assert torch.allclose(loaded[1].to_aligned().x, second.x)
+    assert torch.allclose(loaded[1].to_aligned().mask, second.mask)
+
+
+def test_clinical_dataset_save_to_csv_accepts_explicit_patient_ids(tmp_path: Path) -> None:
+    sample = make_clinical_sample(
+        times=torch.tensor([0.0]),
+        x=torch.tensor([[1.0]]),
+        mask=torch.tensor([[1.0]]),
+        delta_time=torch.tensor([[0.0]]),
+        survival_time=5.0,
+        event=1.0,
+    )
+    dataset = ClinicalTimeSeriesDataset([sample], feature_names=["crp"])
+    patients_csv = tmp_path / "patients.csv"
+    observations_csv = tmp_path / "observations.csv"
+
+    dataset.save_to_csv(
+        patients_csv=patients_csv,
+        observations_csv=observations_csv,
+        patient_ids=["manual"],
+    )
+
+    rows = pd.read_csv(patients_csv, keep_default_na=False, dtype=str).to_dict("records")
+    assert rows == [{"patient_id": "manual", "survival_time": "5.0", "event": "1.0"}]
 
 
 def test_compact_to_aligned_rejects_duplicate_feature_times() -> None:

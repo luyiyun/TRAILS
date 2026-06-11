@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from logging import getLogger
 from pathlib import Path
 from typing import Any, Literal, cast
 
 import numpy as np
+import pandas as pd
 import torch
+from sklearn.preprocessing import LabelEncoder
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
@@ -17,6 +20,9 @@ Batch = dict[str, Tensor]
 type AlignedBatch = dict[str, Tensor]
 type CompactBatch = dict[str, Tensor]
 PATIENT_LEVEL_METADATA_KEYS = frozenset({"latent_z", "sequence_lengths"})
+
+
+logger = getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -196,6 +202,67 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
         }
         torch.save(payload, destination)
 
+    def save_to_csv(
+        self,
+        *,
+        patients_csv: str | Path,
+        observations_csv: str | Path,
+        patient_ids: Sequence[str] | None = None,
+        patient_id_col: str = "patient_id",
+        survival_time_col: str = "survival_time",
+        event_col: str = "event",
+        cluster_label_col: str = "cluster_label",
+        observation_patient_id_col: str = "patient_id",
+        time_col: str = "time",
+        feature_col: str = "feature",
+        value_col: str = "value",
+    ) -> None:
+        resolved_patient_ids = _resolve_csv_patient_ids(
+            self,
+            explicit_patient_ids=patient_ids,
+        )
+        aligned_samples = [sample.to_aligned() for sample in self.samples]
+
+        patient_rows: list[dict[str, Any]] = []
+        observation_rows: list[dict[str, Any]] = []
+        for patient_id, sample in zip(resolved_patient_ids, aligned_samples, strict=True):
+            patient_row: dict[str, Any] = {
+                patient_id_col: patient_id,
+                survival_time_col: float(sample.survival_time),
+                event_col: float(sample.event),
+            }
+            if sample.cluster_label is not None:
+                patient_row[cluster_label_col] = int(sample.cluster_label)
+            patient_rows.append(patient_row)
+
+            observed_positions = torch.nonzero(sample.mask > 0, as_tuple=False)
+            if int(observed_positions.shape[0]) == 0:
+                raise ValueError("save_to_csv requires every patient to have observed values.")
+            for visit_index, feature_index in observed_positions.tolist():
+                observation_rows.append(
+                    {
+                        observation_patient_id_col: patient_id,
+                        time_col: float(sample.times[int(visit_index)]),
+                        feature_col: self.feature_names[int(feature_index)],
+                        value_col: float(sample.x[int(visit_index), int(feature_index)]),
+                    }
+                )
+
+        patient_columns = [patient_id_col, survival_time_col, event_col]
+        if self.has_cluster_labels:
+            patient_columns.append(cluster_label_col)
+        observation_columns = [observation_patient_id_col, time_col, feature_col, value_col]
+
+        patients_path = Path(patients_csv)
+        observations_path = Path(observations_csv)
+        patients_path.parent.mkdir(parents=True, exist_ok=True)
+        observations_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(patient_rows, columns=patient_columns).to_csv(patients_path, index=False)
+        pd.DataFrame(observation_rows, columns=observation_columns).to_csv(
+            observations_path,
+            index=False,
+        )
+
     @classmethod
     def load(
         cls,
@@ -221,6 +288,248 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
             feature_names=list(payload["feature_names"]),
             description=str(payload.get("description", "")),
             metadata=dict(payload.get("metadata", {})),
+            return_kind=return_kind,
+        )
+
+    @classmethod
+    def load_from_csv(
+        cls,
+        *,
+        patients_csv: str | Path,
+        observations_csv: str | Path,
+        patient_id_col: str = "patient_id",
+        survival_time_col: str = "survival_time",
+        event_col: str = "event",
+        cluster_label_col: str = "cluster_label",
+        observation_id_col: str = "patient_id",
+        time_col: str = "time",
+        feature_col: str = "feature",
+        value_col: str = "value",
+        use_features: Sequence[str] = (),
+        description: str = "",
+        metadata: dict[str, Any] | None = None,
+        return_kind: SampleKind = "aligned",
+    ) -> ClinicalTimeSeriesDataset:
+        patients_path = Path(patients_csv)
+        observations_path = Path(observations_csv)
+        metadata = dict(metadata or {})
+
+        # -----------------------------------------
+        # 1. 读取患者信息
+        # -----------------------------------------
+        patient_frame = pd.read_csv(
+            patients_path,
+            na_values=[
+                "nan",
+                "+nan",
+                "-nan",
+                "inf",
+                "+inf",
+                "-inf",
+                "infinity",
+                "+infinity",
+                "-infinity",
+                " ",
+            ],
+        )
+        for col in [patient_id_col, survival_time_col, event_col]:
+            assert col in patient_frame.columns, f"{patients_path} must contain column {col!r}."
+
+        patient_frame = patient_frame.astype(
+            {patient_id_col: str, survival_time_col: float, event_col: float}
+        )
+        assert not patient_frame[patient_id_col].duplicated().any(), (
+            f"{patients_csv} has duplicated ids."
+        )
+        assert (patient_frame[survival_time_col].to_numpy() >= 0.0).any(), (
+            f"{patients_csv} must contain positive survival_time values."
+        )
+        assert bool((patient_frame[event_col].isin([0.0, 1.0])).any()), (
+            f"{patients_csv} must contain 0 or 1 event values."
+        )
+
+        has_cluster_labels = cluster_label_col is not None and cluster_label_col in patient_frame
+        if has_cluster_labels:
+            le = LabelEncoder()
+            patient_frame[cluster_label_col] = le.fit_transform(
+                patient_frame[cluster_label_col].to_numpy()
+            )
+            metadata["cluster_label_codes"] = le.classes_
+
+        assert patient_frame.shape[0] > 0, f"{patients_csv} must contain at least one patient row."
+
+        patient_frame.set_index(patient_id_col, inplace=True)
+
+        # -----------------------------------------
+        # 2. 读取纵向观测数值
+        # -----------------------------------------
+        observation_frame = pd.read_csv(
+            observations_path,
+            na_values=[
+                "nan",
+                "+nan",
+                "-nan",
+                "inf",
+                "+inf",
+                "-inf",
+                "infinity",
+                "+infinity",
+                "-infinity",
+                " ",
+            ],
+        )
+        for col in [observation_id_col, time_col, feature_col, value_col]:
+            assert col in observation_frame.columns, (
+                f"{observations_csv} must contain column {col!r}."
+            )
+        # configured_features = list(feature_order)
+        # _validate_unique_names(configured_features, label="feature_order")
+        # known_patients = {str(record["patient_id"]) for record in patient_records}
+
+        observation_frame = observation_frame.astype(
+            {
+                observation_id_col: str,
+                feature_col: str,
+                value_col: float,
+                time_col: float,
+            }
+        )
+
+        unknown_patient = ~(
+            observation_frame[observation_id_col].isin(patient_frame.index.tolist())
+        )
+        assert not bool(unknown_patient.any()), f"{observations_path} contains unknown patient_ids."
+
+        if use_features:
+            mask = observation_frame[feature_col].isin(use_features)
+            observation_frame: pd.DataFrame = observation_frame.loc[mask, :]
+
+        canonical_observations: pd.DataFrame = observation_frame.loc[
+            :, [observation_id_col, time_col, feature_col, value_col]
+        ].rename(
+            columns={
+                observation_id_col: "patient_id",
+                time_col: "time",
+                feature_col: "feature",
+                value_col: "value",
+            }
+        )
+
+        assert not canonical_observations.duplicated(["patient_id", "time", "feature"]).any(), (
+            f"{observations_path} contains duplicate observations."
+        )
+        assert bool(canonical_observations["value"].notna().all()), (
+            f"{observations_path} contains invalid numeric values."
+        )
+
+        # -----------------------------------------
+        # 3. 转换格式，形成dataset
+        # -----------------------------------------
+        feature_names = (
+            list(dict.fromkeys(use_features))
+            if use_features
+            else canonical_observations["feature"].unique().tolist()
+        )
+        grouped_observations = {
+            str(patient_id): patient_observations
+            for patient_id, patient_observations in canonical_observations.groupby(
+                canonical_observations["patient_id"],
+                sort=False,
+            )
+        }
+        missing_patient_ids = [
+            patient_id
+            for patient_id in patient_frame.index.tolist()
+            if patient_id not in grouped_observations
+        ]
+        if missing_patient_ids:
+            preview = ", ".join(str(patient_id) for patient_id in missing_patient_ids[:5])
+            suffix = (
+                "" if len(missing_patient_ids) <= 5 else f", ... ({len(missing_patient_ids)} total)"
+            )
+            raise ValueError(
+                f"Every patient must have at least one observation; missing: {preview}{suffix}"
+            )
+
+        samples = []
+        patient_summaries = []
+        for i, (pid, dfi) in enumerate(grouped_observations.items()):
+            dfi_wide = dfi.pivot(index="time", columns="feature", values="value")
+            dfi_wide.sort_index(inplace=True)
+            dfi_wide = dfi_wide.reindex(columns=feature_names)
+            mask = torch.as_tensor(dfi_wide.notna().to_numpy(copy=True), dtype=torch.float32)
+            times = torch.as_tensor(dfi_wide.index.to_numpy(copy=True), dtype=torch.float32)
+            x = torch.as_tensor(dfi_wide.fillna(0.0).to_numpy(copy=True), dtype=torch.float32)
+
+            samples.append(
+                AlignedClinicalSample(
+                    times=times,
+                    x=x,
+                    mask=mask,
+                    delta_time=compute_delta_time(times, mask),
+                    survival_time=torch.as_tensor(
+                        patient_frame.loc[pid, survival_time_col], dtype=torch.float32
+                    ),
+                    event=torch.as_tensor(patient_frame.loc[pid, event_col], dtype=torch.float32),
+                    cluster_label=(
+                        None
+                        if not has_cluster_labels
+                        else torch.as_tensor(
+                            patient_frame.loc[pid, cluster_label_col], dtype=torch.long
+                        )
+                    ),
+                )
+            )
+
+            n_observations = int(mask.sum().item())
+            total_slots = x.shape[0] * x.shape[1]
+            patient_summaries.append(
+                {
+                    "patient_id": pid,
+                    "sample_index": i,
+                    "n_observations": n_observations,
+                    "n_visits": x.shape[0],
+                    "first_time": times[0].item(),
+                    "last_time": times[-1].item(),
+                    "missing_fraction": 1.0 - (n_observations / float(total_slots)),
+                }
+            )
+
+        csv_columns = {
+            "patients": {
+                "patient_id": patient_id_col,
+                "survival_time": survival_time_col,
+                "event": event_col,
+                "cluster_label": cluster_label_col,
+            },
+            "observations": {
+                "patient_id": observation_id_col,
+                "time": time_col,
+                "feature": feature_col,
+                "value": value_col,
+            },
+        }
+        generated_metadata = {
+            "csv_columns": csv_columns,
+            "feature_names": feature_names,
+            "has_cluster_labels": has_cluster_labels,
+            "n_features": len(feature_names),
+            "n_observations": int(canonical_observations.shape[0]),
+            "n_patients": len(samples),
+            "observations_csv": str(observations_path),
+            "patient_ids": [str(record["patient_id"]) for record in patient_summaries],
+            "patient_summaries": patient_summaries,
+            "patients_csv": str(patients_path),
+            "source": "csv",
+        }
+        generated_metadata.update(metadata)
+        metadata = generated_metadata
+
+        return cls(
+            samples,
+            feature_names=feature_names,
+            description=description,
+            metadata=metadata,
             return_kind=return_kind,
         )
 
@@ -323,6 +632,56 @@ def _slice_patient_metadata(value: Any, indices: np.ndarray, *, source_count: in
     if isinstance(value, tuple) and len(value) == source_count:
         return tuple(value[int(index)] for index in indices)
     return value
+
+
+def _resolve_csv_patient_ids(
+    dataset: ClinicalTimeSeriesDataset,
+    *,
+    explicit_patient_ids: Sequence[str] | None,
+) -> list[str]:
+    if explicit_patient_ids is not None:
+        return _validate_csv_patient_ids(
+            explicit_patient_ids,
+            expected_count=len(dataset),
+            label="patient_ids",
+        )
+
+    metadata_patient_ids = dataset.metadata.get("patient_ids")
+    if isinstance(metadata_patient_ids, Sequence) and not isinstance(
+        metadata_patient_ids,
+        str | bytes,
+    ):
+        values = [str(value).strip() for value in metadata_patient_ids]
+        if _is_valid_csv_patient_ids(values, expected_count=len(dataset)):
+            return values
+
+    return [f"sample_{index}" for index in range(len(dataset))]
+
+
+def _validate_csv_patient_ids(
+    patient_ids: Sequence[str],
+    *,
+    expected_count: int,
+    label: str,
+) -> list[str]:
+    values = [str(value).strip() for value in patient_ids]
+    if len(values) != expected_count:
+        raise ValueError(f"{label} length must match dataset length.")
+    empty = [index for index, value in enumerate(values) if value == ""]
+    if empty:
+        raise ValueError(f"{label} cannot contain empty values.")
+    duplicates = sorted({value for value in values if values.count(value) > 1})
+    if duplicates:
+        raise ValueError(f"{label} cannot contain duplicates: {', '.join(duplicates)}.")
+    return values
+
+
+def _is_valid_csv_patient_ids(values: Sequence[str], *, expected_count: int) -> bool:
+    return (
+        len(values) == expected_count
+        and all(value != "" for value in values)
+        and len(set(values)) == len(values)
+    )
 
 
 def make_clinical_sample(

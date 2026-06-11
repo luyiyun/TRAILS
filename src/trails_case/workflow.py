@@ -23,16 +23,12 @@ from trails.estimator import TrailsEstimator
 from trails.trainer import HistoryEntry
 
 from .config import CaseApplicationConfig, DiagnosticsConfig, SwanLabConfig
-from .data import case_dataset_summary, load_case_dataset_from_csv
+from .data import case_dataset_summary, patient_summaries_from_metadata
 from .evaluation import (
-    cluster_feature_summary_rows,
-    cluster_summary_rows,
+    CaseResultTables,
     evaluate_case_predictions,
     json_safe_metrics,
     prediction_payload_from_case_dataset,
-    save_cluster_feature_summary_csv,
-    save_cluster_summary_csv,
-    save_patient_clusters_csv,
     save_prediction_payload,
 )
 
@@ -49,30 +45,79 @@ class CaseOutputPaths:
     cluster_feature_summary: Path
     summary: Path
 
+    @classmethod
+    def from_config(
+        cls,
+        config: CaseApplicationConfig,
+        hydra_run_dir: Path,
+    ) -> CaseOutputPaths:
+        return cls(
+            dataset=resolve_path(config.case.outputs.dataset, hydra_run_dir),
+            dataset_summary=resolve_path(config.case.outputs.dataset_summary, hydra_run_dir),
+            predictions=resolve_path(config.case.outputs.predictions, hydra_run_dir),
+            patient_clusters=resolve_path(config.case.outputs.patient_clusters, hydra_run_dir),
+            cluster_summary=resolve_path(config.case.outputs.cluster_summary, hydra_run_dir),
+            cluster_feature_summary=resolve_path(
+                config.case.outputs.cluster_feature_summary,
+                hydra_run_dir,
+            ),
+            summary=resolve_path(config.case.outputs.summary, hydra_run_dir),
+        )
+
+
+def configure_torch_threads(torch_threads: int | None) -> None:
+    if torch_threads is None:
+        return
+    torch.set_num_threads(torch_threads)
+
+
+def resolve_path(path: Path, root: Path) -> Path:
+    return path if path.is_absolute() else root / path
+
 
 def run_case_command(
     config: CaseApplicationConfig,
     hydra_run_dir: Path,
     project_root: Path,
 ) -> dict[str, Any]:
+    # --------------------------------------------------------------
+    # 1. config and output paths
+    # --------------------------------------------------------------
     configure_torch_threads(config.training.parallel.torch_threads)
     hydra_run_dir.mkdir(parents=True, exist_ok=True)
-    outputs = case_output_paths(config, hydra_run_dir)
-    patients_csv = resolve_project_path(config.case.patients_csv, project_root)
-    observations_csv = resolve_project_path(config.case.observations_csv, project_root)
+    outputs = CaseOutputPaths.from_config(config, hydra_run_dir)
 
-    imported = load_case_dataset_from_csv(
-        patients_csv=patients_csv,
-        observations_csv=observations_csv,
-        columns=config.case.columns,
+    # --------------------------------------------------------------
+    # 2. load dataset from case CSVs
+    # --------------------------------------------------------------
+    patient_columns = config.case.columns.patients
+    observation_columns = config.case.columns.observations
+    dataset = ClinicalTimeSeriesDataset.load_from_csv(
+        patients_csv=resolve_path(config.case.patients_csv, project_root),
+        observations_csv=resolve_path(config.case.observations_csv, project_root),
+        patient_id_col=patient_columns.patient_id,
+        survival_time_col=patient_columns.survival_time,
+        event_col=patient_columns.event,
+        cluster_label_col=patient_columns.cluster_label,
+        observation_id_col=observation_columns.patient_id,
+        time_col=observation_columns.time,
+        feature_col=observation_columns.feature,
+        value_col=observation_columns.value,
+        use_features=config.case.feature_order,
         description=config.case.description,
-        feature_order=config.case.feature_order,
+        metadata={
+            "case_columns": config.case.columns.model_dump(mode="json"),
+            "source": "case_csv",
+        },
     )
-    dataset = imported.dataset
     dataset.save(outputs.dataset)
-    dataset_summary = case_dataset_summary(imported)
+    dataset_summary = case_dataset_summary(dataset)
     save_json(outputs.dataset_summary, dataset_summary)
+    patient_summaries = patient_summaries_from_metadata(dataset.metadata)
 
+    # --------------------------------------------------------------
+    # 3. configure TRAILS
+    # --------------------------------------------------------------
     seed = config.training.trainer.seed
     artifacts = resolve_artifact_names(config.training.artifacts.names)
     trails_config = TrailsConfig(
@@ -87,6 +132,9 @@ def run_case_command(
         seed=seed,
     )
 
+    # --------------------------------------------------------------
+    # 4. train and predict
+    # --------------------------------------------------------------
     start_swanlab_run(
         config.training.swanlab,
         trails_config,
@@ -118,6 +166,9 @@ def run_case_command(
         if config.training.swanlab.enabled:
             swanlab.finish()
 
+    # --------------------------------------------------------------
+    # 5. save artifacts and prediction tables
+    # --------------------------------------------------------------
     save_case_training_artifacts(
         config=config,
         trails_config=trails_config,
@@ -128,23 +179,26 @@ def run_case_command(
         artifacts=artifacts,
     )
     if config.training.artifacts.save is not None:
-        estimator.save(resolve_project_path(config.training.artifacts.save, project_root))
+        estimator.save(resolve_path(config.training.artifacts.save, project_root))
 
     save_prediction_payload(outputs.predictions, prediction)
-    save_patient_clusters_csv(
+    tables = CaseResultTables(prediction)
+    tables.save_patient_clusters_csv(
         outputs.patient_clusters,
-        payload=prediction,
-        patient_summaries=imported.patient_summaries,
+        patient_summaries=patient_summaries,
     )
-    cluster_rows = cluster_summary_rows(prediction, n_clusters=trails_config.model.n_clusters)
-    feature_rows = cluster_feature_summary_rows(
+    tables.save_cluster_summary_csv(
+        outputs.cluster_summary, n_clusters=trails_config.model.n_clusters
+    )
+    tables.save_cluster_feature_summary_csv(
+        outputs.cluster_feature_summary,
         dataset,
-        prediction,
         n_clusters=trails_config.model.n_clusters,
     )
-    save_cluster_summary_csv(outputs.cluster_summary, cluster_rows)
-    save_cluster_feature_summary_csv(outputs.cluster_feature_summary, feature_rows)
 
+    # --------------------------------------------------------------
+    # 6. summarize
+    # --------------------------------------------------------------
     summary = {
         "case": config.case.model_dump(mode="json"),
         "command": "case",
@@ -216,21 +270,6 @@ def save_case_training_artifacts(
             diagnostics,
             random_state=trails_config.seed,
         )
-
-
-def case_output_paths(config: CaseApplicationConfig, hydra_run_dir: Path) -> CaseOutputPaths:
-    return CaseOutputPaths(
-        dataset=resolve_output_path(config.case.outputs.dataset, hydra_run_dir),
-        dataset_summary=resolve_output_path(config.case.outputs.dataset_summary, hydra_run_dir),
-        predictions=resolve_output_path(config.case.outputs.predictions, hydra_run_dir),
-        patient_clusters=resolve_output_path(config.case.outputs.patient_clusters, hydra_run_dir),
-        cluster_summary=resolve_output_path(config.case.outputs.cluster_summary, hydra_run_dir),
-        cluster_feature_summary=resolve_output_path(
-            config.case.outputs.cluster_feature_summary,
-            hydra_run_dir,
-        ),
-        summary=resolve_output_path(config.case.outputs.summary, hydra_run_dir),
-    )
 
 
 def output_payload(outputs: CaseOutputPaths) -> dict[str, str]:
@@ -333,20 +372,6 @@ def log_swanlab_history(entry: HistoryEntry) -> None:
 def log_swanlab_case_metrics(metrics: Mapping[str, float], history: list[HistoryEntry]) -> None:
     step = int(float(history[-1]["global_epoch"])) if history else 0
     swanlab.log({f"case/{name}": value for name, value in metrics.items()}, step=step)
-
-
-def configure_torch_threads(torch_threads: int | None) -> None:
-    if torch_threads is None:
-        return
-    torch.set_num_threads(torch_threads)
-
-
-def resolve_project_path(path: Path, project_root: Path) -> Path:
-    return path if path.is_absolute() else project_root / path
-
-
-def resolve_output_path(path: Path, hydra_run_dir: Path) -> Path:
-    return path if path.is_absolute() else hydra_run_dir / path
 
 
 def compact_log_path(path: Path, *, keep_parts: int = 4) -> str:

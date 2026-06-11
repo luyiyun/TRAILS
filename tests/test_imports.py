@@ -27,3 +27,10 @@ def test_case_package_does_not_import_simulation_package() -> None:
     for path in Path("src/trails_case").glob("*.py"):
         text = path.read_text()
         assert "trails_simulate" not in text
+
+
+def test_case_package_does_not_use_stdlib_csv() -> None:
+    for path in Path("src/trails_case").glob("*.py"):
+        text = path.read_text()
+        assert "import csv" not in text
+        assert "csv." not in text

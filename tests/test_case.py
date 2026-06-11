@@ -1,8 +1,8 @@
-import csv
 import json
 from pathlib import Path
 from typing import Any, cast
 
+import pandas as pd
 import pytest
 import torch
 from hydra import compose, initialize_config_dir
@@ -24,25 +24,22 @@ def write_case_csvs(root: Path, *, include_labels: bool = True) -> tuple[Path, P
     patients = root / "patients.csv"
     observations = root / "observations.csv"
     root.mkdir(parents=True, exist_ok=True)
-    label_header = ",cluster_label" if include_labels else ""
-    label_rows = ["p1,5,1,0", "p2,4,0,1"] if include_labels else ["p1,5,1", "p2,4,0"]
-    patients.write_text(
-        "\n".join([f"patient_id,survival_time,event{label_header}", *label_rows, ""]),
-        encoding="utf-8",
-    )
-    observations.write_text(
-        "\n".join(
-            [
-                "patient_id,time,feature,value",
-                "p1,0,crp,1.0",
-                "p1,2,albumin,3.0",
-                "p2,1,crp,2.0",
-                "p2,1,albumin,4.0",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    patient_rows: list[dict[str, Any]] = [
+        {"patient_id": "p1", "survival_time": 5, "event": 1},
+        {"patient_id": "p2", "survival_time": 4, "event": 0},
+    ]
+    if include_labels:
+        patient_rows[0]["cluster_label"] = 0
+        patient_rows[1]["cluster_label"] = 1
+    pd.DataFrame(patient_rows).to_csv(patients, index=False)
+    pd.DataFrame(
+        [
+            {"patient_id": "p1", "time": 0, "feature": "crp", "value": 1.0},
+            {"patient_id": "p1", "time": 2, "feature": "albumin", "value": 3.0},
+            {"patient_id": "p2", "time": 1, "feature": "crp", "value": 2.0},
+            {"patient_id": "p2", "time": 1, "feature": "albumin", "value": 4.0},
+        ]
+    ).to_csv(observations, index=False)
     return patients, observations
 
 
@@ -61,19 +58,18 @@ def test_case_config_defaults_validate() -> None:
 
 
 def test_case_importer_builds_aligned_dataset(tmp_path: Path) -> None:
-    from trails_case.config import CaseColumnsConfig
-    from trails_case.data import load_case_dataset_from_csv
+    from trails.data import ClinicalTimeSeriesDataset
+    from trails_case.data import patient_summaries_from_metadata
 
     patients, observations = write_case_csvs(tmp_path)
 
-    imported = load_case_dataset_from_csv(
+    dataset = ClinicalTimeSeriesDataset.load_from_csv(
         patients_csv=patients,
         observations_csv=observations,
-        columns=CaseColumnsConfig(),
         description="case test",
-        feature_order=[],
+        metadata={"source": "case_csv"},
     )
-    dataset = imported.dataset
+    patient_summaries = patient_summaries_from_metadata(dataset.metadata)
     first = dataset[0].to_aligned()
 
     assert len(dataset) == 2
@@ -84,28 +80,24 @@ def test_case_importer_builds_aligned_dataset(tmp_path: Path) -> None:
     assert torch.allclose(first.x, torch.tensor([[1.0, 0.0], [0.0, 3.0]]))
     assert torch.allclose(first.mask, torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
     assert torch.allclose(first.delta_time, torch.tensor([[0.0, 0.0], [2.0, 2.0]]))
-    assert imported.patient_summaries[0].missing_fraction == 0.5
-    assert imported.patient_summaries[1].n_visits == 1
+    assert patient_summaries[0].missing_fraction == 0.5
+    assert patient_summaries[1].n_visits == 1
 
 
 def test_case_importer_respects_configured_feature_order(tmp_path: Path) -> None:
-    from trails_case.config import CaseColumnsConfig
-    from trails_case.data import load_case_dataset_from_csv
+    from trails.data import ClinicalTimeSeriesDataset
 
     patients, observations = write_case_csvs(tmp_path)
 
-    imported = load_case_dataset_from_csv(
+    dataset = ClinicalTimeSeriesDataset.load_from_csv(
         patients_csv=patients,
         observations_csv=observations,
-        columns=CaseColumnsConfig(),
         description="case test",
-        feature_order=["albumin", "crp"],
+        use_features=["albumin", "crp"],
     )
 
-    assert imported.dataset.feature_names == ["albumin", "crp"]
-    assert torch.allclose(
-        imported.dataset[0].to_aligned().x, torch.tensor([[0.0, 1.0], [3.0, 0.0]])
-    )
+    assert dataset.feature_names == ["albumin", "crp"]
+    assert torch.allclose(dataset[0].to_aligned().x, torch.tensor([[0.0, 1.0], [3.0, 0.0]]))
 
 
 @pytest.mark.parametrize(
@@ -114,27 +106,27 @@ def test_case_importer_respects_configured_feature_order(tmp_path: Path) -> None
         (
             "patient_id,survival_time\np1,5\n",
             "patient_id,time,feature,value\np1,0,crp,1\n",
-            "missing required column",
+            "must contain column 'event'",
         ),
         (
             "patient_id,survival_time,event\np1,5,1\n",
             "patient_id,time,feature,value\np2,0,crp,1\n",
-            "unknown patient_id",
+            "contains unknown patient_ids",
         ),
         (
             "patient_id,survival_time,event\np1,5,1\n",
             "patient_id,time,feature,value\np1,0,crp,1\np1,0.0,crp,2\n",
-            "duplicate observation",
+            "contains duplicate observations",
         ),
         (
             "patient_id,survival_time,event\np1,5,1\n",
             "patient_id,time,feature,value\np1,0,crp,abc\n",
-            "must be numeric",
+            "could not convert string to float",
         ),
         (
             "patient_id,survival_time,event\np1,5,2\n",
             "patient_id,time,feature,value\np1,0,crp,1\n",
-            "must be 0 or 1",
+            "must contain 0 or 1 event values",
         ),
         (
             "patient_id,survival_time,event\np1,5,1\np2,4,0\n",
@@ -149,21 +141,18 @@ def test_case_importer_validation_errors(
     observations_text: str,
     match: str,
 ) -> None:
-    from trails_case.config import CaseColumnsConfig
-    from trails_case.data import load_case_dataset_from_csv
+    from trails.data import ClinicalTimeSeriesDataset
 
     patients = tmp_path / "patients.csv"
     observations = tmp_path / "observations.csv"
     patients.write_text(patients_text, encoding="utf-8")
     observations.write_text(observations_text, encoding="utf-8")
 
-    with pytest.raises(ValueError, match=match):
-        load_case_dataset_from_csv(
+    with pytest.raises((AssertionError, ValueError), match=match):
+        ClinicalTimeSeriesDataset.load_from_csv(
             patients_csv=patients,
             observations_csv=observations,
-            columns=CaseColumnsConfig(),
             description="bad case",
-            feature_order=[],
         )
 
 
@@ -235,8 +224,11 @@ def test_case_command_writes_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert (tmp_path / "run" / "cluster_feature_summary.csv").exists()
     assert (tmp_path / "run" / "case_summary.json").exists()
 
-    with (tmp_path / "run" / "patient_clusters.csv").open(encoding="utf-8", newline="") as handle:
-        rows = list(csv.DictReader(handle))
+    rows = pd.read_csv(
+        tmp_path / "run" / "patient_clusters.csv",
+        keep_default_na=False,
+        dtype=str,
+    ).to_dict("records")
     assert rows[0]["patient_id"] == "p1"
     assert rows[0]["pred_cluster"] == "0"
     assert "cluster_prob_0" in rows[0]

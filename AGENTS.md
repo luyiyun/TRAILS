@@ -60,6 +60,9 @@ clean reusable method library.
   Makefile experiment wrappers.
 - All new Python code must have type annotations.
 - `pyright` uses `standard` mode.
+- CSV/tabular ingestion, export, and downstream tabular manipulation should
+  prefer pandas DataFrames and numpy vectorized operations over stdlib `csv` and
+  ad hoc row loops; torch remains the right tool for tensor/model code.
 - Inside `src/trails`, prefer relative imports for project modules.
 - Inside `src/trails_simulate` and `src/trails_case`, use absolute imports from
   `trails`.
