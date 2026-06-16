@@ -1,0 +1,16 @@
+- .git/**
+- .venv/**
+- __pycache__/**
+- .mypy_cache/**
+- .pytest_cache/**
+- data/**
+- datasets/**
+- outputs/**
+- output/**
+- results/**
+- checkpoints/**
+- logs/**
+- wandb/**
+- mlruns/**
+- .ruff_cache/**
+- swanlog/**

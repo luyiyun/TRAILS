@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from trails.config import ModelConfig, TrainerConfig
 
@@ -102,6 +102,23 @@ class CaseOutputConfig(BaseModel):
     summary: Path = Path("case_summary.json")
 
 
+class CaseKSelectionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    candidate_clusters: tuple[int, ...] = ()
+    valid_size: float | None = Field(default=None, gt=0.0, lt=1.0)
+    result_dir: Path = Path("k_selection")
+
+    @model_validator(mode="after")
+    def validate_candidate_clusters(self) -> CaseKSelectionConfig:
+        if any(value <= 1 for value in self.candidate_clusters):
+            raise ValueError("case.k_selection.candidate_clusters values must be greater than 1.")
+        if len(set(self.candidate_clusters)) != len(self.candidate_clusters):
+            raise ValueError("case.k_selection.candidate_clusters values must be unique.")
+        return self
+
+
 class CaseConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -111,6 +128,7 @@ class CaseConfig(BaseModel):
     feature_order: tuple[str, ...] = ()
     outputs: CaseOutputConfig = Field(default_factory=CaseOutputConfig)
     columns: CaseColumnsConfig = Field(default_factory=CaseColumnsConfig)
+    k_selection: CaseKSelectionConfig = Field(default_factory=CaseKSelectionConfig)
 
 
 class CaseApplicationConfig(BaseModel):

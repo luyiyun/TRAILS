@@ -55,6 +55,10 @@ def test_case_config_defaults_validate() -> None:
     assert config.training.artifacts.names == ("all",)
     assert config.training.diagnostics.latent_embeddings.enabled
     assert config.case.outputs.patient_clusters == Path("patient_clusters.csv")
+    assert config.case.k_selection.enabled
+    assert config.case.k_selection.candidate_clusters == (2, 3, 4, 5)
+    assert config.case.k_selection.valid_size == 0.2
+    assert config.case.k_selection.result_dir == Path("k_selection")
 
 
 def test_case_importer_builds_aligned_dataset(tmp_path: Path) -> None:
@@ -202,6 +206,7 @@ def test_case_command_writes_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: 
             "case=default",
             f"case.patients_csv={patients}",
             f"case.observations_csv={observations}",
+            "case.k_selection.enabled=false",
             "training.swanlab.enabled=false",
             "training.diagnostics.latent_embeddings.enabled=false",
             "training.trainer.device=cpu",
@@ -237,3 +242,215 @@ def test_case_command_writes_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     summary = json.loads((tmp_path / "run" / "case_summary.json").read_text(encoding="utf-8"))
     assert summary["data"]["n_patients"] == 2
     assert summary["outputs"]["patient_clusters"] == str(tmp_path / "run" / "patient_clusters.csv")
+    assert "k_selection" not in summary
+
+
+def test_case_command_k_selection_writes_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from trails_case import workflow
+    from trails_case.config import CaseApplicationConfig
+
+    patients, observations = write_case_csvs(tmp_path / "data", include_labels=False)
+    selection_calls: list[dict[str, Any]] = []
+    fit_calls: list[int] = []
+
+    class FakeEstimator:
+        def __init__(self, config: Any) -> None:
+            self.config = config
+            self.history = [
+                {
+                    "epoch": 1,
+                    "global_epoch": 1,
+                    "stage": "vade",
+                    "train": {"loss": 1.0, "cindex": 0.5},
+                    "valid": {"loss": 0.8, "cindex": 0.6},
+                }
+            ]
+
+        def select_n_clusters(
+            self,
+            data: Any,
+            *,
+            candidate_clusters: tuple[int, ...],
+            valid_fraction: float,
+            inherit_best: bool,
+            result_dir: str | Path,
+        ) -> dict[str, dict[str, float]]:
+            result_path = Path(result_dir)
+            result_path.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                [
+                    {"n_clusters": 3, "rank": 1, "cindex": 0.8, "bic": 10.0},
+                    {"n_clusters": 2, "rank": 2, "cindex": 0.7, "bic": 12.0},
+                    {"n_clusters": 4, "rank": 3, "cindex": 0.6, "bic": 13.0},
+                    {"n_clusters": 5, "rank": 4, "cindex": 0.5, "bic": 14.0},
+                ]
+            ).to_csv(result_path / "selection_metrics.csv", index=False)
+            selection_calls.append(
+                {
+                    "candidate_clusters": candidate_clusters,
+                    "base_k": self.config.model.n_clusters,
+                    "n_samples": len(data),
+                    "valid_fraction": valid_fraction,
+                    "inherit_best": inherit_best,
+                    "result_dir": result_path,
+                }
+            )
+            if inherit_best:
+                self.config = self.config.model_copy(
+                    update={"model": self.config.model.model_copy(update={"n_clusters": 3})}
+                )
+            return {
+                "rank": {"3": 1.0, "2": 2.0, "4": 3.0, "5": 4.0},
+                "cindex": {"3": 0.8, "2": 0.7, "4": 0.6, "5": 0.5},
+                "bic": {"3": 10.0, "2": 12.0, "4": 13.0, "5": 14.0},
+                "mean_nll": {"3": 1.0, "2": 1.2, "4": 1.3, "5": 1.4},
+                "n_parameters": {"3": 65.0, "2": 43.0, "4": 87.0, "5": 109.0},
+                "bic_norm": {"3": 0.0, "2": 1.0, "4": 1.0, "5": 1.0},
+                "selection_score": {"3": 1.2806248474865698, "2": 0.7, "4": 0.6, "5": 0.5},
+                "cluster_empty_count": {"3": 0.0, "2": 0.0, "4": 0.0, "5": 0.0},
+                "cluster_entropy": {"3": 1.0, "2": 1.0, "4": 1.0, "5": 1.0},
+            }
+
+        def fit(self, *_args: Any, history_callback: Any = None, **_kwargs: Any) -> Any:
+            fit_calls.append(self.config.model.n_clusters)
+            if history_callback is not None:
+                history_callback(self.history[0])
+            return self
+
+        def predict(self, data: Any) -> torch.Tensor:
+            return torch.arange(len(data), dtype=torch.long) % self.config.model.n_clusters
+
+        def predict_risk(self, data: Any) -> torch.Tensor:
+            return torch.arange(len(data), dtype=torch.float32)
+
+        def predict_proba(self, data: Any) -> torch.Tensor:
+            probabilities = torch.zeros(len(data), self.config.model.n_clusters)
+            for index in range(len(data)):
+                probabilities[index, index % self.config.model.n_clusters] = 1.0
+            return probabilities
+
+        def save(self, path: str | Path) -> None:
+            destination = Path(path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"config": self.config.model_dump(mode="json")}, destination)
+
+    monkeypatch.setattr(workflow, "TrailsEstimator", FakeEstimator)
+    config = CaseApplicationConfig.model_validate(
+        compose_payload(
+            "case=default",
+            f"case.patients_csv={patients}",
+            f"case.observations_csv={observations}",
+            "case.k_selection.enabled=true",
+            "training.swanlab.enabled=false",
+            "training.diagnostics.latent_embeddings.enabled=false",
+            "training.trainer.device=cpu",
+        )
+    )
+
+    result = workflow.run_case_command(config, tmp_path / "run", ROOT)
+
+    k_selection_path = tmp_path / "run" / "k_selection"
+    assert k_selection_path.is_dir()
+    rows = pd.read_csv(k_selection_path / "selection_metrics.csv").to_dict("records")
+    assert [int(row["rank"]) for row in rows] == [1, 2, 3, 4]
+    assert int(rows[0]["n_clusters"]) == 3
+    assert selection_calls == [
+        {
+            "candidate_clusters": (2, 3, 4, 5),
+            "base_k": 4,
+            "n_samples": 2,
+            "valid_fraction": 0.2,
+            "inherit_best": True,
+            "result_dir": k_selection_path,
+        }
+    ]
+    assert fit_calls == []
+    assert result["training"]["n_clusters"] == 3
+    assert result["outputs"]["k_selection"] == str(k_selection_path)
+    assert result["k_selection"]["selected_k"] == 3
+
+    summary = json.loads((tmp_path / "run" / "case_summary.json").read_text(encoding="utf-8"))
+    assert summary["training"]["n_clusters"] == 3
+    assert summary["k_selection"]["result_dir"] == str(k_selection_path)
+    assert summary["k_selection"]["metrics"]["rank"]["3"] == 1.0
+
+
+def test_swanlab_history_logs_train_and_validation_cindex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trails_case import workflow
+
+    logged: list[tuple[dict[str, float], int | None]] = []
+    monkeypatch.setattr(
+        workflow.swanlab,
+        "log",
+        lambda metrics, step=None: logged.append((dict(metrics), step)),
+    )
+
+    workflow.log_swanlab_history(
+        {
+            "epoch": 1,
+            "global_epoch": 5,
+            "stage": "vade",
+            "train": {"loss": 1.0, "cindex": 0.55},
+            "valid": {"loss": 0.9, "cindex": 0.65},
+        }
+    )
+
+    assert logged == [
+        (
+            {
+                "epoch/global": 5,
+                "epoch/local": 1,
+                "train/loss": 1.0,
+                "train/cindex": 0.55,
+                "val/loss": 0.9,
+                "val/cindex": 0.65,
+            },
+            5,
+        )
+    ]
+
+
+def test_swanlab_case_metrics_logs_cindex_and_k_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trails_case import workflow
+
+    logged: list[tuple[dict[str, float | int], int | None]] = []
+    monkeypatch.setattr(
+        workflow.swanlab,
+        "log",
+        lambda metrics, step=None: logged.append((dict(metrics), step)),
+    )
+    selection = {
+        "rank": {"3": 1.0},
+        "cindex": {"3": 0.8},
+        "bic": {"3": 10.0},
+        "selection_score": {"3": 1.28},
+        "mean_nll": {"3": 1.0},
+    }
+
+    workflow.log_swanlab_case_metrics(
+        {"cindex": 0.75, "cluster_entropy": 0.9},
+        [
+            {
+                "epoch": 1,
+                "global_epoch": 7,
+                "stage": "vade",
+                "train": {"loss": 1.0},
+            }
+        ],
+        selection,
+    )
+
+    metrics, step = logged[0]
+    assert step == 7
+    assert metrics["case/cindex"] == 0.75
+    assert metrics["selection/selected_k"] == 3
+    assert metrics["selection/best_cindex"] == 0.8
+    assert metrics["selection/best_bic"] == 10.0
+    assert metrics["selection/best_score"] == 1.28

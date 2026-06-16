@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from collections.abc import Callable
 from itertools import chain
 from typing import Literal, NotRequired, TypedDict
@@ -19,6 +20,8 @@ from .metrics import (
 )
 from .model import TrailsLossBreakdown, TrailsModelOutput, TrailsSurvVaderModel
 from .progress import ProgressBar
+
+LOGGER = logging.getLogger(__name__)
 
 
 class HistoryEntry(TypedDict):
@@ -122,10 +125,20 @@ class TrailsTrainer:
         self,
         data: ClinicalTimeSeriesDataset,
         history_callback: HistoryCallback | None = None,
+        validation_data: ClinicalTimeSeriesDataset | None = None,
     ) -> list[HistoryEntry]:
         # 根据我们使用的input调整数据格式
         data = data.with_return_kind(self._model_return_kind())
-        if self.config.valid_size > 0:
+        if validation_data is not None:
+            if self.config.valid_size > 0:
+                LOGGER.warning(
+                    "Explicit validation_data was provided; trainer.valid_size=%s is ignored "
+                    "for this fit call.",
+                    self.config.valid_size,
+                )
+            validation_data = validation_data.with_return_kind(self._model_return_kind())
+            valid_loader = make_data_loader(validation_data, self.config, shuffle=False)
+        elif self.config.valid_size > 0:
             data, validation_data = data.split([1 - self.config.valid_size, self.config.valid_size])
             valid_loader = make_data_loader(validation_data, self.config, shuffle=False)
         else:

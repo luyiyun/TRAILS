@@ -1,3 +1,5 @@
+import logging
+import math
 from pathlib import Path
 from typing import Literal
 
@@ -15,7 +17,13 @@ from trails.config import (
     TrainerConfig,
 )
 from trails.data import ClinicalTimeSeriesDataset, make_clinical_sample
-from trails.estimator import TrailsEstimator, observed_time_range
+from trails.estimator import (
+    TrailsEstimator,
+    observed_time_range,
+    score_k_selection_rows,
+    selected_k_from_selection_metrics,
+    selection_metrics_to_rows,
+)
 from trails_simulate import (
     ClinicalTimeSeriesDatasetGenerator,
     ClinicalTimeSeriesDatasetGeneratorConfig,
@@ -42,6 +50,13 @@ def tiny_config(n_features: int) -> TrailsConfig:
             valid_size=0.0,
         ),
         seed=13,
+    )
+
+
+def tiny_config_with_validation(n_features: int, valid_size: float = 0.25) -> TrailsConfig:
+    config = tiny_config(n_features)
+    return config.model_copy(
+        update={"trainer": config.trainer.model_copy(update={"valid_size": valid_size})}
     )
 
 
@@ -174,6 +189,109 @@ def test_estimator_latent_diagnostics_exports_labels_and_embeddings() -> None:
         torch.ones(8),
         atol=1e-5,
     )
+
+
+def test_estimator_selection_metrics_include_cindex_and_bic() -> None:
+    data = simulate_dataset(seed=29)
+    estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data)
+    metrics = estimator.selection_metrics(data)
+
+    for name in ["cindex", "bic", "mean_nll", "n_parameters"]:
+        assert name in metrics
+        assert math.isfinite(metrics[name])
+    assert metrics["n_parameters"] == pytest.approx(17.0)
+    assert "cluster_empty_count" in metrics
+    assert "cluster_entropy" in metrics
+
+
+def test_select_n_clusters_scores_ranks_and_can_inherit_best(tmp_path: Path) -> None:
+    data = simulate_dataset(seed=41)
+    estimator = TrailsEstimator(tiny_config(data.n_features))
+    result = estimator.select_n_clusters(
+        data,
+        candidate_clusters=(2, 3),
+        valid_fraction=0.25,
+        inherit_best=True,
+        result_dir=tmp_path / "k_selection",
+    )
+
+    selected_k = selected_k_from_selection_metrics(result)
+    rows = selection_metrics_to_rows(result)
+    assert selected_k in {2, 3}
+    assert estimator.config.model.n_clusters == selected_k
+    assert estimator.history
+    assert set(result["bic"]) == {"2", "3"}
+    assert {int(row["n_clusters"]) for row in rows} == {2, 3}
+    assert [int(row["rank"]) for row in rows] == [1, 2]
+    for row in rows:
+        assert 0.0 <= float(row["bic_norm"]) <= 1.0
+        assert math.isfinite(float(row["selection_score"]))
+    assert (tmp_path / "k_selection" / "selection_metrics.csv").exists()
+    assert (tmp_path / "k_selection" / "selection_metrics.json").exists()
+    for n_clusters in [2, 3]:
+        candidate_dir = tmp_path / "k_selection" / f"k{n_clusters}"
+        assert (candidate_dir / "model.pt").exists()
+        assert (candidate_dir / "history.json").exists()
+        assert (candidate_dir / "metrics.json").exists()
+        assert (candidate_dir / "config.json").exists()
+
+
+def test_select_n_clusters_reuses_one_validation_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = simulate_dataset(seed=43)
+    config = tiny_config_with_validation(data.n_features)
+    split_calls: list[tuple[int, tuple[float, ...], int]] = []
+    original_split = ClinicalTimeSeriesDataset.split
+
+    def tracking_split(
+        self: ClinicalTimeSeriesDataset,
+        fraction: list[float],
+        seed: int = 0,
+    ) -> list[ClinicalTimeSeriesDataset]:
+        split_calls.append((len(self), tuple(fraction), seed))
+        return original_split(self, fraction, seed)
+
+    monkeypatch.setattr(ClinicalTimeSeriesDataset, "split", tracking_split)
+
+    TrailsEstimator(config).select_n_clusters(data, candidate_clusters=(2, 3))
+
+    assert split_calls == [(8, (0.75, 0.25), config.seed)]
+
+
+def test_k_selection_bic_normalization_handles_equal_bic() -> None:
+    rows = score_k_selection_rows(
+        [
+            {"n_clusters": 2, "cindex": 0.3, "bic": 10.0, "mean_nll": 1.0},
+            {"n_clusters": 3, "cindex": 0.7, "bic": 10.0, "mean_nll": 1.1},
+        ]
+    )
+
+    assert [float(row["bic_norm"]) for row in rows] == [0.0, 0.0]
+    assert int(rows[0]["n_clusters"]) == 3
+    assert int(rows[0]["rank"]) == 1
+
+
+def test_fit_with_explicit_validation_data_warns_and_uses_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    data = simulate_dataset(seed=47)
+    train_data, validation_data = data.split([0.75, 0.25], seed=11)
+    config = tiny_config_with_validation(data.n_features)
+
+    caplog.set_level(logging.WARNING, logger="trails.trainer")
+    estimator = TrailsEstimator(config).fit(train_data, validation_data=validation_data)
+
+    assert "Explicit validation_data was provided" in caplog.text
+    assert "trainer.valid_size=0.25 is ignored" in caplog.text
+    assert "valid" in estimator.history[-1]
+
+
+def test_fit_internal_validation_split_remains_default_behavior() -> None:
+    data = simulate_dataset(seed=53)
+    estimator = TrailsEstimator(tiny_config_with_validation(data.n_features)).fit(data)
+
+    assert "valid" in estimator.history[-1]
 
 
 def test_estimator_fit_without_internal_validation_skips_validation_metrics() -> None:

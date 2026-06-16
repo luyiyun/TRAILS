@@ -19,7 +19,12 @@ from trails.artifacts import (
 )
 from trails.config import DataConfig, TrailsConfig, resolve_batch_size
 from trails.data import ClinicalTimeSeriesDataset
-from trails.estimator import TrailsEstimator
+from trails.estimator import (
+    KSelectionMetrics,
+    TrailsEstimator,
+    best_selection_metrics,
+    selected_k_from_selection_metrics,
+)
 from trails.trainer import HistoryEntry
 
 from .config import CaseApplicationConfig, DiagnosticsConfig, SwanLabConfig
@@ -131,6 +136,28 @@ def run_case_command(
         ),
         seed=seed,
     )
+    k_selection_metrics: KSelectionMetrics | None = None
+    k_selection_result_dir: Path | None = None
+    estimator = TrailsEstimator(trails_config)
+    if config.case.k_selection.enabled:
+        k_selection_result_dir = resolve_path(config.case.k_selection.result_dir, hydra_run_dir)
+        k_selection_metrics = estimator.select_n_clusters(
+            dataset,
+            candidate_clusters=case_k_selection_candidates(config),
+            valid_fraction=case_k_selection_valid_fraction(config),
+            inherit_best=True,
+            result_dir=k_selection_result_dir,
+        )
+        trails_config = estimator.config
+        selected_k = selected_k_from_selection_metrics(k_selection_metrics)
+        best_metrics = best_selection_metrics(k_selection_metrics)
+        LOGGER.info(
+            "Selected case K=%s score=%.4g cindex=%.4g bic=%.4g",
+            selected_k,
+            best_metrics["selection_score"],
+            best_metrics["cindex"],
+            best_metrics["bic"],
+        )
 
     # --------------------------------------------------------------
     # 4. train and predict
@@ -142,13 +169,19 @@ def run_case_command(
         outputs,
         artifacts,
         config.training.diagnostics,
+        k_selection_metrics=k_selection_metrics,
+        k_selection_result_dir=k_selection_result_dir,
     )
-    estimator = TrailsEstimator(trails_config)
     try:
-        estimator.fit(
-            dataset,
-            history_callback=log_swanlab_history if config.training.swanlab.enabled else None,
-        )
+        if config.case.k_selection.enabled:
+            if config.training.swanlab.enabled:
+                for entry in estimator.history:
+                    log_swanlab_history(entry)
+        else:
+            estimator.fit(
+                dataset,
+                history_callback=log_swanlab_history if config.training.swanlab.enabled else None,
+            )
         prediction = prediction_payload_from_case_dataset(
             dataset,
             patient_ids=list(dataset.metadata["patient_ids"]),
@@ -161,7 +194,7 @@ def run_case_command(
             n_clusters=trails_config.model.n_clusters,
         )
         if config.training.swanlab.enabled:
-            log_swanlab_case_metrics(metrics, estimator.history)
+            log_swanlab_case_metrics(metrics, estimator.history, k_selection_metrics)
     finally:
         if config.training.swanlab.enabled:
             swanlab.finish()
@@ -177,6 +210,8 @@ def run_case_command(
         metrics=metrics,
         outputs=outputs,
         artifacts=artifacts,
+        k_selection_metrics=k_selection_metrics,
+        k_selection_result_dir=k_selection_result_dir,
     )
     if config.training.artifacts.save is not None:
         estimator.save(resolve_path(config.training.artifacts.save, project_root))
@@ -206,7 +241,7 @@ def run_case_command(
         "data": dataset_summary,
         "hydra_run_dir": str(hydra_run_dir),
         "metrics": json_safe_metrics(metrics),
-        "outputs": output_payload(outputs),
+        "outputs": output_payload(outputs, k_selection_result_dir),
         "seed": seed,
         "training": {
             "history": estimator.history,
@@ -214,6 +249,8 @@ def run_case_command(
             "trails_config": trails_config.model_dump(mode="json"),
         },
     }
+    if k_selection_metrics is not None:
+        summary["k_selection"] = k_selection_payload(k_selection_metrics, k_selection_result_dir)
     save_json(outputs.summary, summary)
     LOGGER.info(
         "Completed case run: patients=%s features=%s k=%s prediction=%s",
@@ -234,6 +271,8 @@ def save_case_training_artifacts(
     metrics: Mapping[str, float],
     outputs: CaseOutputPaths,
     artifacts: frozenset[str],
+    k_selection_metrics: KSelectionMetrics | None = None,
+    k_selection_result_dir: Path | None = None,
 ) -> None:
     should_save_diagnostics = config.training.diagnostics.latent_embeddings.enabled
     if not artifacts and not should_save_diagnostics:
@@ -251,6 +290,8 @@ def save_case_training_artifacts(
                 outputs=outputs,
                 artifacts=artifacts,
                 created_at=created_at,
+                k_selection_metrics=k_selection_metrics,
+                k_selection_result_dir=k_selection_result_dir,
             ),
         )
     if "history" in artifacts:
@@ -272,8 +313,11 @@ def save_case_training_artifacts(
         )
 
 
-def output_payload(outputs: CaseOutputPaths) -> dict[str, str]:
-    return {
+def output_payload(
+    outputs: CaseOutputPaths,
+    k_selection_result_dir: Path | None = None,
+) -> dict[str, str]:
+    payload = {
         "case_summary": str(outputs.summary),
         "cluster_feature_summary": str(outputs.cluster_feature_summary),
         "cluster_summary": str(outputs.cluster_summary),
@@ -282,6 +326,9 @@ def output_payload(outputs: CaseOutputPaths) -> dict[str, str]:
         "patient_clusters": str(outputs.patient_clusters),
         "predictions": str(outputs.predictions),
     }
+    if k_selection_result_dir is not None:
+        payload["k_selection"] = str(k_selection_result_dir)
+    return payload
 
 
 def case_run_config(
@@ -291,14 +338,16 @@ def case_run_config(
     outputs: CaseOutputPaths,
     artifacts: frozenset[str],
     created_at: datetime,
+    k_selection_metrics: KSelectionMetrics | None = None,
+    k_selection_result_dir: Path | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "artifacts": sorted(artifacts),
         "case": app_config.case.model_dump(mode="json"),
         "config": trails_config.model_dump(mode="json"),
         "created_at": created_at.isoformat(timespec="seconds"),
         "diagnostics": app_config.training.diagnostics.model_dump(mode="json"),
-        "outputs": output_payload(outputs),
+        "outputs": output_payload(outputs, k_selection_result_dir),
         "swanlab": app_config.training.swanlab.model_dump(mode="json"),
         "train_args": {
             "batch_size": trails_config.trainer.batch_size,
@@ -325,6 +374,9 @@ def case_run_config(
             "warmup_epochs": trails_config.trainer.warmup_epochs,
         },
     }
+    if k_selection_metrics is not None:
+        payload["k_selection"] = k_selection_payload(k_selection_metrics, k_selection_result_dir)
+    return payload
 
 
 def start_swanlab_run(
@@ -334,6 +386,8 @@ def start_swanlab_run(
     outputs: CaseOutputPaths,
     artifacts: frozenset[str],
     diagnostics_config: DiagnosticsConfig,
+    k_selection_metrics: KSelectionMetrics | None = None,
+    k_selection_result_dir: Path | None = None,
 ) -> None:
     if not swanlab_config.enabled:
         return
@@ -348,11 +402,16 @@ def start_swanlab_run(
             "case": app_config.case.model_dump(mode="json"),
             "config": trails_config.model_dump(mode="json"),
             "diagnostics": diagnostics_config.model_dump(mode="json"),
-            "outputs": output_payload(outputs),
+            "outputs": output_payload(outputs, k_selection_result_dir),
             "save_artifacts": sorted(artifacts),
             "swanlab": swanlab_config.model_dump(mode="json"),
         },
     }
+    if k_selection_metrics is not None:
+        init_kwargs["config"]["k_selection"] = k_selection_payload(
+            k_selection_metrics,
+            k_selection_result_dir,
+        )
     if swanlab_config.mode is not None:
         init_kwargs["mode"] = swanlab_config.mode
     swanlab.init(**init_kwargs)
@@ -369,9 +428,60 @@ def log_swanlab_history(entry: HistoryEntry) -> None:
     swanlab.log(metrics, step=entry["global_epoch"])
 
 
-def log_swanlab_case_metrics(metrics: Mapping[str, float], history: list[HistoryEntry]) -> None:
+def log_swanlab_case_metrics(
+    metrics: Mapping[str, float],
+    history: list[HistoryEntry],
+    k_selection_metrics: KSelectionMetrics | None = None,
+) -> None:
     step = int(float(history[-1]["global_epoch"])) if history else 0
-    swanlab.log({f"case/{name}": value for name, value in metrics.items()}, step=step)
+    payload = {f"case/{name}": value for name, value in metrics.items()}
+    if k_selection_metrics is not None:
+        payload.update(swanlab_k_selection_metrics(k_selection_metrics))
+    swanlab.log(payload, step=step)
+
+
+def case_k_selection_candidates(config: CaseApplicationConfig) -> tuple[int, ...]:
+    if config.case.k_selection.candidate_clusters:
+        return config.case.k_selection.candidate_clusters
+    return tuple(range(2, config.training.model.n_clusters + 1))
+
+
+def case_k_selection_valid_fraction(config: CaseApplicationConfig) -> float:
+    valid_fraction = (
+        config.training.trainer.valid_size
+        if config.case.k_selection.valid_size is None
+        else config.case.k_selection.valid_size
+    )
+    if valid_fraction <= 0.0 or valid_fraction >= 1.0:
+        raise ValueError(
+            "case K selection requires case.k_selection.valid_size or "
+            "training.trainer.valid_size to be greater than 0 and less than 1."
+        )
+    return valid_fraction
+
+
+def k_selection_payload(
+    metrics: KSelectionMetrics,
+    result_dir: Path | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "selected_k": selected_k_from_selection_metrics(metrics),
+        "best": best_selection_metrics(metrics),
+        "metrics": metrics,
+    }
+    if result_dir is not None:
+        payload["result_dir"] = str(result_dir)
+    return payload
+
+
+def swanlab_k_selection_metrics(metrics: KSelectionMetrics) -> dict[str, float | int]:
+    best = best_selection_metrics(metrics)
+    return {
+        "selection/selected_k": selected_k_from_selection_metrics(metrics),
+        "selection/best_cindex": float(best["cindex"]),
+        "selection/best_bic": float(best["bic"]),
+        "selection/best_score": float(best["selection_score"]),
+    }
 
 
 def compact_log_path(path: Path, *, keep_parts: int = 4) -> str:

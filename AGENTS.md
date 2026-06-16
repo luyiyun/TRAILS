@@ -189,6 +189,14 @@ clean reusable method library.
   only for internal early stopping, and saves the converted dataset, model,
   history, predictions, patient-level clusters, cluster summaries, feature
   summaries, and `case_summary.json` under `outputs/case/<run.name>`.
+- `case.k_selection.enabled=true` runs estimator-level holdout K selection before
+  final case training. Empty `case.k_selection.candidate_clusters` means
+  `2..training.model.n_clusters`; candidates are scored by validation C-index and
+  latent MoG BIC using `sqrt(CI^2 + (1 - BIC_norm)^2)`. Candidate training and
+  selection metrics share the same holdout validation split. Case runs inherit
+  the best candidate estimator instead of retraining on all patients, and
+  candidate models, histories, metrics, configs, and aggregate selection tables
+  are saved under `case.k_selection.result_dir`.
 - The `case=default` config selects `training=case`, which defaults to SwanLab
   enabled, complete artifacts, and latent embedding diagnostics.
 
