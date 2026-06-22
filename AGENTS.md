@@ -48,6 +48,7 @@ clean reusable method library.
 - Run lightweight baselines on existing splits: `uv run main.py command=baseline paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run main.py command=optim paths.data_root=data/simulated/base`
 - Summarize train and baseline results: `uv run main.py command=summary 'summary.train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'summary.baseline_roots=[outputs/baseline/base-...]' 'summary.train_labels=[base,mtan]' 'summary.baseline_labels=[kmeans]'`
+- Compute cluster attribution lines for a saved model: `uv run python scripts/cluster_attribution.py --model-path outputs/case/case-.../model.pt --data-path outputs/case/case-.../case_dataset.pt --plot-features 6`
 - Format: `uv run ruff format`
 - Lint: `uv run ruff check --fix`
 - Type check: `UV_CACHE_DIR=/tmp/uv-cache uv run pyright`
@@ -182,6 +183,12 @@ clean reusable method library.
   method labels when repeated method names appear across roots, aggregates by
   scenario/sample size/K/method label, and writes CSV/JSON plus one publication-facing
   metrics-by-K PNG/PDF grid per scenario.
+- `scripts/cluster_attribution.py` is the lightweight attribution entrypoint. It
+  loads a saved `TrailsEstimator` checkpoint and matching `ClinicalTimeSeriesDataset`,
+  computes Captum integrated-gradient contributions of observed values to VaDE cluster
+  logits, aggregates them into fixed time-bin by feature tables with SEM, and writes
+  one multi-cluster line plot using `--plot-features` as either Top-N or explicit
+  feature names.
 - `command=case` lives in `trails_case` and reads real-data CSV inputs:
   `patients.csv` with `patient_id`, `survival_time`, `event`, and optional
   `cluster_label`; `observations.csv` with `patient_id`, `time`, `feature`,

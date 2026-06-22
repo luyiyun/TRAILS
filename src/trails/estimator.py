@@ -180,9 +180,14 @@ class TrailsEstimator:
         torch.save(checkpoint, destination)
 
     @classmethod
-    def load(cls, path: str | Path) -> TrailsEstimator:
+    def load(cls, path: str | Path, *, device: str | None = None) -> TrailsEstimator:
         checkpoint: dict[str, Any] = torch.load(Path(path), map_location="cpu", weights_only=False)
-        estimator = cls(TrailsConfig.model_validate(checkpoint["config"]))
+        config = TrailsConfig.model_validate(checkpoint["config"])
+        if device is not None:
+            config = config.model_copy(
+                update={"trainer": config.trainer.model_copy(update={"device": device})}
+            )
+        estimator = cls(config)
         estimator.model.load_state_dict(checkpoint["model_state"])
         estimator.history = list(checkpoint.get("history", []))
         return estimator

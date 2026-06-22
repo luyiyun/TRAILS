@@ -28,6 +28,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "captum>=0.9.0",
     "ipdb>=0.13.13",
     "optuna>=4.8.0",
     "pyright>=1.1.409",
@@ -45,6 +46,6 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.pyright]
-include = ["src", "tests", "main.py"]
+include = ["src", "tests", "scripts", "main.py"]
 typeCheckingMode = "standard"
 reportPrivateImportUsage = false

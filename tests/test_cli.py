@@ -63,6 +63,10 @@ def test_command_enum_rejects_removed_paper_grid() -> None:
     with pytest.raises(ValidationError, match="Input should be"):
         ApplicationConfig.model_validate(payload)
 
+    attribution_payload = compose_payload("command=attribution")
+    with pytest.raises(ValidationError, match="Input should be"):
+        ApplicationConfig.model_validate(attribution_payload)
+
 
 def test_summary_command_config_validates_required_roots(tmp_path: Path) -> None:
     from trails_simulate.config import ApplicationConfig
