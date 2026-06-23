@@ -1,6 +1,8 @@
 import csv
+import importlib.util
 import json
 import logging
+import sys
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,13 +17,88 @@ from pydantic import ValidationError
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def load_script(name: str) -> Any:
+    module_name = f"{name}_script"
+    script_path = ROOT / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(module_name, script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module: Any = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def compose_payload(*overrides: str) -> dict[str, Any]:
+    command, config_overrides = command_config_from_overrides(overrides)
     config_dir = str((ROOT / "configs").resolve())
+    __import__("trails_simulate.config")
     with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
-        cfg = compose(config_name="config", overrides=list(overrides))
+        cfg = compose(config_name=f"{command}", overrides=config_overrides)
     payload = OmegaConf.to_container(cfg, resolve=True)
     assert isinstance(payload, dict)
     return cast(dict[str, Any], payload)
+
+
+def with_paths_dir(config: Any, run_dir: Path) -> Any:
+    return config.model_copy(update={"paths": config.paths.model_copy(update={"dir": run_dir})})
+
+
+def command_config_from_overrides(overrides: tuple[str, ...]) -> tuple[str, list[str]]:
+    command = "simulate"
+    config_overrides: list[str] = []
+    for override in overrides:
+        if override.startswith("command="):
+            command = override.split("=", maxsplit=1)[1]
+            continue
+        config_overrides.append(override)
+
+    if command != "simulate":
+        return command, config_overrides
+    baseline_fields = {
+        "fallback_n_clusters",
+        "fpca_components",
+        "fpca_grid_size",
+        "kmeans_iters",
+        "methods",
+        "n_clusters",
+        "ridge_alpha",
+        "risk_feature_weight",
+    }
+    summary_fields = {
+        "baseline_labels",
+        "baseline_roots",
+        "metrics",
+        "train_labels",
+        "train_roots",
+    }
+    training_prefixes = (
+        "artifacts.",
+        "diagnostics.",
+        "model.",
+        "parallel.",
+        "swanlab.",
+        "trainer.",
+    )
+    if any(override.split("=", maxsplit=1)[0] in baseline_fields for override in overrides):
+        return "baseline", config_overrides
+    if any(
+        override.startswith("optim.") or override.startswith("optim=") for override in overrides
+    ):
+        return "optim", config_overrides
+    if any(override.split("=", maxsplit=1)[0] in summary_fields for override in overrides):
+        return "summary", config_overrides
+    if any(
+        override.startswith(training_prefixes) or override.startswith("training=")
+        for override in overrides
+    ):
+        return "train", config_overrides
+    if any(
+        override.startswith("paths.data_root") or override.startswith("paths.explicit_split")
+        for override in overrides
+    ):
+        return "train", config_overrides
+    return command, config_overrides
 
 
 def write_synthetic_split(root: Path, *, n_clusters: int, seed: int) -> None:
@@ -55,63 +132,127 @@ def write_metrics_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def test_command_enum_rejects_removed_paper_grid() -> None:
-    from trails_simulate.config import ApplicationConfig
+def test_legacy_single_entrypoint_is_removed() -> None:
+    assert not (ROOT / "main.py").exists()
+    assert not (ROOT / "configs" / "config.yaml").exists()
+    assert not (ROOT / "configs" / "commands").exists()
+    assert not (ROOT / "configs" / "baseline" / "default.yaml").exists()
+    assert not (ROOT / "configs" / "summary" / "default.yaml").exists()
+    assert not (ROOT / "configs" / "case" / "default.yaml").exists()
+    assert not (ROOT / "configs" / "paths" / "default.yaml").exists()
+    assert not (ROOT / "src" / "trails_simulate" / "workflow.py").exists()
+    assert not (ROOT / "src" / "trails_case" / "workflow.py").exists()
 
-    payload = compose_payload("command=paper_grid")
+    for command in ("simulate", "train", "baseline", "optim", "summary", "case"):
+        assert (ROOT / "scripts" / f"{command}.py").exists()
+        assert (ROOT / "configs" / f"{command}.yaml").exists()
 
-    with pytest.raises(ValidationError, match="Input should be"):
-        ApplicationConfig.model_validate(payload)
 
-    attribution_payload = compose_payload("command=attribution")
-    with pytest.raises(ValidationError, match="Input should be"):
-        ApplicationConfig.model_validate(attribution_payload)
+def test_command_configs_flatten_non_optim_namespaces() -> None:
+    forbidden_namespaces = {"baseline", "case", "simulation", "summary", "training"}
+
+    for command in ("simulate", "train", "baseline", "summary", "case"):
+        payload = compose_payload(f"command={command}")
+        assert forbidden_namespaces.isdisjoint(payload)
+        assert {"root", "prefix", "suffix", "dir"}.issubset(payload["paths"])
+
+    optim_payload = compose_payload("command=optim")
+    assert "optim" in optim_payload
+    assert "training" not in optim_payload
+    assert {"root", "prefix", "suffix", "dir"}.issubset(optim_payload["paths"])
+
+
+def test_paths_defaults_are_inlined_into_data_commands() -> None:
+    for command in ("train", "baseline", "optim"):
+        root_config = (ROOT / "configs" / f"{command}.yaml").read_text(encoding="utf-8")
+        payload = compose_payload(f"command={command}")
+        assert "/paths: default" not in root_config
+        assert payload["paths"]["data_root"] == "data/simulated"
+        assert payload["paths"]["explicit_split"] == {
+            "enabled": False,
+            "train_data": "data/simulated/train.pt",
+            "test_data": "data/simulated/test.pt",
+        }
+
+    for command in ("simulate", "summary", "case"):
+        root_config = (ROOT / "configs" / f"{command}.yaml").read_text(encoding="utf-8")
+        payload = compose_payload(f"command={command}")
+        assert "/paths: default" not in root_config
+        assert "data_root" not in payload["paths"]
+        assert "explicit_split" not in payload["paths"]
+
+
+def test_legacy_namespace_overrides_are_rejected() -> None:
+    from hydra.errors import ConfigCompositionException
+
+    invalid_overrides = [
+        ("command=simulate", "simulation.train_size=[10]"),
+        ("command=train", "training.trainer.device=cpu"),
+        ("command=baseline", "baseline=default"),
+        ("command=baseline", "baseline.methods=[summary_kmeans]"),
+        ("command=summary", "summary=default"),
+        ("command=summary", "summary.train_roots=[outputs/train/demo]"),
+        ("command=case", "case=default"),
+        ("command=case", "case.observations_csv=data/case/observations.csv"),
+    ]
+
+    for command_override, invalid_override in invalid_overrides:
+        with pytest.raises(ConfigCompositionException):
+            compose_payload(command_override, invalid_override)
+
+
+def test_removed_paths_default_group_is_rejected_by_validation() -> None:
+    from trails_simulate.config import TrainApplicationConfig
+
+    payload = compose_payload("command=train", "paths=default")
+
+    with pytest.raises(ValidationError, match="paths"):
+        TrainApplicationConfig.model_validate(payload)
 
 
 def test_summary_command_config_validates_required_roots(tmp_path: Path) -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import SummaryApplicationConfig
 
     payload = compose_payload("command=summary")
 
     with pytest.raises(ValidationError, match="at least one"):
-        ApplicationConfig.model_validate(payload)
+        SummaryApplicationConfig.model_validate(payload)
 
     roots_payload = compose_payload("command=summary")
-    roots_payload["summary"]["train_roots"] = [str(tmp_path / "train")]
-    roots_payload["summary"]["baseline_roots"] = [str(tmp_path / "baseline")]
-    roots_config = ApplicationConfig.model_validate(roots_payload)
+    roots_payload["train_roots"] = [str(tmp_path / "train")]
+    roots_payload["baseline_roots"] = [str(tmp_path / "baseline")]
+    roots_config = SummaryApplicationConfig.model_validate(roots_payload)
 
-    assert roots_config.command == "summary"
-    assert roots_config.summary.train_roots == (tmp_path / "train",)
-    assert roots_config.summary.baseline_roots == (tmp_path / "baseline",)
-    assert roots_config.summary.metrics == ("acc", "ari", "nmi", "cindex")
+    assert roots_config.train_roots == (tmp_path / "train",)
+    assert roots_config.baseline_roots == (tmp_path / "baseline",)
+    assert roots_config.metrics == ("acc", "ari", "nmi", "cindex")
 
     plural_payload = compose_payload("command=summary")
-    plural_payload["summary"]["train_roots"] = [
+    plural_payload["train_roots"] = [
         str(tmp_path / "train-base"),
         str(tmp_path / "train-mtan"),
     ]
-    plural_payload["summary"]["train_labels"] = ["base", "mtan"]
-    plural_config = ApplicationConfig.model_validate(plural_payload)
+    plural_payload["train_labels"] = ["base", "mtan"]
+    plural_config = SummaryApplicationConfig.model_validate(plural_payload)
 
-    assert plural_config.summary.train_roots == (
+    assert plural_config.train_roots == (
         tmp_path / "train-base",
         tmp_path / "train-mtan",
     )
-    assert plural_config.summary.train_labels == ("base", "mtan")
+    assert plural_config.train_labels == ("base", "mtan")
 
     bad_label_payload = compose_payload("command=summary")
-    bad_label_payload["summary"]["baseline_roots"] = [
+    bad_label_payload["baseline_roots"] = [
         str(tmp_path / "baseline-a"),
         str(tmp_path / "baseline-b"),
     ]
-    bad_label_payload["summary"]["baseline_labels"] = ["only-one"]
+    bad_label_payload["baseline_labels"] = ["only-one"]
     with pytest.raises(ValidationError, match="baseline_labels"):
-        ApplicationConfig.model_validate(bad_label_payload)
+        SummaryApplicationConfig.model_validate(bad_label_payload)
 
 
 def test_simulation_configs_validate() -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import SimulateApplicationConfig
 
     expected_features = {
         "quick": 10,
@@ -121,63 +262,77 @@ def test_simulation_configs_validate() -> None:
         "high_dimension": 24,
     }
     for simulation, n_features in expected_features.items():
-        app_config = ApplicationConfig.model_validate(compose_payload(f"simulation={simulation}"))
-
-        assert app_config.command == "simulate"
-        assert app_config.simulation.name == simulation
-        assert len(app_config.simulation.train_size) == len(app_config.simulation.test_size)
-        assert all(value > 0 for value in app_config.simulation.train_size)
-        assert all(value > 0 for value in app_config.simulation.test_size)
-        assert all(k > 1 for k in app_config.simulation.generator.n_clusters_tuple_)
-        assert len(app_config.simulation.generator.feature_names) == n_features
-        assert (
-            "patients"
-            not in cast(dict[str, Any], compose_payload(f"simulation={simulation}")["simulation"])[
-                "generator"
-            ]
+        app_config = SimulateApplicationConfig.model_validate(
+            compose_payload(f"simulation={simulation}")
         )
 
-    base_config = ApplicationConfig.model_validate(compose_payload("simulation=base"))
-    assert base_config.simulation.train_size == (500, 1000, 2000, 3000, 5000)
-    assert base_config.simulation.test_size == (300, 300, 300, 300, 300)
-    assert base_config.simulation.generator.n_clusters_tuple_ == (2, 3, 4, 5)
-    assert base_config.simulation.repeats == 5
+        assert app_config.name == simulation
+        assert len(app_config.train_size) == len(app_config.test_size)
+        assert all(value > 0 for value in app_config.train_size)
+        assert all(value > 0 for value in app_config.test_size)
+        assert all(k > 1 for k in app_config.generator.n_clusters_tuple_)
+        assert len(app_config.generator.feature_names) == n_features
+        assert "patients" not in cast(
+            dict[str, Any], compose_payload(f"simulation={simulation}")["generator"]
+        )
+
+    base_config = SimulateApplicationConfig.model_validate(compose_payload("simulation=base"))
+    assert base_config.train_size == (500, 1000, 2000, 3000, 5000)
+    assert base_config.test_size == (300, 300, 300, 300, 300)
+    assert base_config.generator.n_clusters_tuple_ == (2, 3, 4, 5)
+    assert base_config.repeats == 5
 
 
 def test_baseline_config_includes_fpca_and_rejects_duplicate_methods() -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import BaselineApplicationConfig
 
-    app_config = ApplicationConfig.model_validate(compose_payload())
-    assert app_config.baseline.methods == (
+    app_config = BaselineApplicationConfig.model_validate(compose_payload("command=baseline"))
+    assert app_config.methods == (
         "summary_kmeans",
         "risk_stratified_kmeans",
         "fpca_kmeans",
     )
+    assert app_config.seed == 20260517
+    assert app_config.fallback_n_clusters == 3
 
-    payload = compose_payload("baseline.methods=[summary_kmeans,summary_kmeans]")
+    payload = compose_payload("methods=[summary_kmeans,summary_kmeans]")
     with pytest.raises(ValidationError, match="duplicates"):
-        ApplicationConfig.model_validate(payload)
+        BaselineApplicationConfig.model_validate(payload)
 
 
-def test_run_config_defaults_infer_prefix_and_keep_paths_explicit() -> None:
-    from trails_simulate.config import ApplicationConfig
+def test_paths_config_defaults_use_composed_output_dir_and_keep_inputs_explicit() -> None:
+    from trails_simulate.config import SimulateApplicationConfig, TrainApplicationConfig
 
-    simulate_config = ApplicationConfig.model_validate(compose_payload("simulation=base"))
-    train_config = ApplicationConfig.model_validate(
+    simulate_config = SimulateApplicationConfig.model_validate(compose_payload("simulation=base"))
+    train_config = TrainApplicationConfig.model_validate(
         compose_payload("command=train", "paths.data_root=data/simulated/base")
     )
+    override_config = TrainApplicationConfig.model_validate(
+        compose_payload("command=train", "paths.dir=outputs/train/my-run")
+    )
 
-    assert simulate_config.run.output_root == Path("outputs")
-    assert simulate_config.run.prefix == "base"
-    assert simulate_config.run.name.startswith("base-")
-    assert simulate_config.paths.data_root == Path("data/simulated")
-    assert not simulate_config.paths.explicit_split.enabled
-    assert simulate_config.paths.explicit_split.train_data == Path("data/simulated/train.pt")
-    assert train_config.run.prefix == "base"
+    assert {"root", "prefix", "suffix", "dir"}.issubset(type(simulate_config.paths).model_fields)
+    assert simulate_config.paths.root == Path("outputs/simulate")
+    assert simulate_config.paths.prefix == "base"
+    assert simulate_config.paths.suffix
+    assert simulate_config.paths.dir.as_posix().startswith("outputs/simulate/base-")
+    assert train_config.paths.data_root == Path("data/simulated/base")
+    assert not train_config.paths.explicit_split.enabled
+    assert train_config.paths.explicit_split.train_data == Path("data/simulated/train.pt")
+    assert train_config.paths.root == Path("outputs/train")
+    assert train_config.paths.prefix == "base"
+    assert train_config.paths.suffix
+    assert train_config.paths.dir.as_posix().startswith("outputs/train/base-")
+    assert override_config.paths.dir == Path("outputs/train/my-run")
+
+    old_payload = compose_payload("simulation=base")
+    old_payload["run"] = {"dir": "outputs/simulate/old"}
+    with pytest.raises(ValidationError, match="run"):
+        SimulateApplicationConfig.model_validate(old_payload)
 
 
 def test_training_configs_validate() -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import TrainApplicationConfig
 
     expected_input = {
         "small": "grud",
@@ -186,99 +341,96 @@ def test_training_configs_validate() -> None:
         "mtan": "mtan",
     }
     for training, input_kind in expected_input.items():
-        app_config = ApplicationConfig.model_validate(compose_payload(f"training={training}"))
-        assert app_config.training.model.encoder.input.kind == input_kind
-        assert app_config.training.model.n_clusters > 1
-        assert app_config.training.trainer.batch_size is None
-        assert app_config.training.trainer.valid_size == 0.2
-        assert app_config.training.parallel.workers == 1
-        assert app_config.training.parallel.devices == ()
-        assert app_config.training.parallel.torch_threads is None
+        app_config = TrainApplicationConfig.model_validate(compose_payload(f"training={training}"))
+        assert app_config.model.encoder.input.kind == input_kind
+        assert app_config.model.n_clusters > 1
+        assert app_config.trainer.batch_size is None
+        assert app_config.trainer.valid_size == 0.2
+        assert app_config.parallel.workers == 1
+        assert app_config.parallel.devices == ()
+        assert app_config.parallel.torch_threads is None
 
-    explicit_config = ApplicationConfig.model_validate(
+    explicit_config = TrainApplicationConfig.model_validate(
         compose_payload(
             "training=base",
-            "training.trainer.batch_size=64",
-            "training.parallel.workers=4",
-            "training.parallel.devices=[cuda:0,cuda:1]",
-            "training.parallel.torch_threads=2",
+            "trainer.batch_size=64",
+            "parallel.workers=4",
+            "parallel.devices=[cuda:0,cuda:1]",
+            "parallel.torch_threads=2",
         )
     )
-    assert explicit_config.training.trainer.batch_size == 64
-    assert explicit_config.training.parallel.workers == 4
-    assert explicit_config.training.parallel.devices == ("cuda:0", "cuda:1")
-    assert explicit_config.training.parallel.torch_threads == 2
+    assert explicit_config.trainer.batch_size == 64
+    assert explicit_config.parallel.workers == 4
+    assert explicit_config.parallel.devices == ("cuda:0", "cuda:1")
+    assert explicit_config.parallel.torch_threads == 2
 
     invalid_payload = compose_payload("training=base")
-    invalid_payload["training"]["parallel"]["workers"] = 0
+    invalid_payload["parallel"]["workers"] = 0
     with pytest.raises(ValidationError, match="greater than 0"):
-        ApplicationConfig.model_validate(invalid_payload)
+        TrainApplicationConfig.model_validate(invalid_payload)
 
 
 def test_simulation_list_overrides_are_validated() -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import SimulateApplicationConfig
 
-    app_config = ApplicationConfig.model_validate(
+    app_config = SimulateApplicationConfig.model_validate(
         compose_payload(
             "simulation=quick",
-            "simulation.train_size=[10]",
-            "simulation.test_size=[5]",
-            "simulation.generator.n_clusters=[2]",
+            "train_size=[10]",
+            "test_size=[5]",
+            "generator.n_clusters=[2]",
         )
     )
 
-    assert app_config.simulation.train_size == (10,)
-    assert app_config.simulation.test_size == (5,)
-    assert app_config.simulation.generator.n_clusters_tuple_ == (2,)
+    assert app_config.train_size == (10,)
+    assert app_config.test_size == (5,)
+    assert app_config.generator.n_clusters_tuple_ == (2,)
 
 
 def test_simulation_rejects_mismatched_train_test_lists() -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import SimulateApplicationConfig
 
     payload = compose_payload("simulation=quick")
-    simulation = dict(cast(dict[str, Any], payload["simulation"]))
-    simulation["train_size"] = [10, 20]
-    simulation["test_size"] = [5]
-    payload["simulation"] = simulation
+    payload["train_size"] = [10, 20]
+    payload["test_size"] = [5]
 
     with pytest.raises(ValidationError, match="equal length"):
-        ApplicationConfig.model_validate(payload)
+        SimulateApplicationConfig.model_validate(payload)
 
 
 def test_simulation_rejects_sample_size_not_larger_than_k() -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import SimulateApplicationConfig
 
     payload = compose_payload(
         "simulation=quick",
-        "simulation.train_size=[2]",
-        "simulation.test_size=[1]",
-        "simulation.generator.n_clusters=[3]",
+        "train_size=[2]",
+        "test_size=[1]",
+        "generator.n_clusters=[3]",
     )
 
     with pytest.raises(ValidationError, match="greater than every requested K"):
-        ApplicationConfig.model_validate(payload)
+        SimulateApplicationConfig.model_validate(payload)
 
 
 def test_simulate_command_writes_grid_manifest_and_splits(tmp_path: Path) -> None:
-    from trails.data import ClinicalTimeSeriesDataset
-    from trails_simulate import workflow
-    from trails_simulate.config import ApplicationConfig
+    simulate_script = load_script("simulate")
 
-    sentinel_data_root = tmp_path / "unused-data-root"
-    app_config = ApplicationConfig.model_validate(
+    from trails.data import ClinicalTimeSeriesDataset
+    from trails_simulate.config import SimulateApplicationConfig
+
+    app_config = SimulateApplicationConfig.model_validate(
         compose_payload(
             "simulation=quick",
-            "simulation.train_size=[6,8]",
-            "simulation.test_size=[2,4]",
-            "simulation.generator.n_clusters=[2,3]",
-            "simulation.repeats=2",
-            f"paths.data_root={sentinel_data_root}",
+            "train_size=[6,8]",
+            "test_size=[2,4]",
+            "generator.n_clusters=[2,3]",
+            "repeats=2",
         )
     )
 
-    hydra_run_dir = tmp_path / "run"
-    result = workflow.run_simulate_command(app_config, hydra_run_dir, ROOT)
-    scenario_root = hydra_run_dir
+    scenario_root = tmp_path / "run"
+    app_config = with_paths_dir(app_config, scenario_root)
+    result = simulate_script.run(app_config)
     train_path = scenario_root / "train_6_test_2" / "k2" / "0" / "train.pt"
     test_path = scenario_root / "train_6_test_2" / "k2" / "0" / "test.pt"
     manifest_path = scenario_root / "simulation_manifest.csv"
@@ -286,12 +438,12 @@ def test_simulate_command_writes_grid_manifest_and_splits(tmp_path: Path) -> Non
 
     assert result["command"] == "simulate"
     assert result["data_root"] == str(scenario_root)
+    assert result["run_dir"] == str(scenario_root)
     assert len(result["runs"]) == 8
     assert train_path.exists()
     assert test_path.exists()
     assert manifest_path.exists()
     assert summary_path.exists()
-    assert not sentinel_data_root.exists()
     assert result["outputs"] == {
         "manifest": str(manifest_path),
         "summary": str(summary_path),
@@ -315,17 +467,17 @@ def test_simulate_command_writes_grid_manifest_and_splits(tmp_path: Path) -> Non
 
 
 def test_recursive_dataset_discovery_uses_mirrored_run_ids(tmp_path: Path) -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import TrainApplicationConfig
     from trails_simulate.path import discover_dataset_runs
 
     data_root = tmp_path / "data"
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
-    app_config = ApplicationConfig.model_validate(
+    app_config = TrainApplicationConfig.model_validate(
         compose_payload("command=train", f"paths.data_root={data_root}")
     )
 
-    runs = discover_dataset_runs(app_config, tmp_path / "run", ROOT)
+    runs = discover_dataset_runs(app_config)
 
     assert [run.run_id for run in runs] == [
         "base/train_6_test_2/k2/0",
@@ -333,14 +485,43 @@ def test_recursive_dataset_discovery_uses_mirrored_run_ids(tmp_path: Path) -> No
     ]
 
 
+def test_dataset_discovery_resolves_relative_inputs_from_cwd(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from trails_simulate.config import TrainApplicationConfig
+    from trails_simulate.path import discover_dataset_runs
+
+    write_synthetic_split(
+        tmp_path / "relative-data" / "base" / "train_6_test_2" / "k2" / "0",
+        n_clusters=2,
+        seed=43,
+    )
+    app_config = TrainApplicationConfig.model_validate(
+        compose_payload("command=train", "paths.data_root=relative-data")
+    )
+
+    monkeypatch.chdir(tmp_path)
+    runs = discover_dataset_runs(app_config)
+
+    assert runs[0].train_data == (
+        tmp_path / "relative-data" / "base" / "train_6_test_2" / "k2" / "0" / "train.pt"
+    )
+    assert runs[0].test_data == (
+        tmp_path / "relative-data" / "base" / "train_6_test_2" / "k2" / "0" / "test.pt"
+    )
+
+
 def test_train_command_runs_all_discovered_splits_and_uses_dataset_k(
     monkeypatch,
     caplog,
     tmp_path: Path,
 ) -> None:
+    train_script = load_script("train")
+
     from trails.data import ClinicalTimeSeriesDataset
-    from trails_simulate import workflow
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate import train_jobs
+    from trails_simulate.config import TrainApplicationConfig
     from trails_simulate.evaluation import prediction_payload_from_dataset
     from trails_simulate.training import TrainResult
 
@@ -349,19 +530,19 @@ def test_train_command_runs_all_discovered_splits_and_uses_dataset_k(
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
     seen_clusters: list[int] = []
 
-    app_config = ApplicationConfig.model_validate(
+    app_config = TrainApplicationConfig.model_validate(
         compose_payload(
             "command=train",
             "training=small",
             f"paths.data_root={data_root}",
-            "training.artifacts.names=[none]",
+            "artifacts.names=[none]",
         )
     )
 
     def fake_fit_training_run(*args: Any, **kwargs: Any) -> TrainResult:
         run_config = args[0]
         train_paths = kwargs["train_paths"]
-        seen_clusters.append(run_config.training.model.n_clusters)
+        seen_clusters.append(run_config.model.n_clusters)
         loaded_test = ClinicalTimeSeriesDataset.load(train_paths.test_data)
         prediction = prediction_payload_from_dataset(
             loaded_test,
@@ -375,10 +556,11 @@ def test_train_command_runs_all_discovered_splits_and_uses_dataset_k(
             run_dir=None,
         )
 
-    monkeypatch.setattr(workflow, "fit_training_run", fake_fit_training_run)
+    monkeypatch.setattr(train_jobs, "fit_training_run", fake_fit_training_run)
     caplog.set_level(logging.INFO)
 
-    result = workflow.run_train_command(app_config, tmp_path / "run", ROOT)
+    app_config = with_paths_dir(app_config, tmp_path / "run")
+    result = train_script.run(app_config)
 
     assert [run["run_id"] for run in result["runs"]] == [
         "base/train_6_test_2/k2/0",
@@ -399,9 +581,11 @@ def test_train_command_parallel_branch_sorts_results_and_rotates_devices(
 ) -> None:
     from concurrent.futures import Future
 
+    train_script = load_script("train")
+
     from trails.data import ClinicalTimeSeriesDataset
-    from trails_simulate import workflow
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate import train_jobs
+    from trails_simulate.config import TrainApplicationConfig
     from trails_simulate.evaluation import prediction_payload_from_dataset
     from trails_simulate.training import TrainResult
 
@@ -413,21 +597,21 @@ def test_train_command_parallel_branch_sorts_results_and_rotates_devices(
     submitted_slots: list[int] = []
     seen_max_workers: list[int] = []
 
-    app_config = ApplicationConfig.model_validate(
+    app_config = TrainApplicationConfig.model_validate(
         compose_payload(
             "command=train",
             "training=small",
             f"paths.data_root={data_root}",
-            "training.artifacts.names=[none]",
-            "training.parallel.workers=2",
-            "training.parallel.devices=[cuda:0,cuda:1]",
+            "artifacts.names=[none]",
+            "parallel.workers=2",
+            "parallel.devices=[cuda:0,cuda:1]",
         )
     )
 
     def fake_fit_training_run(*args: Any, **kwargs: Any) -> TrainResult:
         run_config = args[0]
         train_paths = kwargs["train_paths"]
-        seen_devices.append(run_config.training.trainer.device)
+        seen_devices.append(run_config.trainer.device)
         loaded_test = ClinicalTimeSeriesDataset.load(train_paths.test_data)
         prediction = prediction_payload_from_dataset(
             loaded_test,
@@ -460,10 +644,11 @@ def test_train_command_parallel_branch_sorts_results_and_rotates_devices(
                 future.set_exception(error)
             return future
 
-    monkeypatch.setattr(workflow, "fit_training_run", fake_fit_training_run)
-    monkeypatch.setattr(workflow, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(train_jobs, "fit_training_run", fake_fit_training_run)
+    monkeypatch.setattr(train_jobs, "ProcessPoolExecutor", FakeExecutor)
 
-    result = workflow.run_train_command(app_config, tmp_path / "run", ROOT)
+    app_config = with_paths_dir(app_config, tmp_path / "run")
+    result = train_script.run(app_config)
 
     assert seen_max_workers == [2]
     assert submitted_slots[:2] == [0, 1]
@@ -478,26 +663,26 @@ def test_train_command_parallel_branch_sorts_results_and_rotates_devices(
 
 
 def test_parallel_device_helpers_keep_same_device_without_device_list() -> None:
-    from trails_simulate.config import ApplicationConfig
-    from trails_simulate.workflow import config_with_training_device, device_for_worker_slot
+    from trails_simulate.config import TrainApplicationConfig
+    from trails_simulate.train_jobs import config_with_training_device, device_for_worker_slot
 
-    same_device_config = ApplicationConfig.model_validate(
-        compose_payload("training=small", "training.trainer.device=cuda:0")
+    same_device_config = TrainApplicationConfig.model_validate(
+        compose_payload("training=small", "trainer.device=cuda:0")
     )
     assert device_for_worker_slot(same_device_config, 0) is None
-    assert same_device_config.training.trainer.device == "cuda:0"
+    assert same_device_config.trainer.device == "cuda:0"
 
-    rotated_config = ApplicationConfig.model_validate(
-        compose_payload("training=small", "training.parallel.devices=[cuda:0,cuda:1]")
+    rotated_config = TrainApplicationConfig.model_validate(
+        compose_payload("training=small", "parallel.devices=[cuda:0,cuda:1]")
     )
     assert device_for_worker_slot(rotated_config, 0) == "cuda:0"
     assert device_for_worker_slot(rotated_config, 1) == "cuda:1"
     assert device_for_worker_slot(rotated_config, 2) == "cuda:0"
-    assert config_with_training_device(rotated_config, "cuda:1").training.trainer.device == "cuda:1"
+    assert config_with_training_device(rotated_config, "cuda:1").trainer.device == "cuda:1"
 
 
 def test_completed_train_run_log_omits_timing_fields() -> None:
-    from trails_simulate.workflow import format_completed_train_run
+    from trails_simulate.command_utils import format_completed_train_run
 
     completed_message = format_completed_train_run(
         run_id="base/train_500_test_300/k3/0",
@@ -520,7 +705,7 @@ def test_fit_training_run_resolves_auto_batch_size_and_records_effective_value(
     tmp_path: Path,
 ) -> None:
     from trails_simulate import training
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import TrainApplicationConfig
     from trails_simulate.path import TrainPaths
 
     split_root = tmp_path / "data"
@@ -546,11 +731,11 @@ def test_fit_training_run_resolves_auto_batch_size_and_records_effective_value(
             return torch.ones(len(data), self.config.model.n_clusters, dtype=torch.float32)
 
     monkeypatch.setattr(training, "TrailsEstimator", FakeEstimator)
-    app_config = ApplicationConfig.model_validate(
+    app_config = TrainApplicationConfig.model_validate(
         compose_payload(
             "command=train",
             "training=small",
-            "training.artifacts.names=[config]",
+            "artifacts.names=[config]",
         )
     )
 
@@ -826,18 +1011,20 @@ def test_progress_logging_suppresses_nested_tensor_warning() -> None:
 
 
 def test_baseline_command_infers_k_per_split(tmp_path: Path) -> None:
-    from trails_simulate import workflow
-    from trails_simulate.config import ApplicationConfig
+    baseline_script = load_script("baseline")
+
+    from trails_simulate.config import BaselineApplicationConfig
 
     data_root = tmp_path / "data"
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
 
-    app_config = ApplicationConfig.model_validate(
+    app_config = BaselineApplicationConfig.model_validate(
         compose_payload("command=baseline", f"paths.data_root={data_root}")
     )
 
-    result = workflow.run_baseline_command(app_config, tmp_path / "run", ROOT)
+    app_config = with_paths_dir(app_config, tmp_path / "run")
+    result = baseline_script.run(app_config)
 
     assert result["command"] == "baseline"
     assert [run["n_clusters"] for run in result["runs"]] == [2, 3]
@@ -849,7 +1036,7 @@ def test_baseline_command_infers_k_per_split(tmp_path: Path) -> None:
 
 
 def test_optim_trial_config_updates_training_namespace() -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import OptimApplicationConfig
     from trails_simulate.optim import optim_trial_config
 
     class FakeTrial:
@@ -868,20 +1055,23 @@ def test_optim_trial_config_updates_training_namespace() -> None:
         def set_user_attr(self, name: str, value: Any) -> None:
             self.user_attrs[name] = value
 
-    app_config = ApplicationConfig.model_validate(compose_payload("command=optim", "training=base"))
+    app_config = OptimApplicationConfig.model_validate(
+        compose_payload("command=optim", "training=base")
+    )
     trial_config = optim_trial_config(app_config, FakeTrial())
 
-    assert trial_config.training.artifacts.names == ("none",)
-    assert not trial_config.training.diagnostics.latent_embeddings.enabled
-    assert not trial_config.training.swanlab.enabled
-    assert trial_config.training.model.encoder.input.kind == "grud"
-    assert trial_config.training.trainer.batch_size == app_config.optim.search.batch_size[0]
-    assert app_config.training.model.n_clusters == 4
+    assert trial_config.artifacts.names == ("none",)
+    assert not trial_config.diagnostics.latent_embeddings.enabled
+    assert not trial_config.swanlab.enabled
+    assert trial_config.model.encoder.input.kind == "grud"
+    assert trial_config.trainer.batch_size == app_config.optim.search.batch_size[0]
+    assert app_config.model.n_clusters == 4
 
 
 def test_summary_command_combines_metrics_and_writes_figures(tmp_path: Path) -> None:
-    from trails_simulate import workflow
-    from trails_simulate.config import ApplicationConfig
+    summary_script = load_script("summary")
+
+    from trails_simulate.config import SummaryApplicationConfig
 
     train_root = tmp_path / "train"
     baseline_root = tmp_path / "baseline"
@@ -901,12 +1091,13 @@ def test_summary_command_combines_metrics_and_writes_figures(tmp_path: Path) -> 
             {"run_id": run_id_b, "method": "summary_kmeans", "cindex": 0.6, "ari": 0.2},
         ],
     )
-    payload = compose_payload("command=summary", "summary.metrics=[cindex,ari,nmi]")
-    payload["summary"]["train_roots"] = [str(train_root)]
-    payload["summary"]["baseline_roots"] = [str(baseline_root)]
-    app_config = ApplicationConfig.model_validate(payload)
+    payload = compose_payload("command=summary", "metrics=[cindex,ari,nmi]")
+    payload["train_roots"] = [str(train_root)]
+    payload["baseline_roots"] = [str(baseline_root)]
+    app_config = SummaryApplicationConfig.model_validate(payload)
 
-    result = workflow.run(app_config, hydra_run_dir=tmp_path / "run", project_root=ROOT)
+    app_config = with_paths_dir(app_config, tmp_path / "run")
+    result = summary_script.run(app_config)
 
     assert result["command"] == "summary"
     assert result["n_rows"] == 4
@@ -930,8 +1121,9 @@ def test_summary_command_combines_metrics_and_writes_figures(tmp_path: Path) -> 
 def test_summary_command_merges_multiple_roots_with_distinct_method_labels(
     tmp_path: Path,
 ) -> None:
-    from trails_simulate import workflow
-    from trails_simulate.config import ApplicationConfig
+    summary_script = load_script("summary")
+
+    from trails_simulate.config import SummaryApplicationConfig
 
     train_base = tmp_path / "train-base"
     train_mtan = tmp_path / "train-mtan"
@@ -962,14 +1154,15 @@ def test_summary_command_merges_multiple_roots_with_distinct_method_labels(
         [{"run_id": run_id_a, "method": "fpca_kmeans", "cindex": 0.6, "ari": 0.12}],
     )
 
-    payload = compose_payload("command=summary", "summary.metrics=[cindex,ari]")
-    payload["summary"]["train_roots"] = [str(train_base), str(train_mtan)]
-    payload["summary"]["baseline_roots"] = [str(baseline_classic), str(baseline_fpca)]
-    payload["summary"]["train_labels"] = ["base", "mtan"]
-    payload["summary"]["baseline_labels"] = ["classic", "fpca"]
-    app_config = ApplicationConfig.model_validate(payload)
+    payload = compose_payload("command=summary", "metrics=[cindex,ari]")
+    payload["train_roots"] = [str(train_base), str(train_mtan)]
+    payload["baseline_roots"] = [str(baseline_classic), str(baseline_fpca)]
+    payload["train_labels"] = ["base", "mtan"]
+    payload["baseline_labels"] = ["classic", "fpca"]
+    app_config = SummaryApplicationConfig.model_validate(payload)
 
-    result = workflow.run(app_config, hydra_run_dir=tmp_path / "run", project_root=ROOT)
+    app_config = with_paths_dir(app_config, tmp_path / "run")
+    result = summary_script.run(app_config)
 
     assert result["n_rows"] == 6
     assert len(result["inputs"]) == 4
@@ -990,8 +1183,9 @@ def test_summary_command_merges_multiple_roots_with_distinct_method_labels(
 
 
 def test_summary_command_plots_scenarioless_train_run_ids(tmp_path: Path) -> None:
-    from trails_simulate import workflow
-    from trails_simulate.config import ApplicationConfig
+    summary_script = load_script("summary")
+
+    from trails_simulate.config import SummaryApplicationConfig
 
     train_root = tmp_path / "train"
     baseline_root = tmp_path / "baseline"
@@ -1013,12 +1207,13 @@ def test_summary_command_plots_scenarioless_train_run_ids(tmp_path: Path) -> Non
         baseline_root / "baseline_metrics.csv",
         [{"run_id": baseline_run_id, "method": "summary_kmeans", "cindex": 0.6, "ari": 0.2}],
     )
-    payload = compose_payload("command=summary", "summary.metrics=[cindex,ari]")
-    payload["summary"]["train_roots"] = [str(train_root)]
-    payload["summary"]["baseline_roots"] = [str(baseline_root)]
-    app_config = ApplicationConfig.model_validate(payload)
+    payload = compose_payload("command=summary", "metrics=[cindex,ari]")
+    payload["train_roots"] = [str(train_root)]
+    payload["baseline_roots"] = [str(baseline_root)]
+    app_config = SummaryApplicationConfig.model_validate(payload)
 
-    result = workflow.run(app_config, hydra_run_dir=tmp_path / "run", project_root=ROOT)
+    app_config = with_paths_dir(app_config, tmp_path / "run")
+    result = summary_script.run(app_config)
 
     assert result["parse_warnings"] == []
     assert (tmp_path / "run" / "figures" / "base_metrics_by_train_size.png").exists()
@@ -1036,8 +1231,10 @@ def test_optim_command_filters_configured_run_ids_with_shared_storage(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    optim_script = load_script("optim")
+
     from trails_simulate import optim
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import OptimApplicationConfig
 
     class FakeTrial:
         def __init__(self, number: int) -> None:
@@ -1102,7 +1299,7 @@ def test_optim_command_filters_configured_run_ids_with_shared_storage(
     data_root = tmp_path / "data"
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
-    app_config = ApplicationConfig.model_validate(
+    app_config = OptimApplicationConfig.model_validate(
         compose_payload(
             "command=optim",
             "optim.n_trials=1",
@@ -1112,7 +1309,7 @@ def test_optim_command_filters_configured_run_ids_with_shared_storage(
         )
     )
     fake_optuna = FakeOptuna()
-    monkeypatch.setattr(optim, "load_optuna", lambda: fake_optuna)
+    monkeypatch.setattr(optim_script, "load_optuna", lambda: fake_optuna)
 
     def fake_run_optim_split_job(job: optim.OptimSplitJob) -> optim.OptimSplitResult:
         return optim.OptimSplitResult(
@@ -1125,7 +1322,8 @@ def test_optim_command_filters_configured_run_ids_with_shared_storage(
 
     monkeypatch.setattr(optim, "run_optim_split_job", fake_run_optim_split_job)
 
-    result = optim.run_optim_command(app_config, tmp_path / "run", ROOT)
+    app_config = with_paths_dir(app_config, tmp_path / "run")
+    result = optim_script.run(app_config)
 
     assert result["selected_run_ids"] == ["base/train_6_test_2/k3/0"]
     assert result["selection"]["source"] == "configured"
@@ -1141,8 +1339,10 @@ def test_optim_command_runs_all_splits_and_aggregates_mean_metrics(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    optim_script = load_script("optim")
+
     from trails_simulate import optim
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import OptimApplicationConfig
 
     class FakeTrial:
         def __init__(self, number: int) -> None:
@@ -1203,7 +1403,7 @@ def test_optim_command_runs_all_splits_and_aggregates_mean_metrics(
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
     _progress, bars = install_fake_tqdm(monkeypatch)
-    app_config = ApplicationConfig.model_validate(
+    app_config = OptimApplicationConfig.model_validate(
         compose_payload("command=optim", "optim.n_trials=1", f"paths.data_root={data_root}")
     )
 
@@ -1221,10 +1421,11 @@ def test_optim_command_runs_all_splits_and_aggregates_mean_metrics(
             trial_number=job.trial_number,
         )
 
-    monkeypatch.setattr(optim, "load_optuna", lambda: FakeOptuna())
+    monkeypatch.setattr(optim_script, "load_optuna", lambda: FakeOptuna())
     monkeypatch.setattr(optim, "run_optim_split_job", fake_run_optim_split_job)
 
-    result = optim.run_optim_command(app_config, tmp_path / "run", ROOT)
+    app_config = with_paths_dir(app_config, tmp_path / "run")
+    result = optim_script.run(app_config)
 
     optim_bars = [bar for bar in bars if bar.kwargs["desc"] == "Optim splits"]
     assert len(optim_bars) == 1
@@ -1257,8 +1458,10 @@ def test_optim_parallel_uses_shared_pool_and_rotates_devices(
 ) -> None:
     from concurrent.futures import Future
 
+    optim_script = load_script("optim")
+
     from trails_simulate import optim
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import OptimApplicationConfig
 
     class FakeTrial:
         def __init__(self, number: int) -> None:
@@ -1318,7 +1521,7 @@ def test_optim_parallel_uses_shared_pool_and_rotates_devices(
     data_root = tmp_path / "data"
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k2" / "0", n_clusters=2, seed=43)
     write_synthetic_split(data_root / "base" / "train_6_test_2" / "k3" / "0", n_clusters=3, seed=44)
-    app_config = ApplicationConfig.model_validate(
+    app_config = OptimApplicationConfig.model_validate(
         compose_payload(
             "command=optim",
             "optim.n_trials=2",
@@ -1364,11 +1567,12 @@ def test_optim_parallel_uses_shared_pool_and_rotates_devices(
             trial_number=job.trial_number,
         )
 
-    monkeypatch.setattr(optim, "load_optuna", lambda: FakeOptuna())
+    monkeypatch.setattr(optim_script, "load_optuna", lambda: FakeOptuna())
     monkeypatch.setattr(optim, "ProcessPoolExecutor", FakeExecutor)
     monkeypatch.setattr(optim, "run_optim_split_job", fake_run_optim_split_job)
 
-    result = optim.run_optim_command(app_config, tmp_path / "run", ROOT)
+    app_config = with_paths_dir(app_config, tmp_path / "run")
+    result = optim_script.run(app_config)
 
     optim_bars = [bar for bar in bars if bar.kwargs["desc"] == "Optim splits"]
     assert len(optim_bars) == 1
@@ -1392,8 +1596,10 @@ def test_optim_resume_rejects_changed_dataset_fingerprint(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    optim_script = load_script("optim")
+
     from trails_simulate import optim
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import OptimApplicationConfig
 
     class FakeTrial:
         def __init__(self, number: int) -> None:
@@ -1453,7 +1659,7 @@ def test_optim_resume_rejects_changed_dataset_fingerprint(
     data_root = tmp_path / "data"
     split_root = data_root / "base" / "train_6_test_2" / "k2" / "0"
     write_synthetic_split(split_root, n_clusters=2, seed=43)
-    app_config = ApplicationConfig.model_validate(
+    app_config = OptimApplicationConfig.model_validate(
         compose_payload("command=optim", "optim.n_trials=1", f"paths.data_root={data_root}")
     )
 
@@ -1466,12 +1672,13 @@ def test_optim_resume_rejects_changed_dataset_fingerprint(
             trial_number=job.trial_number,
         )
 
-    monkeypatch.setattr(optim, "load_optuna", lambda: FakeOptuna())
+    monkeypatch.setattr(optim_script, "load_optuna", lambda: FakeOptuna())
     monkeypatch.setattr(optim, "run_optim_split_job", fake_run_optim_split_job)
-    optim.run_optim_command(app_config, tmp_path / "run", ROOT)
+    app_config = with_paths_dir(app_config, tmp_path / "run")
+    optim_script.run(app_config)
 
     write_synthetic_split(split_root, n_clusters=2, seed=99)
-    resume_config = ApplicationConfig.model_validate(
+    resume_config = OptimApplicationConfig.model_validate(
         compose_payload(
             "command=optim",
             "optim.n_trials=1",
@@ -1480,42 +1687,39 @@ def test_optim_resume_rejects_changed_dataset_fingerprint(
         )
     )
     with pytest.raises(ValueError, match="fingerprint"):
-        optim.run_optim_command(resume_config, tmp_path / "run", ROOT)
+        resume_config = with_paths_dir(resume_config, tmp_path / "run")
+        optim_script.run(resume_config)
 
 
 def test_paths_reject_removed_validation_data_field() -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import TrainApplicationConfig
 
-    payload = compose_payload()
+    payload = compose_payload("command=train")
     paths = dict(cast(dict[str, Any], payload["paths"]))
     paths["val_data"] = "data/val.pt"
     payload["paths"] = paths
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        ApplicationConfig.model_validate(payload)
+        TrainApplicationConfig.model_validate(payload)
 
 
 def test_simulation_rejects_removed_seed_stride_field() -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import SimulateApplicationConfig
 
     payload = compose_payload()
-    simulation = dict(cast(dict[str, Any], payload["simulation"]))
-    simulation["seed_stride"] = 100
-    payload["simulation"] = simulation
+    payload["seed_stride"] = 100
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        ApplicationConfig.model_validate(payload)
+        SimulateApplicationConfig.model_validate(payload)
 
 
 def test_generator_config_rejects_removed_patients_field() -> None:
-    from trails_simulate.config import ApplicationConfig
+    from trails_simulate.config import SimulateApplicationConfig
 
     payload = compose_payload()
-    simulation = dict(cast(dict[str, Any], payload["simulation"]))
-    generator = dict(cast(dict[str, Any], simulation["generator"]))
+    generator = dict(cast(dict[str, Any], payload["generator"]))
     generator["patients"] = 10
-    simulation["generator"] = generator
-    payload["simulation"] = simulation
+    payload["generator"] = generator
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        ApplicationConfig.model_validate(payload)
+        SimulateApplicationConfig.model_validate(payload)

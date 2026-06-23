@@ -1,0 +1,19 @@
+# @package _global_
+defaults:
+  - _self_
+  - /simulation: quick
+
+paths:
+  root: outputs/simulate
+  prefix: ${name}
+  suffix: ${now:%Y%m%d-%H%M%S-%f}
+  dir: ${paths.root}/${paths.prefix}-${paths.suffix}
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.dir}
+  sweep:
+    dir: outputs/multirun/simulate/${now:%Y%m%d-%H%M%S-%f}
+    subdir: ${hydra.job.num}

@@ -1,3 +1,4 @@
+# @package _global_
 name: imbalance
 repeats: 5
 train_size: [500, 1000, 2000, 3000, 5000]

@@ -8,12 +8,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from trails.config import ModelConfig, TrainerConfig
 
 
-class RunConfig(BaseModel):
+class PathsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    output_root: Path = Path("outputs")
+    root: Path = Path("outputs/case")
     prefix: str = Field(default="case", min_length=1)
-    name: str = Field(default="case", min_length=1)
+    suffix: str = Field(default="default", min_length=1)
+    dir: Path = Path("outputs/case/case-default")
 
 
 class ArtifactsConfig(BaseModel):
@@ -113,9 +114,9 @@ class CaseKSelectionConfig(BaseModel):
     @model_validator(mode="after")
     def validate_candidate_clusters(self) -> CaseKSelectionConfig:
         if any(value <= 1 for value in self.candidate_clusters):
-            raise ValueError("case.k_selection.candidate_clusters values must be greater than 1.")
+            raise ValueError("k_selection.candidate_clusters values must be greater than 1.")
         if len(set(self.candidate_clusters)) != len(self.candidate_clusters):
-            raise ValueError("case.k_selection.candidate_clusters values must be unique.")
+            raise ValueError("k_selection.candidate_clusters values must be unique.")
         return self
 
 
@@ -131,10 +132,8 @@ class CaseConfig(BaseModel):
     k_selection: CaseKSelectionConfig = Field(default_factory=CaseKSelectionConfig)
 
 
-class CaseApplicationConfig(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class CaseApplicationConfig(TrainingConfig, CaseConfig):
+    model_config = ConfigDict(extra="forbid")
 
     command: Literal["case"] = "case"
-    run: RunConfig = Field(default_factory=RunConfig)
-    training: TrainingConfig = Field(default_factory=TrainingConfig)
-    case: CaseConfig = Field(default_factory=CaseConfig)
+    paths: PathsConfig = Field(default_factory=PathsConfig)

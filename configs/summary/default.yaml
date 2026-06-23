@@ -1,5 +1,0 @@
-train_roots: []
-baseline_roots: []
-train_labels: []
-baseline_labels: []
-metrics: [acc, ari, nmi, cindex]

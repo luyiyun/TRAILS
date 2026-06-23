@@ -1,4 +1,6 @@
+import importlib.util
 import json
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -11,13 +13,29 @@ from omegaconf import OmegaConf
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def load_script(name: str) -> Any:
+    module_name = f"{name}_script"
+    script_path = ROOT / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(module_name, script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module: Any = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def compose_payload(*overrides: str) -> dict[str, Any]:
     config_dir = str((ROOT / "configs").resolve())
     with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
-        cfg = compose(config_name="config", overrides=list(overrides))
+        cfg = compose(config_name="case", overrides=list(overrides))
     payload = OmegaConf.to_container(cfg, resolve=True)
     assert isinstance(payload, dict)
     return cast(dict[str, Any], payload)
+
+
+def with_paths_dir(config: Any, run_dir: Path) -> Any:
+    return config.model_copy(update={"paths": config.paths.model_copy(update={"dir": run_dir})})
 
 
 def write_case_csvs(root: Path, *, include_labels: bool = True) -> tuple[Path, Path]:
@@ -46,19 +64,19 @@ def write_case_csvs(root: Path, *, include_labels: bool = True) -> tuple[Path, P
 def test_case_config_defaults_validate() -> None:
     from trails_case.config import CaseApplicationConfig
 
-    config = CaseApplicationConfig.model_validate(compose_payload("case=default"))
+    config = CaseApplicationConfig.model_validate(compose_payload())
 
     assert config.command == "case"
-    assert config.run.prefix == "case"
-    assert config.training.swanlab.enabled
-    assert config.training.swanlab.experiment == "case"
-    assert config.training.artifacts.names == ("all",)
-    assert config.training.diagnostics.latent_embeddings.enabled
-    assert config.case.outputs.patient_clusters == Path("patient_clusters.csv")
-    assert config.case.k_selection.enabled
-    assert config.case.k_selection.candidate_clusters == (2, 3, 4, 5)
-    assert config.case.k_selection.valid_size == 0.2
-    assert config.case.k_selection.result_dir == Path("k_selection")
+    assert config.paths.dir.as_posix().startswith("outputs/case/case-")
+    assert config.swanlab.enabled
+    assert config.swanlab.experiment == "case"
+    assert config.artifacts.names == ("all",)
+    assert config.diagnostics.latent_embeddings.enabled
+    assert config.outputs.patient_clusters == Path("patient_clusters.csv")
+    assert config.k_selection.enabled
+    assert config.k_selection.candidate_clusters == (2, 3, 4, 5)
+    assert config.k_selection.valid_size == 0.2
+    assert config.k_selection.result_dir == Path("k_selection")
 
 
 def test_case_importer_builds_aligned_dataset(tmp_path: Path) -> None:
@@ -161,7 +179,8 @@ def test_case_importer_validation_errors(
 
 
 def test_case_command_writes_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    from trails_case import workflow
+    case_script = load_script("case")
+
     from trails_case.config import CaseApplicationConfig
 
     patients, observations = write_case_csvs(tmp_path / "data", include_labels=False)
@@ -200,20 +219,20 @@ def test_case_command_writes_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: 
             destination.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"config": self.config.model_dump(mode="json")}, destination)
 
-    monkeypatch.setattr(workflow, "TrailsEstimator", FakeEstimator)
+    monkeypatch.setattr(case_script, "TrailsEstimator", FakeEstimator)
     config = CaseApplicationConfig.model_validate(
         compose_payload(
-            "case=default",
-            f"case.patients_csv={patients}",
-            f"case.observations_csv={observations}",
-            "case.k_selection.enabled=false",
-            "training.swanlab.enabled=false",
-            "training.diagnostics.latent_embeddings.enabled=false",
-            "training.trainer.device=cpu",
+            f"patients_csv={patients}",
+            f"observations_csv={observations}",
+            "k_selection.enabled=false",
+            "swanlab.enabled=false",
+            "diagnostics.latent_embeddings.enabled=false",
+            "trainer.device=cpu",
         )
     )
 
-    result = workflow.run_case_command(config, tmp_path / "run", ROOT)
+    config = with_paths_dir(config, tmp_path / "run")
+    result = case_script.run(config)
 
     assert result["command"] == "case"
     assert (tmp_path / "run" / "case_dataset.pt").exists()
@@ -249,7 +268,8 @@ def test_case_command_k_selection_writes_outputs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    from trails_case import workflow
+    case_script = load_script("case")
+
     from trails_case.config import CaseApplicationConfig
 
     patients, observations = write_case_csvs(tmp_path / "data", include_labels=False)
@@ -337,20 +357,20 @@ def test_case_command_k_selection_writes_outputs(
             destination.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"config": self.config.model_dump(mode="json")}, destination)
 
-    monkeypatch.setattr(workflow, "TrailsEstimator", FakeEstimator)
+    monkeypatch.setattr(case_script, "TrailsEstimator", FakeEstimator)
     config = CaseApplicationConfig.model_validate(
         compose_payload(
-            "case=default",
-            f"case.patients_csv={patients}",
-            f"case.observations_csv={observations}",
-            "case.k_selection.enabled=true",
-            "training.swanlab.enabled=false",
-            "training.diagnostics.latent_embeddings.enabled=false",
-            "training.trainer.device=cpu",
+            f"patients_csv={patients}",
+            f"observations_csv={observations}",
+            "k_selection.enabled=true",
+            "swanlab.enabled=false",
+            "diagnostics.latent_embeddings.enabled=false",
+            "trainer.device=cpu",
         )
     )
 
-    result = workflow.run_case_command(config, tmp_path / "run", ROOT)
+    config = with_paths_dir(config, tmp_path / "run")
+    result = case_script.run(config)
 
     k_selection_path = tmp_path / "run" / "k_selection"
     assert k_selection_path.is_dir()
@@ -381,16 +401,16 @@ def test_case_command_k_selection_writes_outputs(
 def test_swanlab_history_logs_train_and_validation_cindex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from trails_case import workflow
+    from trails_case import swanlab as case_swanlab
 
     logged: list[tuple[dict[str, float], int | None]] = []
     monkeypatch.setattr(
-        workflow.swanlab,
+        case_swanlab.swanlab,
         "log",
         lambda metrics, step=None: logged.append((dict(metrics), step)),
     )
 
-    workflow.log_swanlab_history(
+    case_swanlab.log_swanlab_history(
         {
             "epoch": 1,
             "global_epoch": 5,
@@ -418,11 +438,11 @@ def test_swanlab_history_logs_train_and_validation_cindex(
 def test_swanlab_case_metrics_logs_cindex_and_k_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from trails_case import workflow
+    from trails_case import swanlab as case_swanlab
 
     logged: list[tuple[dict[str, float | int], int | None]] = []
     monkeypatch.setattr(
-        workflow.swanlab,
+        case_swanlab.swanlab,
         "log",
         lambda metrics, step=None: logged.append((dict(metrics), step)),
     )
@@ -434,7 +454,7 @@ def test_swanlab_case_metrics_logs_cindex_and_k_selection(
         "mean_nll": {"3": 1.0},
     }
 
-    workflow.log_swanlab_case_metrics(
+    case_swanlab.log_swanlab_case_metrics(
         {"cindex": 0.75, "cluster_entropy": 0.9},
         [
             {

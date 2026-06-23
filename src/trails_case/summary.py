@@ -11,7 +11,7 @@ def format_case_summary(result: Mapping[str, Any]) -> str:
     metrics = dict(result["metrics"])
     lines = [
         "TRAILS case complete",
-        f"Hydra run: {result['hydra_run_dir']}",
+        f"Run dir: {result['run_dir']}",
         f"Patients: {data['n_patients']}",
         f"Features: {data['n_features']}",
         f"Observations: {data['n_observations']}",

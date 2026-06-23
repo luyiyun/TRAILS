@@ -1,7 +1,17 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
-from .config import ApplicationConfig
+from .config import ArtifactsConfig, PathsConfig
+
+
+class DatasetDiscoveryConfig(Protocol):
+    paths: PathsConfig
+
+
+class CheckpointConfig(Protocol):
+    paths: PathsConfig
+    artifacts: ArtifactsConfig
 
 
 @dataclass(frozen=True)
@@ -20,47 +30,42 @@ class DatasetRunPaths:
     test_data: Path
 
 
-def data_root(
-    config: ApplicationConfig,
-    hydra_run_dir: Path,
-    project_root: Path,
-) -> Path:
-    del hydra_run_dir
-    return resolve_path(config.paths.data_root, project_root)
+def data_root(config: DatasetDiscoveryConfig) -> Path:
+    return resolve_input_path(config.paths.data_root)
 
 
 def checkpoint_path_for_run(
-    config: ApplicationConfig,
+    config: CheckpointConfig,
     *,
-    hydra_run_dir: Path,
-    project_root: Path,
     run_id: str,
     n_runs: int,
 ) -> Path | None:
-    if config.training.artifacts.save is None:
+    if config.artifacts.save is None:
         return None
-    configured = resolve_path(config.training.artifacts.save, project_root)
+    configured = resolve_output_path(config.artifacts.save, config.paths.dir)
     if n_runs == 1:
         return configured
     suffix = configured.suffix
     stem = configured.stem if suffix else configured.name
-    return hydra_run_dir / run_id / f"{stem}{suffix}"
+    return config.paths.dir / run_id / f"{stem}{suffix}"
 
 
-def resolve_path(path: Path, project_root: Path) -> Path:
+def resolve_input_path(path: Path, base_dir: Path | None = None) -> Path:
     if path.is_absolute():
         return path
-    return project_root / path
+    return (base_dir or Path.cwd()) / path
 
 
-def discover_dataset_runs(
-    config: ApplicationConfig,
-    hydra_run_dir: Path,
-    project_root: Path,
-) -> list[DatasetRunPaths]:
+def resolve_output_path(path: Path, run_dir: Path) -> Path:
+    if path.is_absolute():
+        return path
+    return run_dir / path
+
+
+def discover_dataset_runs(config: DatasetDiscoveryConfig) -> list[DatasetRunPaths]:
     if config.paths.explicit_split.enabled:
-        data_path = resolve_path(config.paths.explicit_split.train_data, project_root)
-        test_path = resolve_path(config.paths.explicit_split.test_data, project_root)
+        data_path = resolve_input_path(config.paths.explicit_split.train_data)
+        test_path = resolve_input_path(config.paths.explicit_split.test_data)
         return [
             DatasetRunPaths(
                 run_id="0",
@@ -70,7 +75,7 @@ def discover_dataset_runs(
             )
         ]
 
-    root = data_root(config, hydra_run_dir, project_root)
+    root = data_root(config)
 
     single_train = root / "train.pt"
     single_test = root / "test.pt"

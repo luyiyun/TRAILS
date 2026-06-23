@@ -1,0 +1,24 @@
+# @package _global_
+defaults:
+  - _self_
+  - /training: small
+
+paths:
+  root: outputs/train
+  prefix: ${trails_run_prefix:train,"",${paths.data_root}}
+  suffix: ${now:%Y%m%d-%H%M%S-%f}
+  dir: ${paths.root}/${paths.prefix}-${paths.suffix}
+  data_root: data/simulated
+  explicit_split:
+    enabled: false
+    train_data: data/simulated/train.pt
+    test_data: data/simulated/test.pt
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.dir}
+  sweep:
+    dir: outputs/multirun/train/${now:%Y%m%d-%H%M%S-%f}
+    subdir: ${hydra.job.num}

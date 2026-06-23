@@ -46,6 +46,6 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.pyright]
-include = ["src", "tests", "scripts", "main.py"]
+include = ["src", "tests", "scripts"]
 typeCheckingMode = "standard"
 reportPrivateImportUsage = false

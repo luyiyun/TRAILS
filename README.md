@@ -34,60 +34,61 @@ Dataset 的 `metadata` 会保留 `latent_z`、`cluster_means`、`cluster_covaria
 
 ## 命令
 
-实验入口使用 Hydra 配置。默认命令是生成模拟 train/test split：
+实验入口使用 Hydra 配置。每个任务都有独立脚本；生成模拟 train/test split：
 
 ```bash
-uv run main.py command=simulate simulation=quick
+uv run python scripts/simulate.py simulation=quick
 ```
 
 模拟场景放在 `configs/simulation/`：
 
 ```bash
-uv run main.py command=simulate simulation=quick
-uv run main.py command=simulate simulation=base
-uv run main.py command=simulate simulation=imbalance
-uv run main.py command=simulate simulation=censored
-uv run main.py command=simulate simulation=high_dimension
+uv run python scripts/simulate.py simulation=quick
+uv run python scripts/simulate.py simulation=base
+uv run python scripts/simulate.py simulation=imbalance
+uv run python scripts/simulate.py simulation=censored
+uv run python scripts/simulate.py simulation=high_dimension
 ```
 
 所有参数都可以通过 Hydra 覆盖，例如：
 
 ```bash
-uv run main.py command=simulate simulation=quick 'simulation.train_size=[128]' 'simulation.test_size=[32]'
-uv run main.py command=simulate simulation=base 'simulation.generator.n_clusters=[2,3,4]'
+uv run python scripts/simulate.py simulation=quick 'train_size=[128]' 'test_size=[32]'
+uv run python scripts/simulate.py simulation=base 'generator.n_clusters=[2,3,4]'
 ```
 
-`simulation.generator` 控制数据生成机制；`simulation.mechanism_seed` 不设置时默认使用
-`simulation.seed`。`simulation.train_size` 和 `simulation.test_size` 是按位置配对
-的列表，每个样本量层级再与 `simulation.generator.n_clusters` 列表做组合，并在
-`simulation.repeats` 内重复。相同 `simulation.name × K` 固定生成机制，不同样本量层级
+`generator` 控制数据生成机制；`mechanism_seed` 不设置时默认使用
+`seed`。`train_size` 和 `test_size` 是按位置配对
+的列表，每个样本量层级再与 `generator.n_clusters` 列表做组合，并在
+`repeats` 内重复。相同 `name × K` 固定生成机制，不同样本量层级
 和 repeat 使用独立 sample seed。
 
 单独生成模拟数据：
 
 ```bash
-uv run main.py command=simulate simulation=base
+uv run python scripts/simulate.py simulation=base
 ```
 
 输出路径为
-`outputs/simulate/<run.name>/train_<train>_test_<test>/k<K>/<repeat>/train.pt`
-和对应 `test.pt`，并在本次 Hydra run 目录下写出 `simulation_manifest.csv` 与
+`paths.dir/train_<train>_test_<test>/k<K>/<repeat>/train.pt` 和对应 `test.pt`。
+默认 `paths.root=outputs/simulate`、`paths.prefix=<simulation>`、`paths.suffix=<timestamp>`，
+并组合成 `paths.dir`。同一个目录下还会写出 `simulation_manifest.csv` 与
 `simulation_summary.json`。
 
 训练已有的 train/test split：
 
 ```bash
-uv run main.py command=train training=base paths.data_root=data/simulated/base
-uv run main.py command=train training=mtan paths.data_root=data/simulated/high_dimension
+uv run python scripts/train.py training=base paths.data_root=data/simulated/base
+uv run python scripts/train.py training=mtan paths.data_root=data/simulated/high_dimension
 ```
 
 训练显式指定的 train/test `.pt` 数据：
 
 ```bash
-uv run main.py command=train training=small paths.explicit_split.enabled=true paths.explicit_split.train_data=data/simulated/base/train_500_test_300/k2/0/train.pt paths.explicit_split.test_data=data/simulated/base/train_500_test_300/k2/0/test.pt
+uv run python scripts/train.py training=small paths.explicit_split.enabled=true paths.explicit_split.train_data=data/simulated/base/train_500_test_300/k2/0/train.pt paths.explicit_split.test_data=data/simulated/base/train_500_test_300/k2/0/test.pt
 ```
 
-真实数据建模使用 `command=case`。先把真实队列预处理成两个 CSV：
+真实数据建模使用 `scripts/case.py`。先把真实队列预处理成两个 CSV：
 
 - `patients.csv`：必需列为 `patient_id`、`survival_time`、`event`，可选列为
   `cluster_label`。`event` 必须是 `0/1`，`survival_time` 与纵向观测时间使用同一单位。
@@ -97,13 +98,13 @@ uv run main.py command=train training=small paths.explicit_split.enabled=true pa
 运行示例：
 
 ```bash
-uv run main.py case=default case.observations_csv=data/case/observations.csv case.patients_csv=data/case/patients.csv
+uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv
 ```
 
-`case=default` 会自动切到 `training=case`，默认开启 SwanLab、保存完整训练 artifacts，
-并开启 latent embedding diagnostics。命令使用全部患者训练，`training.trainer.valid_size`
-只作为内部 early stopping validation。输出默认保存在
-`outputs/case/<run.name>/`，包括 `case_dataset.pt`、`case_dataset_summary.json`、
+`scripts/case.py` 默认加载 `training=case`，默认开启 SwanLab、保存完整训练 artifacts，
+并开启 latent embedding diagnostics。命令使用全部患者训练，`trainer.valid_size`
+只作为内部 early stopping validation。输出默认保存在 `paths.dir`，默认形如
+`outputs/case/case-<timestamp>/`，包括 `case_dataset.pt`、`case_dataset_summary.json`、
 `config.json`、`history.json`、`history.csv`、`history.png`、`model.pt`、
 `predictions.pt`、`patient_clusters.csv`、`cluster_summary.csv`、
 `cluster_feature_summary.csv` 和 `case_summary.json`。`patient_clusters.csv`
@@ -113,89 +114,93 @@ uv run main.py case=default case.observations_csv=data/case/observations.csv cas
 对已有 train/test split 运行轻量基线方法：
 
 ```bash
-uv run main.py command=baseline paths.data_root=data/simulated/base
+uv run python scripts/baseline.py paths.data_root=data/simulated/base
 ```
 
 对已有 train/test split 运行 Optuna 搜索：
 
 ```bash
-uv run main.py command=optim paths.data_root=data/simulated/base optim.n_trials=20
-uv run main.py command=optim paths.data_root=data/simulated/base 'optim.run_ids=[base/train_500_test_300/k2/0]' optim.n_trials=20
-uv run main.py command=optim paths.data_root=data/simulated/base run.name=base-optim-round1 optim.n_trials=20
-uv run main.py command=optim paths.data_root=data/simulated/base run.name=base-optim-round1 optim.resume=true optim.n_trials=20
+uv run python scripts/optim.py paths.data_root=data/simulated/base optim.n_trials=20
+uv run python scripts/optim.py paths.data_root=data/simulated/base 'optim.run_ids=[base/train_500_test_300/k2/0]' optim.n_trials=20
+uv run python scripts/optim.py paths.data_root=data/simulated/base paths.dir=outputs/optim/base-round1 optim.n_trials=20
+uv run python scripts/optim.py paths.data_root=data/simulated/base paths.dir=outputs/optim/base-round1 optim.resume=true optim.n_trials=20
 ```
 
 合并训练与基线结果并生成图表：
 
 ```bash
-uv run main.py command=summary 'summary.train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'summary.baseline_roots=[outputs/baseline/base-...]' 'summary.train_labels=[base,mtan]' 'summary.baseline_labels=[kmeans]'
+uv run python scripts/summary.py 'train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'baseline_roots=[outputs/baseline/base-...]' 'train_labels=[base,mtan]' 'baseline_labels=[kmeans]'
 ```
 
 单次运行也使用列表形式：
 
 ```bash
-uv run main.py command=summary 'summary.train_roots=[outputs/train/base-...]' 'summary.baseline_roots=[outputs/baseline/base-...]'
+uv run python scripts/summary.py 'train_roots=[outputs/train/base-...]' 'baseline_roots=[outputs/baseline/base-...]'
 ```
 
-`command=train`、`command=baseline` 和 `command=optim` 都会递归扫描
+`scripts/train.py`、`scripts/baseline.py` 和 `scripts/optim.py` 都会递归扫描
 `paths.data_root` 下所有 sibling `train.pt`/`test.pt` 目录；也可以用
 `paths.explicit_split.enabled=true` 加 `paths.explicit_split.train_data/test_data`
-显式指定单个 split。Hydra 元数据和命令输出保存在同一 run 目录，默认形如
-`outputs/<command>/<run.name>/`；`run.prefix` 默认使用 scenario，`run.name`
-默认是 `<run.prefix>-<timestamp>`，也可以手动覆盖。输出会镜像数据相对路径，例如
-`outputs/train/base-.../train_500_test_300/k2/0/trails.pt`。训练和基线会优先从 dataset metadata
-中的 `generation_params.n_clusters` 推断 K，metadata 缺失时才回退到 YAML 默认值。
+显式指定单个 split。命令根配置在 `configs/<command>.yaml`；Hydra 元数据和命令输出保存在
+同一个 `paths.dir`，默认由 `paths.root`、`paths.prefix` 和 `paths.suffix` 组合，也可以手动
+覆盖，例如 `paths.dir=outputs/train/my-run`。`paths.data_root` 和 explicit split 默认值由
+train、baseline、optim 各自的根配置直接声明。输入路径（如 `paths.data_root`、summary roots、
+case CSV）相对启动命令时的当前目录解析；输出路径统一相对 `paths.dir` 解析。train、baseline
+和 optim 会镜像数据相对路径，例如 `outputs/train/base-.../train_500_test_300/k2/0/trails.pt`。
+训练和基线会优先从 dataset metadata 中的 `generation_params.n_clusters` 推断 K，metadata
+缺失时才回退到 YAML 默认值。
 
-`command=train` 会在每个 split 开始和结束时打印已耗时与剩余时间估计，并在
-Hydra run 目录下保存 `train_summary.json`、`train_metrics.csv`
-和 `<run_id>/trails.pt`。`command=baseline` 会保存
+`scripts/train.py` 会在每个 split 开始和结束时打印已耗时与剩余时间估计，并在
+`paths.dir` 下保存 `train_summary.json`、`train_metrics.csv`
+和 `<run_id>/trails.pt`。`scripts/baseline.py` 会保存
 `baseline_summary.json`、`baseline_metrics.csv` 和
 `<run_id>/<method>.pt`，用于比较 summary-feature KMeans、risk-stratified
-summary-feature KMeans 和 FPCA-KMeans。`command=optim` 会对所有选中 split
+summary-feature KMeans 和 FPCA-KMeans。`scripts/optim.py` 会对所有选中 split
 共享同一组超参数 trial，并以平均 C-index 与平均 ARI 作为多目标；`optim.run_ids`
 为空表示使用全部 split，非空时只选择指定 split。`optim.parallel` 提供共享进程池，
-`optim.resume=true run.name=<已有运行名>` 会在数据 fingerprint 一致时继续追加 trials。
+`optim.resume=true paths.dir=<已有运行目录>` 会在数据 fingerprint 一致时继续追加 trials。
 每次 optim 会写出 `trials.csv`、`pareto_trials.json`、`top_trials.csv` 和 `figures/`
-下的 Pareto、目标历史、split heatmap 等图表。`command=summary` 读取显式 train/baseline run 目录下的
+下的 Pareto、目标历史、split heatmap 等图表。`scripts/summary.py` 读取显式 train/baseline run 目录下的
 metrics CSV，保存合并 CSV、聚合 CSV、summary JSON，并为每个 simulation scenario
 生成一张按 `metrics × K` 排布的带误差条总图 PNG/PDF。
 
 命令结束时 logging 会打印精简的可读 summary；完整机器可读结果保存在上述
 JSON/CSV artifacts 中。
 
-训练 split 默认串行执行；需要多进程时显式设置 `training.parallel.workers`：
+训练 split 默认串行执行；需要多进程时显式设置 `parallel.workers`：
 
 ```bash
-uv run main.py command=train training=base paths.data_root=data/simulated/base training.parallel.workers=4
+uv run python scripts/train.py training=base paths.data_root=data/simulated/base parallel.workers=4
 ```
 
-未配置 `training.parallel.devices` 时，每个 worker 都沿用
-`training.trainer.device`，因此也允许多个进程同时使用同一张 GPU，例如默认的
+未配置 `parallel.devices` 时，每个 worker 都沿用
+`trainer.device`，因此也允许多个进程同时使用同一张 GPU，例如默认的
 `cuda:0`；请按显存情况控制 `workers`。如果有多张 GPU，可以轮转分配设备：
 
 ```bash
-uv run main.py command=train training=base paths.data_root=data/simulated/base training.parallel.workers=4 'training.parallel.devices=[cuda:0,cuda:1]'
+uv run python scripts/train.py training=base paths.data_root=data/simulated/base parallel.workers=4 'parallel.devices=[cuda:0,cuda:1]'
 ```
 
 终端输出统一走 logging，并与 tqdm 进度条兼容；train 会显示总 split 进度条以及
 当前活跃 worker 的训练进度条。
 
-可以用 `training.artifacts.names` 控制训练保存内容：
+可以用 `artifacts.names` 控制训练保存内容：
 
 ```bash
-uv run main.py command=train training=base paths.data_root=data/simulated/base 'training.artifacts.names=[config,history,test,plot]'
-uv run main.py command=train training=base paths.data_root=data/simulated/base 'training.artifacts.names=[none]'
+uv run python scripts/train.py training=base paths.data_root=data/simulated/base 'artifacts.names=[config,history,test,plot]'
+uv run python scripts/train.py training=base paths.data_root=data/simulated/base 'artifacts.names=[none]'
 ```
 
 SwanLab 由配置控制，多组 split 训练会自动在实验名后追加 run id：
 
 ```bash
-uv run main.py command=train training=base paths.data_root=data/simulated/base training.swanlab.mode=disabled
-uv run main.py command=train training=mtan paths.data_root=data/simulated/censored training.swanlab.mode=disabled
+uv run python scripts/train.py training=base paths.data_root=data/simulated/base swanlab.mode=disabled
+uv run python scripts/train.py training=mtan paths.data_root=data/simulated/censored swanlab.mode=disabled
 ```
 
-目前所有命令行都集中在根目录 `main.py`。`trails` 主包只包含核心方法代码；
-`trails_simulate` 和 `trails_case` 只能作为下游包引用 `trails`。
+命令入口位于 `scripts/`，每个命令脚本拥有独立 Hydra root config。
+`trails` 主包只包含核心方法代码；`trails_simulate` 和 `trails_case`
+保留模拟、训练、case 分析所需的可复用 helper，并只能作为下游包引用 `trails`。
 
 ## Roadmap
 

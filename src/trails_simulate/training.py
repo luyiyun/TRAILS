@@ -23,10 +23,10 @@ from trails.estimator import TrailsEstimator
 from trails.trainer import HistoryEntry
 
 from .config import (
-    ApplicationConfig,
     Command,
     DiagnosticsConfig,
     SwanLabConfig,
+    TrainingApplicationConfig,
 )
 from .evaluation import PredictionPayload, evaluate_predictions, prediction_payload_from_dataset
 from .path import TrainPaths
@@ -41,13 +41,13 @@ class TrainResult:
 
 
 def fit_training_run(
-    config: ApplicationConfig,
+    config: TrainingApplicationConfig,
     *,
     train_paths: TrainPaths,
     seed: int,
     swanlab_repeat_label: str | None,
 ) -> TrainResult:
-    artifacts = resolve_artifact_names(config.training.artifacts.names)
+    artifacts = resolve_artifact_names(config.artifacts.names)
     dataset = ClinicalTimeSeriesDataset.load(train_paths.data)
     test_dataset = (
         dataset
@@ -56,12 +56,12 @@ def fit_training_run(
     )
     trails_config = TrailsConfig(
         data=DataConfig(n_features=dataset.n_features),
-        model=config.training.model,
-        trainer=config.training.trainer.model_copy(
+        model=config.model,
+        trainer=config.trainer.model_copy(
             update={
                 "batch_size": resolve_batch_size(
                     len(dataset),
-                    config.training.trainer.batch_size,
+                    config.trainer.batch_size,
                 ),
                 "seed": seed,
             }
@@ -70,17 +70,17 @@ def fit_training_run(
     )
 
     start_swanlab_run(
-        config.training.swanlab,
+        config.swanlab,
         trails_config,
         train_paths,
         artifacts,
-        config.training.diagnostics,
+        config.diagnostics,
         repeat_label=swanlab_repeat_label,
     )
     try:
         estimator = TrailsEstimator(trails_config).fit(
             dataset,
-            history_callback=log_swanlab_history if config.training.swanlab.enabled else None,
+            history_callback=log_swanlab_history if config.swanlab.enabled else None,
         )
         prediction = prediction_payload_from_dataset(
             test_dataset,
@@ -92,10 +92,10 @@ def fit_training_run(
             prediction,
             n_clusters=trails_config.model.n_clusters,
         )
-        if config.training.swanlab.enabled:
+        if config.swanlab.enabled:
             log_swanlab_test_metrics(metrics, estimator.history)
     finally:
-        if config.training.swanlab.enabled:
+        if config.swanlab.enabled:
             swanlab.finish()
 
     run_dir = save_training_artifacts(
@@ -122,7 +122,7 @@ def fit_training_run(
 
 def save_training_artifacts(
     *,
-    config: ApplicationConfig,
+    config: TrainingApplicationConfig,
     train_paths: TrainPaths,
     trails_config: TrailsConfig,
     estimator: TrailsEstimator,
@@ -131,7 +131,7 @@ def save_training_artifacts(
     metrics: dict[str, float],
     artifacts: frozenset[str],
 ) -> Path | None:
-    should_save_diagnostics = config.training.diagnostics.latent_embeddings.enabled
+    should_save_diagnostics = config.diagnostics.latent_embeddings.enabled
     if not artifacts and not should_save_diagnostics:
         return None
 
@@ -264,7 +264,7 @@ def swanlab_config_payload(
 
 def training_run_config(
     *,
-    app_config: ApplicationConfig,
+    app_config: TrainingApplicationConfig,
     trails_config: TrailsConfig,
     train_paths: TrainPaths,
     artifacts: frozenset[str],
@@ -279,8 +279,8 @@ def training_run_config(
             **train_paths_payload(train_paths),
             "run_dir": str(run_dir),
         },
-        "diagnostics": app_config.training.diagnostics.model_dump(mode="json"),
-        "swanlab": app_config.training.swanlab.model_dump(mode="json"),
+        "diagnostics": app_config.diagnostics.model_dump(mode="json"),
+        "swanlab": app_config.swanlab.model_dump(mode="json"),
         "train_args": {
             "batch_size": trails_config.trainer.batch_size,
             "clusters": trails_config.model.n_clusters,
@@ -311,7 +311,7 @@ def training_run_config(
 def train_output_payload(
     *,
     command: Command,
-    hydra_run_dir: Path,
+    run_dir: Path,
     train_paths: TrainPaths,
     result: TrainResult,
     seed: int,
@@ -319,11 +319,11 @@ def train_output_payload(
     return {
         "command": command,
         "history": result.history,
-        "hydra_run_dir": str(hydra_run_dir),
+        "run_dir": str(run_dir),
         "paths": train_paths_payload(train_paths),
-        "run_dir": None if result.run_dir is None else str(result.run_dir),
         "seed": seed,
         "test": result.metrics,
+        "trainer_run_dir": None if result.run_dir is None else str(result.run_dir),
     }
 
 

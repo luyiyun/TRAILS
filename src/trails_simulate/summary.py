@@ -5,8 +5,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 
-def format_run_summary(result: Mapping[str, Any]) -> str:
-    command = str(result["command"])
+def format_summary(command: str, result: Mapping[str, Any]) -> str:
     if command == "simulate":
         return format_simulate_summary(result)
     if command == "train":
@@ -25,7 +24,7 @@ def format_simulate_summary(result: Mapping[str, Any]) -> str:
     outputs = dict(result["outputs"])
     lines = [
         "TRAILS simulate complete",
-        f"Hydra run: {result['hydra_run_dir']}",
+        f"Run dir: {result['run_dir']}",
         f"Data root: {result['data_root']}",
         f"Runs: {len(runs)}",
         f"Seeds: {format_seed_list([int(run['seed']) for run in runs])}",
@@ -62,7 +61,7 @@ def format_train_summary(result: Mapping[str, Any]) -> str:
     data_source_label = str(data_source.get("source", "configured path"))
     lines = [
         "TRAILS train complete",
-        f"Hydra run: {result['hydra_run_dir']}",
+        f"Run dir: {result['run_dir']}",
         f"Data root: {data_source.get('data_root', 'unknown')}",
         f"Data source: {data_source_label}",
         f"Runs: {len(runs)}",
@@ -82,7 +81,7 @@ def format_optim_summary(result: Mapping[str, Any]) -> str:
     outputs = dict(result.get("outputs", {}))
     lines = [
         "TRAILS optim complete",
-        f"Hydra run: {result['hydra_run_dir']}",
+        f"Run dir: {result['run_dir']}",
         f"Splits: {len(selected_run_ids)}",
         f"Trials added: {result['n_trials_requested']}",
         (
@@ -115,7 +114,7 @@ def format_baseline_summary(result: Mapping[str, Any]) -> str:
     data_source_label = str(data_source.get("source", "configured path"))
     lines = [
         "TRAILS baseline complete",
-        f"Hydra run: {result['hydra_run_dir']}",
+        f"Run dir: {result['run_dir']}",
         f"Data root: {data_source.get('data_root', 'unknown')}",
         f"Data source: {data_source_label}",
         f"Runs: {len(runs)}",
@@ -143,7 +142,7 @@ def format_result_summary(result: Mapping[str, Any]) -> str:
     figures = dict(outputs.get("figures", {}))
     lines = [
         "TRAILS summary complete",
-        f"Hydra run: {result['hydra_run_dir']}",
+        f"Run dir: {result['run_dir']}",
         f"Rows: {result['n_rows']}",
         f"Groups: {result['n_groups']}",
         f"Available metrics: {', '.join(metrics.get('available', []))}",

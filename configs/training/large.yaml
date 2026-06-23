@@ -1,3 +1,4 @@
+# @package _global_
 model:
   latent_dim: 64
   n_clusters: 4

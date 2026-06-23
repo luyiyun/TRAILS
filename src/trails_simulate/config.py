@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from trails.config import ModelConfig, TrainerConfig
@@ -49,6 +49,16 @@ def sanitize_run_name(value: str) -> str:
     return normalized or "run"
 
 
+def resolved_payload(raw_config: DictConfig) -> dict[str, Any]:
+    """
+    Resolve all references in the config and return a dictionary.
+    """
+    payload = OmegaConf.to_container(raw_config, resolve=True)
+    if not isinstance(payload, dict):
+        raise TypeError("Hydra config must resolve to a mapping.")
+    return cast(dict[str, Any], payload)
+
+
 OmegaConf.register_new_resolver("trails_run_prefix", infer_run_prefix, replace=True)
 
 
@@ -70,9 +80,7 @@ class SimulationConfig(BaseModel):
         if self.mechanism_seed is None:
             self.mechanism_seed = self.seed
         if len(self.train_size) != len(self.test_size):
-            raise ValueError(
-                "simulation.train_size and simulation.test_size must have equal length."
-            )
+            raise ValueError("train_size and test_size must have equal length.")
         cluster_values = self.generator.n_clusters_tuple_
         if any(value <= 0 for value in (*self.train_size, *self.test_size)):
             raise ValueError("simulation train/test sizes must be positive.")
@@ -94,16 +102,12 @@ class ExplicitSplitConfig(BaseModel):
 class PathsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    root: Path = Path("outputs")
+    prefix: str = Field(default="run", min_length=1)
+    suffix: str = Field(default="default", min_length=1)
+    dir: Path = Path("outputs/run-default")
     data_root: Path = Path("data/simulated")
     explicit_split: ExplicitSplitConfig = Field(default_factory=ExplicitSplitConfig)
-
-
-class RunConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    output_root: Path = Path("outputs")
-    prefix: str = Field(default="quick", min_length=1)
-    name: str = Field(default="quick", min_length=1)
 
 
 class ArtifactsConfig(BaseModel):
@@ -163,6 +167,8 @@ class BaselineConfig(BaseModel):
         min_length=1,
     )
     n_clusters: int | None = Field(default=None, gt=1)
+    fallback_n_clusters: int = Field(default=3, gt=1)
+    seed: int = 20260517
     kmeans_iters: int = Field(default=50, ge=0)
     ridge_alpha: float = Field(default=1.0, ge=0.0)
     risk_feature_weight: float = Field(default=1.0, ge=0.0)
@@ -172,7 +178,7 @@ class BaselineConfig(BaseModel):
     @model_validator(mode="after")
     def validate_unique_methods(self) -> BaselineConfig:
         if len(set(self.methods)) != len(self.methods):
-            raise ValueError("baseline.methods cannot contain duplicates.")
+            raise ValueError("methods cannot contain duplicates.")
         return self
 
 
@@ -285,30 +291,47 @@ class SummaryConfig(BaseModel):
         train_roots = self.train_roots
         baseline_roots = self.baseline_roots
         if self.train_labels and len(self.train_labels) != len(train_roots):
-            raise ValueError("summary.train_labels length must match summary train roots.")
+            raise ValueError("train_labels length must match train_roots.")
         if self.baseline_labels and len(self.baseline_labels) != len(baseline_roots):
-            raise ValueError("summary.baseline_labels length must match summary baseline roots.")
+            raise ValueError("baseline_labels length must match baseline_roots.")
         return self
 
 
-class ApplicationConfig(BaseModel):
+class SimulateApplicationConfig(SimulationConfig):
     model_config = ConfigDict(extra="forbid")
 
-    command: Command = "simulate"
-    run: RunConfig = Field(default_factory=RunConfig)
-    simulation: SimulationConfig = Field(default_factory=SimulationConfig)
-    training: TrainingConfig = Field(default_factory=TrainingConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
-    baseline: BaselineConfig = Field(default_factory=BaselineConfig)
+
+
+class TrainApplicationConfig(TrainingConfig):
+    model_config = ConfigDict(extra="forbid")
+
+    paths: PathsConfig = Field(default_factory=PathsConfig)
+
+
+class BaselineApplicationConfig(BaselineConfig):
+    model_config = ConfigDict(extra="forbid")
+
+    paths: PathsConfig = Field(default_factory=PathsConfig)
+
+
+class OptimApplicationConfig(TrainingConfig):
+    model_config = ConfigDict(extra="forbid")
+
+    paths: PathsConfig = Field(default_factory=PathsConfig)
     optim: OptimConfig = Field(default_factory=OptimConfig)
-    summary: SummaryConfig = Field(default_factory=SummaryConfig)
+
+
+class SummaryApplicationConfig(SummaryConfig):
+    model_config = ConfigDict(extra="forbid")
+
+    paths: PathsConfig = Field(default_factory=PathsConfig)
 
     @model_validator(mode="after")
-    def validate_command_specific_config(self) -> ApplicationConfig:
-        if self.command == "summary":
-            if not self.summary.train_roots and not self.summary.baseline_roots:
-                raise ValueError(
-                    "command=summary requires at least one of summary.train_roots, "
-                    "or summary.baseline_roots."
-                )
+    def validate_summary_inputs(self) -> SummaryApplicationConfig:
+        if not self.train_roots and not self.baseline_roots:
+            raise ValueError("summary requires at least one of train_roots or baseline_roots.")
         return self
+
+
+type TrainingApplicationConfig = TrainApplicationConfig | OptimApplicationConfig

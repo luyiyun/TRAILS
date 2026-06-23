@@ -13,8 +13,8 @@ items.
 
 ## Layout
 
-- `main.py`: all CLI commands. Use `uv run main.py ...`.
-- `configs/`: Hydra simulation, training, baseline, optimization, summary, and case configuration.
+- `scripts/`: one Hydra CLI script per command. Use `uv run python scripts/<command>.py ...`.
+- `configs/`: Hydra command roots plus shared simulation, training, baseline, optimization, summary, and case configuration.
 - `src/trails/`: reusable core code: data, model, trainer, estimator, metrics.
 - `src/trails_simulate/`: synthetic clinical data generation; imports `trails`.
 - `src/trails_case/`: real-data/case-study utilities; imports `trails`.
@@ -24,8 +24,9 @@ items.
 
 Allowed dependencies:
 
-- `main.py -> trails`
-- `main.py -> trails_simulate`
+- `scripts/* -> trails`
+- `scripts/* -> trails_simulate`
+- `scripts/* -> trails_case`
 - `trails_simulate -> trails`
 - `trails_case -> trails`
 
@@ -33,21 +34,21 @@ Forbidden dependencies:
 
 - `trails -> trails_simulate`
 - `trails -> trails_case`
-- `trails -> main`
+- `trails -> scripts`
 
 Keep command orchestration out of `src/trails`; the main package should remain a
 clean reusable method library.
 
 ## Commands
 
-- Quick simulation split generation: `uv run main.py command=simulate simulation=quick`
-- Paper simulation grid generation for one scene: `uv run main.py command=simulate simulation=base`
-- Train existing splits: `uv run main.py command=train training=base paths.data_root=data/simulated/base`
-- Train with mTAN-style input: `uv run main.py command=train training=mtan paths.data_root=data/simulated/base`
-- Run real-data case modeling: `uv run main.py case=default case.observations_csv=data/case/observations.csv case.patients_csv=data/case/patients.csv`
-- Run lightweight baselines on existing splits: `uv run main.py command=baseline paths.data_root=data/simulated/base`
-- Run Optuna tuning on existing splits: `uv run main.py command=optim paths.data_root=data/simulated/base`
-- Summarize train and baseline results: `uv run main.py command=summary 'summary.train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'summary.baseline_roots=[outputs/baseline/base-...]' 'summary.train_labels=[base,mtan]' 'summary.baseline_labels=[kmeans]'`
+- Quick simulation split generation: `uv run python scripts/simulate.py simulation=quick`
+- Paper simulation grid generation for one scene: `uv run python scripts/simulate.py simulation=base`
+- Train existing splits: `uv run python scripts/train.py training=base paths.data_root=data/simulated/base`
+- Train with mTAN-style input: `uv run python scripts/train.py training=mtan paths.data_root=data/simulated/base`
+- Run real-data case modeling: `uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv`
+- Run lightweight baselines on existing splits: `uv run python scripts/baseline.py paths.data_root=data/simulated/base`
+- Run Optuna tuning on existing splits: `uv run python scripts/optim.py paths.data_root=data/simulated/base`
+- Summarize train and baseline results: `uv run python scripts/summary.py 'train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'baseline_roots=[outputs/baseline/base-...]' 'train_labels=[base,mtan]' 'baseline_labels=[kmeans]'`
 - Compute cluster attribution lines for a saved model: `uv run python scripts/cluster_attribution.py --model-path outputs/case/case-.../model.pt --data-path outputs/case/case-.../case_dataset.pt --plot-features 6`
 - Format: `uv run ruff format`
 - Lint: `uv run ruff check --fix`
@@ -80,49 +81,55 @@ clean reusable method library.
 ## Current Decisions
 
 - Package name: `trails`.
-- CLI lives only in root `main.py`; no package console script is configured.
-- `main.py` is a Hydra app. Default `command=simulate` generates train/test
-  split simulation data. Training and baseline comparison are separate commands.
+- CLI lives in command-specific Hydra scripts under `scripts/`; no package console script is configured.
+- Each command script has its own root config at `configs/<command>.yaml`.
+  `scripts/simulate.py` generates train/test split simulation data. Training and
+  baseline comparison are separate scripts.
 - Simulation scenarios live under `configs/simulation/`: `quick`, `base`,
   `imbalance`, `censored`, and `high_dimension`. `quick` is for smoke tests;
   the other four are paper simulation scenes.
 - Training model presets live under `configs/training/`: `small`, `base`,
   `large`, and `mtan`. Training scene selection comes from `paths.data_root` or
   `paths.explicit_split`, not from simulation config.
-- `training.trainer.batch_size: null` means the trainer resolves batch size from
+- `trainer.batch_size: null` means the trainer resolves batch size from
   the loaded training split size using a conservative automatic rule; explicit
   integer overrides keep their exact value.
-- Command-level config namespaces are `simulation`, `training`, `baseline`,
-  `optim`, `summary`, `case`, shared `paths`, and shared `run`; generator parameters live under
-  `simulation.generator`, while TRAILS model/trainer/artifacts/diagnostics/SwanLab
-  parameters live under `training`.
-- `simulation.train_size` and `simulation.test_size` are equal-length lists that
+- Command-level root configs live at `configs/<command>.yaml` and compose only the
+  fields needed by that script. Simulation, baseline, summary, case, and training
+  fields are flattened into the command root after preset composition; `paths`
+  remains the shared path namespace, and `optim` intentionally keeps its
+  `optim.*` namespace. Generator parameters live under `generator`, while TRAILS
+  model/trainer/artifacts/diagnostics/SwanLab parameters live at the command root.
+- `train_size` and `test_size` are equal-length lists that
   are paired by position. Each paired sample-size level is crossed with
-  `simulation.generator.n_clusters`, and each combination is repeated
-  `simulation.repeats` times. Formal simulation scenes use train sizes
+  `generator.n_clusters`, and each combination is repeated
+  `repeats` times. Formal simulation scenes use train sizes
   `[500, 1000, 2000, 3000, 5000]` and fixed test size `300`; `quick` remains a
   small smoke-test configuration.
-- `simulation.repeats` means paired split repeats within each sample-size and K
+- `repeats` means paired split repeats within each sample-size and K
   combination: each repeat generates one source simulation dataset and splits it
   into train/test.
 - Generator instantiation fixes DGP mechanism parameters using
-  `simulation.mechanism_seed` when set, otherwise `simulation.seed`. The same
-  `simulation.name × K` combination uses a fixed mechanism seed; sample seeds vary
+  `mechanism_seed` when set, otherwise `seed`. The same
+  `name × K` combination uses a fixed mechanism seed; sample seeds vary
   across sample-size levels and repeats for patient draws, train/test split
-  shuffling. Train, baseline, and optim command seeds come from
-  `training.trainer.seed` plus the discovered split index.
-- Validation data is cut internally from `train.pt` by `training.trainer.valid_size`, is
+  shuffling. Train and optim command seeds come from `trainer.seed`
+  plus the discovered split index; baseline seeds come from `seed`
+  plus the discovered split index.
+- Validation data is cut internally from `train.pt` by `trainer.valid_size`, is
   not saved as a separate `val.pt`, and is used for early stopping; if no validation
   split is requested, early stopping monitors the training metric instead.
-- Hydra metadata and command outputs go under one run directory by default:
-  `outputs/<command>/<run.name>`. `run.output_root` defaults to `outputs`,
-  `run.prefix` defaults to the simulation scenario for `simulate`, the final
-  `paths.data_root` component for `train`/`baseline`/`optim`, and `summary` for
-  summaries. `command=simulate` writes generated split data, manifest, and
-  summary directly under its Hydra run directory; `paths.data_root` is used by
-  `train`, `baseline`, and `optim` to read existing split data. Train, baseline,
-  and optim outputs mirror the relative data split path discovered under
-  `paths.data_root`.
+- Hydra metadata and command outputs go under the single user-visible `paths.dir`
+  directory. Each command root config sets `hydra.run.dir: ${paths.dir}` and
+  defines `paths.root`, `paths.prefix`, and `paths.suffix`, which compose the
+  default `paths.dir`; users may override `paths.dir` directly, for example
+  `paths.dir=outputs/train/my-run`. Train, baseline, and optim root configs
+  declare their own `paths.data_root` and `paths.explicit_split` defaults directly.
+  Input paths such as `paths.data_root`, explicit split paths, summary roots, and
+  case CSVs are resolved relative to the directory where the command is launched.
+  Output paths are resolved relative to
+  `paths.dir`; train, baseline, and optim outputs mirror the relative data split
+  path discovered under `paths.data_root`.
 - Simulation uses a VaDeSC-EHR-style latent-cluster generator adapted to
   continuous asynchronous clinical measurements.
 - Simulation outputs a `ClinicalTimeSeriesDataset` saved via `torch.save`.
@@ -161,25 +168,25 @@ clean reusable method library.
   command-level metrics CSV and summary JSON.
 - Train command progress reports include split index, elapsed time, per-split
   duration, and estimated remaining time.
-- Train command split execution is configurable with `training.parallel.workers`.
+- Train command split execution is configurable with `parallel.workers`.
   The default is serial (`1`); `workers > 1` uses spawn-based process parallelism
-  across discovered train/test splits. If `training.parallel.devices` is empty,
-  every worker keeps `training.trainer.device`, including same-GPU concurrency;
+  across discovered train/test splits. If `parallel.devices` is empty,
+  every worker keeps `trainer.device`, including same-GPU concurrency;
   otherwise worker slots rotate through the configured device list.
 - CLI terminal messages use logging with tqdm-compatible output. Train progress
   keeps a total split bar plus per-worker training bars with fixed positions.
-- `command=baseline` lives in `trails_simulate` and runs lightweight simulation
+- `scripts/baseline.py` runs lightweight simulation
   comparators on existing train/test splits: summary-feature k-means and
   risk-stratified summary-feature k-means, plus FPCA-KMeans via `scikit-fda`. It
-  writes baseline summary JSON and metrics CSV under the Hydra run directory.
-- `command=optim` recursively discovers existing train/test splits and optimizes
+  writes baseline summary JSON and metrics CSV under `paths.dir`.
+- `scripts/optim.py` recursively discovers existing train/test splits and optimizes
   one shared hyperparameter trial over all selected splits by averaging C-index
   and ARI. Use `optim.run_ids` to select a subset; an empty list means all splits.
   `optim.parallel` controls the shared process pool across trial/split jobs.
-  Use `optim.resume=true run.name=<existing-run-name>` to append trials to an
+  Use `optim.resume=true paths.dir=<existing-run-dir>` to append trials to an
   existing study; dataset fingerprints are checked before resume.
-- `command=summary` accepts any number of train and baseline Hydra run directories
-  via `summary.train_roots` and `summary.baseline_roots`, adds source-aware
+- `scripts/summary.py` accepts any number of train and baseline run directories
+  via `train_roots` and `baseline_roots`, adds source-aware
   method labels when repeated method names appear across roots, aggregates by
   scenario/sample size/K/method label, and writes CSV/JSON plus one publication-facing
   metrics-by-K PNG/PDF grid per scenario.
@@ -189,22 +196,22 @@ clean reusable method library.
   logits, aggregates them into fixed time-bin by feature tables with SEM, and writes
   one multi-cluster line plot using `--plot-features` as either Top-N or explicit
   feature names.
-- `command=case` lives in `trails_case` and reads real-data CSV inputs:
+- `scripts/case.py` reads real-data CSV inputs:
   `patients.csv` with `patient_id`, `survival_time`, `event`, and optional
   `cluster_label`; `observations.csv` with `patient_id`, `time`, `feature`,
-  and `value`. It trains on all patients, uses `training.trainer.valid_size`
+  and `value`. It trains on all patients, uses `trainer.valid_size`
   only for internal early stopping, and saves the converted dataset, model,
   history, predictions, patient-level clusters, cluster summaries, feature
-  summaries, and `case_summary.json` under `outputs/case/<run.name>`.
-- `case.k_selection.enabled=true` runs estimator-level holdout K selection before
-  final case training. Empty `case.k_selection.candidate_clusters` means
-  `2..training.model.n_clusters`; candidates are scored by validation C-index and
+  summaries, and `case_summary.json` under `paths.dir`.
+- `k_selection.enabled=true` runs estimator-level holdout K selection before
+  final case training. Empty `k_selection.candidate_clusters` means
+  `2..model.n_clusters`; candidates are scored by validation C-index and
   latent MoG BIC using `sqrt(CI^2 + (1 - BIC_norm)^2)`. Candidate training and
   selection metrics share the same holdout validation split. Case runs inherit
   the best candidate estimator instead of retraining on all patients, and
   candidate models, histories, metrics, configs, and aggregate selection tables
-  are saved under `case.k_selection.result_dir`.
-- The `case=default` config selects `training=case`, which defaults to SwanLab
+  are saved under `k_selection.result_dir`.
+- `configs/case.yaml` composes the `training=case` preset, which defaults to SwanLab
   enabled, complete artifacts, and latent embedding diagnostics.
 
 ## Verification

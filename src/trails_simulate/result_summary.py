@@ -9,10 +9,8 @@ from typing import Any, cast
 
 import pandas as pd
 
-from trails.artifacts import save_json
-
-from .config import ApplicationConfig
-from .path import resolve_path
+from .config import SummaryApplicationConfig
+from .path import resolve_input_path
 
 RUN_ID_PATTERN = re.compile(
     r"^(?P<scenario>[^/]+)/train_(?P<train_size>\d+)_test_(?P<test_size>\d+)/"
@@ -50,74 +48,17 @@ class MetricInput:
     metrics_csv: Path
 
 
-def run_summary_command(
-    config: ApplicationConfig,
-    hydra_run_dir: Path,
-    project_root: Path,
-) -> dict[str, Any]:
-    inputs = summary_metric_inputs(config, project_root)
-    if not inputs:
-        raise ValueError("command=summary requires at least one train or baseline metrics root.")
-
-    metric_df = pd.concat(
-        [read_metric_df(metric_input) for metric_input in inputs], ignore_index=True
-    )
-    metric_df, parse_warnings = add_run_id_fields(metric_df)
-    metric_df = add_method_labels(metric_df)
-    requested_metrics = list(config.summary.metrics)
-    available_metrics = available_numeric_metrics(metric_df)
-    skipped_metrics = [metric for metric in requested_metrics if metric not in available_metrics]
-    grouped_df = group_metric_df(metric_df, metrics=available_metrics)
-
-    metrics_path = hydra_run_dir / "summary_metrics.csv"
-    grouped_path = hydra_run_dir / "summary_metrics_grouped.csv"
-    summary_path = hydra_run_dir / "summary_summary.json"
-    figures_dir = hydra_run_dir / "figures"
-    figures = save_summary_figures(
-        grouped_df,
-        metrics=[metric for metric in requested_metrics if metric in available_metrics],
-        figures_dir=figures_dir,
-    )
-
-    write_metric_df(metrics_path, metric_df)
-    write_metric_df(grouped_path, grouped_df)
-    payload = {
-        "command": "summary",
-        "config": config.model_dump(mode="json"),
-        "hydra_run_dir": str(hydra_run_dir),
-        "inputs": [metric_input_payload(metric_input) for metric_input in inputs],
-        "metrics": {
-            "available": available_metrics,
-            "requested": requested_metrics,
-            "skipped": skipped_metrics,
-        },
-        "n_groups": len(grouped_df),
-        "n_rows": len(metric_df),
-        "outputs": {
-            "figures": figures,
-            "grouped_csv": str(grouped_path),
-            "metrics_csv": str(metrics_path),
-            "summary": str(summary_path),
-        },
-        "parse_warnings": parse_warnings,
-    }
-    save_json(summary_path, payload)
-    return payload
-
-
-def summary_metric_inputs(config: ApplicationConfig, project_root: Path) -> list[MetricInput]:
+def summary_metric_inputs(config: SummaryApplicationConfig) -> list[MetricInput]:
     inputs: list[MetricInput] = []
-    train_roots = tuple(resolve_path(root, project_root) for root in config.summary.train_roots)
-    train_labels = source_labels(train_roots, config.summary.train_labels)
+    train_roots = tuple(resolve_input_path(root) for root in config.train_roots)
+    train_labels = source_labels(train_roots, config.train_labels)
     for root, label in zip(train_roots, train_labels, strict=True):
         metrics_csv = root / "train_metrics.csv"
         require_file(metrics_csv)
         inputs.append(MetricInput("train", root, label, metrics_csv))
 
-    baseline_roots = tuple(
-        resolve_path(root, project_root) for root in config.summary.baseline_roots
-    )
-    baseline_labels = source_labels(baseline_roots, config.summary.baseline_labels)
+    baseline_roots = tuple(resolve_input_path(root) for root in config.baseline_roots)
+    baseline_labels = source_labels(baseline_roots, config.baseline_labels)
     for root, label in zip(baseline_roots, baseline_labels, strict=True):
         metrics_csv = root / "baseline_metrics.csv"
         require_file(metrics_csv)

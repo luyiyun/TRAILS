@@ -19,10 +19,10 @@ from trails.progress import ProgressBar, ProgressManager
 
 from .config import (
     OPTIM_PARAM_NAMES,
-    ApplicationConfig,
     FloatSearchRangeConfig,
+    OptimApplicationConfig,
 )
-from .path import DatasetRunPaths, TrainPaths, discover_dataset_runs, resolve_path
+from .path import DatasetRunPaths, TrainPaths, resolve_output_path
 from .training import fit_training_run
 
 matplotlib.use("Agg")
@@ -33,7 +33,7 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class OptimSplitJob:
-    config: ApplicationConfig
+    config: OptimApplicationConfig
     device: str
     optim_root: Path
     run_paths: DatasetRunPaths
@@ -55,7 +55,7 @@ class OptimSplitResult:
 
 @dataclass
 class ActiveOptimTrial:
-    config: ApplicationConfig
+    config: OptimApplicationConfig
     trial: Any
     results: list[OptimSplitResult] = field(default_factory=list)
     futures: set[Future[OptimSplitResult]] = field(default_factory=set)
@@ -70,99 +70,6 @@ class OptimProgress:
     total_trials: int
     completed_split_jobs: int = 0
     completed_trials: int = 0
-
-
-def run_optim_command(
-    config: ApplicationConfig,
-    hydra_run_dir: Path,
-    project_root: Path,
-) -> dict[str, Any]:
-    optuna = load_optuna()
-    runs = discover_dataset_runs(config, hydra_run_dir, project_root)
-    selected_runs, selection_source = select_optim_runs(runs, config.optim.run_ids)
-    for run_paths in selected_runs:
-        validate_optim_test_data(run_paths.test_data)
-
-    fingerprint = dataset_fingerprint(selected_runs)
-    fingerprint_path = hydra_run_dir / "dataset_fingerprint.json"
-    validate_or_write_dataset_fingerprint(
-        config=config,
-        fingerprint_path=fingerprint_path,
-        fingerprint=fingerprint,
-        hydra_run_dir=hydra_run_dir,
-    )
-
-    storage_url = optim_storage_url(config.optim.storage, hydra_run_dir, project_root)
-    sampler = optuna.samplers.TPESampler(seed=config.training.trainer.seed)
-    study = optuna.create_study(
-        directions=["maximize", "maximize"],
-        load_if_exists=True,
-        sampler=sampler,
-        storage=storage_url,
-        study_name=config.optim.study_name,
-    )
-
-    completed_before = count_completed_trials(study.trials)
-    run_optim_study(
-        study,
-        config=config,
-        selected_runs=selected_runs,
-        optim_root=hydra_run_dir,
-    )
-    completed_after = count_completed_trials(study.trials)
-
-    summary_path = hydra_run_dir / "optim_summary.json"
-    trials_csv_path = hydra_run_dir / "trials.csv"
-    pareto_path = hydra_run_dir / "pareto_trials.json"
-    top_trials_csv_path = hydra_run_dir / "top_trials.csv"
-    figures_dir = hydra_run_dir / "figures"
-    pareto_trials = serialize_optim_trials(best_trials(study))
-    all_trials = serialize_optim_trials(study.trials)
-    figures = save_optim_figures(
-        figures_dir,
-        trials=study.trials,
-        pareto_trials=best_trials(study),
-        selected_runs=selected_runs,
-    )
-
-    save_optim_trials_csv(trials_csv_path, study.trials)
-    save_top_trials_csv(top_trials_csv_path, study.trials)
-    save_json(pareto_path, pareto_trials)
-
-    summary = {
-        "command": "optim",
-        "completed_after": completed_after,
-        "completed_before": completed_before,
-        "config": config.model_dump(mode="json"),
-        "data_fingerprint": fingerprint,
-        "hydra_run_dir": str(hydra_run_dir),
-        "n_trials_requested": config.optim.n_trials,
-        "outputs": {
-            "dataset_fingerprint": str(fingerprint_path),
-            "figures": figures,
-            "pareto_trials": str(pareto_path),
-            "summary": str(summary_path),
-            "top_trials_csv": str(top_trials_csv_path),
-            "trials_csv": str(trials_csv_path),
-        },
-        "paths": {
-            "optim_summary": str(summary_path),
-        },
-        "pareto_trials": pareto_trials,
-        "selected_run_ids": [run.run_id for run in selected_runs],
-        "selection": {
-            "available_run_ids": [run.run_id for run in runs],
-            "run_ids": [run.run_id for run in selected_runs],
-            "source": selection_source,
-        },
-        "splits": [optim_split_payload(run_paths) for run_paths in selected_runs],
-        "storage": storage_url,
-        "study_name": study.study_name,
-        "trials": all_trials,
-    }
-
-    save_json(summary_path, summary)
-    return summary
 
 
 def select_optim_runs(
@@ -190,7 +97,7 @@ def format_available_run_ids(runs: Sequence[DatasetRunPaths]) -> str:
 def run_optim_study(
     study: Any,
     *,
-    config: ApplicationConfig,
+    config: OptimApplicationConfig,
     selected_runs: Sequence[DatasetRunPaths],
     optim_root: Path,
 ) -> None:
@@ -233,7 +140,7 @@ def run_optim_study(
 def run_optim_study_parallel(
     study: Any,
     *,
-    config: ApplicationConfig,
+    config: OptimApplicationConfig,
     selected_runs: Sequence[DatasetRunPaths],
     optim_root: Path,
     progress: OptimProgress,
@@ -329,7 +236,7 @@ def run_optim_study_parallel(
 def run_optim_study_serial(
     study: Any,
     *,
-    config: ApplicationConfig,
+    config: OptimApplicationConfig,
     selected_runs: Sequence[DatasetRunPaths],
     optim_root: Path,
     progress: OptimProgress,
@@ -373,12 +280,12 @@ def update_optim_progress_postfix(progress: OptimProgress) -> None:
     )
 
 
-def effective_active_trials(config: ApplicationConfig) -> int:
+def effective_active_trials(config: OptimApplicationConfig) -> int:
     return max(1, min(config.optim.parallel.max_active_trials, config.optim.n_trials))
 
 
 def build_optim_split_job(
-    config: ApplicationConfig,
+    config: OptimApplicationConfig,
     *,
     optim_root: Path,
     run_paths: DatasetRunPaths,
@@ -393,7 +300,7 @@ def build_optim_split_job(
         device=optim_device_for_task(config, task_slot),
         optim_root=optim_root,
         run_paths=run_paths,
-        seed=config.training.trainer.seed + trial_number * total_splits + split_index,
+        seed=config.trainer.seed + trial_number * total_splits + split_index,
         split_index=split_index,
         total_splits=total_splits,
         trial_number=trial_number,
@@ -401,11 +308,11 @@ def build_optim_split_job(
     )
 
 
-def optim_device_for_task(config: ApplicationConfig, task_slot: int) -> str:
+def optim_device_for_task(config: OptimApplicationConfig, task_slot: int) -> str:
     devices = config.optim.parallel.devices
     if devices:
         return devices[task_slot % len(devices)]
-    return config.training.trainer.device
+    return config.trainer.device
 
 
 def run_optim_split_job(job: OptimSplitJob) -> OptimSplitResult:
@@ -502,12 +409,12 @@ def load_optuna() -> Any:
     except ImportError as error:
         raise RuntimeError(
             "command=optim requires Optuna. Install the project dev dependencies with "
-            "`uv sync --group dev` before running `uv run main.py command=optim`."
+            "`uv sync --group dev` before running `uv run python scripts/optim.py`."
         ) from error
     return optuna
 
 
-def optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationConfig:
+def optim_trial_config(config: OptimApplicationConfig, trial: Any) -> OptimApplicationConfig:
     search = config.optim.search
     encoder_input_kind = str(
         trial.suggest_categorical("encoder_input_kind", list(search.encoder_input_kind))
@@ -528,8 +435,8 @@ def optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationConf
     set_trial_user_attr(trial, "decoder_conditioning", decoder_conditioning)
     hidden_dim = int(trial.suggest_categorical("hidden_dim", list(search.hidden_dim)))
     n_layers = int(trial.suggest_categorical("n_layers", list(search.n_layers)))
-    model = config.training.model
-    trainer = config.training.trainer
+    model = config.model
+    trainer = config.trainer
     encoder_config = model.encoder.model_copy(
         update={
             "input": model.encoder.input.model_copy(
@@ -584,25 +491,23 @@ def optim_trial_config(config: ApplicationConfig, trial: Any) -> ApplicationConf
     )
 
     # optim 只保留 Optuna bookkeeping，训练过程中的模型、图和诊断产物全部关闭。
-    diagnostics_config = config.training.diagnostics.model_copy(
+    diagnostics_config = config.diagnostics.model_copy(
         update={
-            "latent_embeddings": config.training.diagnostics.latent_embeddings.model_copy(
+            "latent_embeddings": config.diagnostics.latent_embeddings.model_copy(
                 update={"enabled": False}
             )
         }
     )
-    training_config = config.training.model_copy(
+    training_config = config.model_copy(
         update={
-            "artifacts": config.training.artifacts.model_copy(
-                update={"names": ("none",), "save": None}
-            ),
+            "artifacts": config.artifacts.model_copy(update={"names": ("none",), "save": None}),
             "diagnostics": diagnostics_config,
             "model": model_config,
-            "swanlab": config.training.swanlab.model_copy(update={"enabled": False}),
+            "swanlab": config.swanlab.model_copy(update={"enabled": False}),
             "trainer": trainer_config,
         }
     )
-    return config.model_copy(update={"training": training_config})
+    return training_config
 
 
 def suggest_float_range(trial: Any, name: str, search_range: FloatSearchRangeConfig) -> float:
@@ -622,30 +527,26 @@ def set_trial_user_attr(trial: Any, name: str, value: Any) -> None:
         set_user_attr(name, value)
 
 
-def config_for_dataset_clusters(config: ApplicationConfig, train_data: Path) -> ApplicationConfig:
+def config_for_dataset_clusters(
+    config: OptimApplicationConfig,
+    train_data: Path,
+) -> OptimApplicationConfig:
     dataset = ClinicalTimeSeriesDataset.load(train_data)
     params = dataset.metadata.get("generation_params")
     if not isinstance(params, Mapping) or "n_clusters" not in params:
         return config
     n_clusters = int(params["n_clusters"])
     return config.model_copy(
-        update={
-            "training": config.training.model_copy(
-                update={
-                    "model": config.training.model.model_copy(update={"n_clusters": n_clusters})
-                }
-            )
-        }
+        update={"model": config.model.model_copy(update={"n_clusters": n_clusters})}
     )
 
 
-def config_with_training_device(config: ApplicationConfig, device: str) -> ApplicationConfig:
+def config_with_training_device(
+    config: OptimApplicationConfig,
+    device: str,
+) -> OptimApplicationConfig:
     return config.model_copy(
-        update={
-            "training": config.training.model_copy(
-                update={"trainer": config.training.trainer.model_copy(update={"device": device})}
-            )
-        }
+        update={"trainer": config.trainer.model_copy(update={"device": device})}
     )
 
 
@@ -725,14 +626,14 @@ def validate_optim_test_data(test_data: Path) -> None:
 
 def validate_or_write_dataset_fingerprint(
     *,
-    config: ApplicationConfig,
+    config: OptimApplicationConfig,
     fingerprint_path: Path,
     fingerprint: dict[str, Any],
-    hydra_run_dir: Path,
+    run_dir: Path,
 ) -> None:
     existing_payload = load_json_if_exists(fingerprint_path)
-    has_existing_results = (hydra_run_dir / "optim_summary.json").exists() or (
-        hydra_run_dir / "study.db"
+    has_existing_results = (run_dir / "optim_summary.json").exists() or (
+        run_dir / "study.db"
     ).exists()
     if existing_payload is None:
         if config.optim.resume and has_existing_results:
@@ -743,7 +644,7 @@ def validate_or_write_dataset_fingerprint(
         if not config.optim.resume and has_existing_results:
             raise ValueError(
                 "Optim output directory already contains results. Use optim.resume=true with "
-                "the same run.name to append trials."
+                "the same paths.dir to append trials."
             )
         save_json(fingerprint_path, fingerprint)
         return
@@ -751,12 +652,12 @@ def validate_or_write_dataset_fingerprint(
     if existing_payload != fingerprint:
         raise ValueError(
             "Optim dataset fingerprint does not match the existing run directory. "
-            "Use a new run.name for a different dataset."
+            "Use a new paths.dir for a different dataset."
         )
     if not config.optim.resume:
         raise ValueError(
             "Optim output directory already contains a dataset fingerprint. Use "
-            "optim.resume=true to continue this run or choose a new run.name."
+            "optim.resume=true to continue this run or choose a new paths.dir."
         )
 
 
@@ -801,12 +702,12 @@ def file_fingerprint(path: Path) -> dict[str, Any]:
     }
 
 
-def optim_storage_url(storage: str | None, optim_root: Path, project_root: Path) -> str:
+def optim_storage_url(storage: str | None, optim_root: Path) -> str:
     if storage is None:
         return f"sqlite:///{(optim_root / 'study.db').as_posix()}"
     if "://" in storage:
         return storage
-    return f"sqlite:///{resolve_path(Path(storage), project_root).as_posix()}"
+    return f"sqlite:///{resolve_output_path(Path(storage), optim_root).as_posix()}"
 
 
 def required_metric(metrics: Mapping[str, float], name: str, trial_number: int) -> float:

@@ -1,3 +1,4 @@
+# @package _global_
 name: quick
 repeats: 1
 train_size: [64]
