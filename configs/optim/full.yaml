@@ -1,3 +1,4 @@
+name: full
 n_trials: 300
 run_ids: []
 study_name: optim

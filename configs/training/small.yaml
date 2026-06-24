@@ -1,4 +1,5 @@
 # @package _global_
+name: small
 model:
   latent_dim: 4
   n_clusters: 3

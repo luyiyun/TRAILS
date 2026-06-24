@@ -5,7 +5,7 @@ defaults:
 
 paths:
   root: outputs/train
-  prefix: ${trails_run_prefix:train,"",${paths.data_root}}
+  prefix: ${name}
   suffix: ${now:%Y%m%d-%H%M%S-%f}
   dir: ${paths.root}/${paths.prefix}-${paths.suffix}
   data_root: data/simulated

@@ -5,65 +5,34 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from trails.config import ModelConfig, TrainerConfig
+from trails_simulate.config import (
+    ArtifactsConfig,
+    DiagnosticsConfig,
+    LatentEmbeddingDiagnosticsConfig,
+    OutputPathsConfig,
+    ParallelTrainingConfig,
+    SwanLabConfig,
+    TrainingConfig,
+)
+
+__all__ = [
+    "ArtifactsConfig",
+    "CaseApplicationConfig",
+    "CaseConfig",
+    "DiagnosticsConfig",
+    "LatentEmbeddingDiagnosticsConfig",
+    "ParallelTrainingConfig",
+    "PathsConfig",
+    "SwanLabConfig",
+    "TrainingConfig",
+]
 
 
-class PathsConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class PathsConfig(OutputPathsConfig):
     root: Path = Path("outputs/case")
     prefix: str = Field(default="case", min_length=1)
     suffix: str = Field(default="default", min_length=1)
     dir: Path = Path("outputs/case/case-default")
-
-
-class ArtifactsConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    names: tuple[str, ...] = ("all",)
-    save: Path | None = None
-
-
-class LatentEmbeddingDiagnosticsConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-
-
-class DiagnosticsConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    latent_embeddings: LatentEmbeddingDiagnosticsConfig = Field(
-        default_factory=LatentEmbeddingDiagnosticsConfig
-    )
-
-
-class SwanLabConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-    project: str = "TRAILS"
-    experiment: str | None = None
-    mode: str | None = None
-
-
-class ParallelTrainingConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    workers: int = Field(default=1, gt=0)
-    devices: tuple[str, ...] = ()
-    torch_threads: int | None = Field(default=None, gt=0)
-
-
-class TrainingConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    model: ModelConfig = Field(default_factory=ModelConfig)
-    trainer: TrainerConfig = Field(default_factory=TrainerConfig)
-    artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
-    diagnostics: DiagnosticsConfig = Field(default_factory=DiagnosticsConfig)
-    parallel: ParallelTrainingConfig = Field(default_factory=ParallelTrainingConfig)
-    swanlab: SwanLabConfig = Field(default_factory=SwanLabConfig)
 
 
 class PatientColumnsConfig(BaseModel):
@@ -136,4 +105,5 @@ class CaseApplicationConfig(TrainingConfig, CaseConfig):
     model_config = ConfigDict(extra="forbid")
 
     command: Literal["case"] = "case"
+    name: str = "case"
     paths: PathsConfig = Field(default_factory=PathsConfig)

@@ -67,7 +67,10 @@ def test_case_config_defaults_validate() -> None:
     config = CaseApplicationConfig.model_validate(compose_payload())
 
     assert config.command == "case"
+    assert config.name == "case"
     assert config.paths.dir.as_posix().startswith("outputs/case/case-")
+    assert "data_root" not in config.paths.model_dump(mode="json")
+    assert "explicit_split" not in config.paths.model_dump(mode="json")
     assert config.swanlab.enabled
     assert config.swanlab.experiment == "case"
     assert config.artifacts.names == ("all",)

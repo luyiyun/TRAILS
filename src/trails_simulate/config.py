@@ -99,13 +99,16 @@ class ExplicitSplitConfig(BaseModel):
     test_data: Path = Path("data/simulated/test.pt")
 
 
-class PathsConfig(BaseModel):
+class OutputPathsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     root: Path = Path("outputs")
     prefix: str = Field(default="run", min_length=1)
     suffix: str = Field(default="default", min_length=1)
     dir: Path = Path("outputs/run-default")
+
+
+class PathsConfig(OutputPathsConfig):
     data_root: Path = Path("data/simulated")
     explicit_split: ExplicitSplitConfig = Field(default_factory=ExplicitSplitConfig)
 
@@ -151,6 +154,7 @@ class ParallelTrainingConfig(BaseModel):
 class TrainingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    name: str = "base"
     model: ModelConfig = Field(default_factory=ModelConfig)
     trainer: TrainerConfig = Field(default_factory=TrainerConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
@@ -268,6 +272,7 @@ class OptimParallelConfig(BaseModel):
 class OptimConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    name: str = "default"
     n_trials: int = Field(default=30, gt=0)
     run_ids: tuple[str, ...] = ()
     study_name: str = Field(default="optim", min_length=1)

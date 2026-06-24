@@ -6,7 +6,7 @@ defaults:
 
 paths:
   root: outputs/optim
-  prefix: ${trails_run_prefix:optim,"",${paths.data_root}}
+  prefix: ${name}-optim_${optim.name}
   suffix: ${now:%Y%m%d-%H%M%S-%f}
   dir: ${paths.root}/${paths.prefix}-${paths.suffix}
   data_root: data/simulated

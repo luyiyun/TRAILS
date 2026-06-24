@@ -34,7 +34,7 @@ columns:
 
 paths:
   root: outputs/case
-  prefix: case
+  prefix: case-train_${name}
   suffix: ${now:%Y%m%d-%H%M%S-%f}
   dir: ${paths.root}/${paths.prefix}-${paths.suffix}
 

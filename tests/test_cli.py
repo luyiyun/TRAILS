@@ -320,9 +320,9 @@ def test_paths_config_defaults_use_composed_output_dir_and_keep_inputs_explicit(
     assert not train_config.paths.explicit_split.enabled
     assert train_config.paths.explicit_split.train_data == Path("data/simulated/train.pt")
     assert train_config.paths.root == Path("outputs/train")
-    assert train_config.paths.prefix == "base"
+    assert train_config.paths.prefix == train_config.name
     assert train_config.paths.suffix
-    assert train_config.paths.dir.as_posix().startswith("outputs/train/base-")
+    assert train_config.paths.dir.as_posix().startswith(f"outputs/train/{train_config.name}-")
     assert override_config.paths.dir == Path("outputs/train/my-run")
 
     old_payload = compose_payload("simulation=base")

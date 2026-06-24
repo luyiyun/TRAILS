@@ -17,7 +17,8 @@ items.
 - `configs/`: Hydra command roots plus shared simulation, training, baseline, optimization, summary, and case configuration.
 - `src/trails/`: reusable core code: data, model, trainer, estimator, metrics.
 - `src/trails_simulate/`: synthetic clinical data generation; imports `trails`.
-- `src/trails_case/`: real-data/case-study utilities; imports `trails`.
+- `src/trails_case/`: real-data/case-study utilities; imports `trails` plus
+  shared command config models from `trails_simulate.config`.
 - `tests/`: smoke, data, model, estimator, CLI, and architecture tests.
 
 ## Import Boundaries
@@ -29,12 +30,14 @@ Allowed dependencies:
 - `scripts/* -> trails_case`
 - `trails_simulate -> trails`
 - `trails_case -> trails`
+- `trails_case -> trails_simulate.config` for shared command config models only
 
 Forbidden dependencies:
 
 - `trails -> trails_simulate`
 - `trails -> trails_case`
 - `trails -> scripts`
+- `trails_case -> trails_simulate` runtime modules outside `trails_simulate.config`
 
 Keep command orchestration out of `src/trails`; the main package should remain a
 clean reusable method library.
@@ -68,6 +71,9 @@ clean reusable method library.
 - Inside `src/trails`, prefer relative imports for project modules.
 - Inside `src/trails_simulate` and `src/trails_case`, use absolute imports from
   `trails`.
+- `src/trails_case` may import only shared command config models from
+  `trails_simulate.config`; do not depend on simulation generation, training, or
+  evaluation runtime modules.
 - 在复杂研究逻辑处使用简洁中文注释，尤其是模拟机制、模型结构和损失函数；
   不要给显而易见的赋值或样板代码写流水账式注释。
 - 如果一段代码只在局部流程中使用一次，不需要为了形式拆成额外函数；在相关
@@ -100,6 +106,9 @@ clean reusable method library.
   remains the shared path namespace, and `optim` intentionally keeps its
   `optim.*` namespace. Generator parameters live under `generator`, while TRAILS
   model/trainer/artifacts/diagnostics/SwanLab parameters live at the command root.
+- Case-study config reuses shared training, diagnostics, artifacts, SwanLab, and
+  output-path config models from `trails_simulate.config`; case paths use only
+  output directory fields and do not carry simulation data split fields.
 - `train_size` and `test_size` are equal-length lists that
   are paired by position. Each paired sample-size level is crossed with
   `generator.n_clusters`, and each combination is repeated

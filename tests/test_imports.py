@@ -23,9 +23,13 @@ def test_trails_package_does_not_import_experiment_packages() -> None:
         assert "scripts" not in text
 
 
-def test_case_package_does_not_import_simulation_package() -> None:
+def test_case_package_only_imports_shared_simulation_config() -> None:
+    allowed_path = Path("src/trails_case/config.py")
+    allowed_import = "from trails_simulate.config import"
     for path in Path("src/trails_case").glob("*.py"):
         text = path.read_text()
+        if path == allowed_path:
+            text = text.replace(allowed_import, "")
         assert "trails_simulate" not in text
 
 
