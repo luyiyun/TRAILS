@@ -19,3 +19,7 @@ data
 runs
 outputs
 multirun
+
+# Local remote-execution state and retrieved artifacts
+.remote-run/
+remote-results/

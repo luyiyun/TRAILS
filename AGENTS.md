@@ -82,6 +82,8 @@ clean reusable method library.
   封装，避免将状态、上下文和协调逻辑分散在多个松散 helper 中。
 - Avoid `try/except` unless the code can recover or add useful diagnostics.
 - Add or update tests for every substantial behavior change.
+- MIMIC preprocessing and EDA scripts do not need separate tests unless requested.
+- MIMIC preprocessing and EDA scripts use fixed project paths without CLI arguments unless requested.
 - Update this file when architecture decisions change.
 
 ## Current Decisions
@@ -233,3 +235,15 @@ Run these commands in order after code changes:
 4. `UV_CACHE_DIR=/tmp/uv-cache uv run pytest`
 
 If any step fails, fix it before considering the change complete.
+
+<!-- pair-programming:active:start -->
+## 结对编程（已启用）
+
+本项目默认使用已安装的全局 `$pair-programming` skill。除非用户在当前请求中明确指定不用，否则所有编码任务开始前都必须自动调用该 skill，并读取和维护根目录 `PAIR.md`。Codex 担任 driver，用户担任 navigator。
+
+- 每批手写代码、测试和配置的新增与修改不得超过 navigator 确认的 200 行，而且必须形成语法完整、逻辑完整、可审查的最小单元；纯删除不限行数，同一重构中尽量先删除已确认废弃的内容，再添加替代代码。
+- 每批完成后进行必要的最小验证，向 navigator 汇报改动和验证结果，然后停止并等待审查；未经通过不得开始下一批。
+- 优先采用简单务实的实现、中文解释性注释和静态类型；不添加当前需求之外的抽象、工具函数、测试或校验。
+- navigator 明确说明、暂存或提交的代码改动视为已确认决定，后续不得回退；未说明且未暂存的意外差异应先询问确认。
+- 每次编码前同步 `PAIR.md`；并行任务、暂停点、风险、决定、交接和完成记忆均记录在其中。
+<!-- pair-programming:active:end -->
