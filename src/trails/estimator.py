@@ -113,20 +113,25 @@ class TrailsEstimator:
         *,
         candidate_clusters: Sequence[int] | None = None,
         valid_fraction: float | None = None,
+        validation_data: ClinicalTimeSeriesDataset | None = None,
         inherit_best: bool = False,
         result_dir: str | Path | None = None,
     ) -> KSelectionMetrics:
         self._validate_data_config(data)
+        if validation_data is not None:
+            self._validate_data_config(validation_data)
         candidates = resolve_candidate_clusters(candidate_clusters, self.config.model.n_clusters)
-        valid_fraction = (
-            self.config.trainer.valid_size if valid_fraction is None else valid_fraction
-        )
-        if valid_fraction <= 0.0 or valid_fraction >= 1.0:
-            raise ValueError("valid_fraction must be greater than 0 and less than 1.")
-
-        train_data, valid_data = data.split(
-            [1.0 - valid_fraction, valid_fraction], seed=self.config.seed
-        )
+        if validation_data is None:
+            valid_fraction = (
+                self.config.trainer.valid_size if valid_fraction is None else valid_fraction
+            )
+            if valid_fraction <= 0.0 or valid_fraction >= 1.0:
+                raise ValueError("valid_fraction must be greater than 0 and less than 1.")
+            train_data, valid_data = data.split(
+                [1.0 - valid_fraction, valid_fraction], seed=self.config.seed
+            )
+        else:
+            train_data, valid_data = data, validation_data
         rows: list[SelectionMetricRow] = []
         estimators: dict[int, TrailsEstimator] = {}
         for n_clusters in candidates:

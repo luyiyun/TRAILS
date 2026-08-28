@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
 import pandas as pd
 
 from .config import SummaryApplicationConfig
@@ -236,12 +237,10 @@ def joined_unique_values(values: pd.Series) -> str:
 
 
 def population_std(values: pd.Series) -> float:
-    finite_values = [float(value) for value in numeric_values(values).dropna().tolist()]
-    if not finite_values:
+    finite_values = numeric_values(values).dropna().to_numpy(dtype=float)
+    if finite_values.size == 0:
         return math.nan
-    mean = sum(finite_values) / len(finite_values)
-    variance = sum((value - mean) ** 2 for value in finite_values) / len(finite_values)
-    return math.sqrt(variance)
+    return float(np.std(finite_values, ddof=0))
 
 
 def save_summary_figures(

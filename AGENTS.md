@@ -214,7 +214,12 @@ clean reusable method library.
   only for internal early stopping, and saves the converted dataset, model,
   history, predictions, patient-level clusters, cluster summaries, feature
   summaries, and `case_summary.json` under `paths.dir`.
-- `k_selection.enabled=true` runs estimator-level holdout K selection before
+- MIMIC-specific command entrypoints share the fixed stratified split and train-only
+  longitudinal feature transformation implemented in `trails_case.mimic`; command
+  scripts do not import one another.
+- `scripts/mimic_select_k.py` runs the multi-seed K-selection experiment;
+  `scripts/mimic_case.py` is reserved for locked final-model evaluation.
+- In generic `scripts/case.py`, `k_selection.enabled=true` runs estimator-level holdout K selection before
   final case training. Empty `k_selection.candidate_clusters` means
   `2..model.n_clusters`; candidates are scored by validation C-index and
   latent MoG BIC using `sqrt(CI^2 + (1 - BIC_norm)^2)`. Candidate training and

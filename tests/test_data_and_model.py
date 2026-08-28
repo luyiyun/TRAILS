@@ -27,7 +27,10 @@ from trails.data import (
     make_data_loader,
 )
 from trails.metrics import (
+    Cindex,
     ClusteringAccuracy,
+    cluster_assignment_diagnostics,
+    concordance_index,
     masked_mse,
     vade_kl_loss,
     weibull_mixture_negative_log_likelihood,
@@ -859,11 +862,30 @@ def test_mtan2_input_layer_uses_per_feature_attention_shape() -> None:
     assert torch.allclose(output[:, :, 8:12], torch.zeros_like(output[:, :, 8:12]))
 
 
-def test_clustering_accuracy_matches_permuted_labels() -> None:
-    metric = ClusteringAccuracy()
-    metric.update(torch.tensor([1, 1, 0, 0]), torch.tensor([0, 0, 1, 1]))
+def test_cindex_uses_sksurv_time_and_risk_tie_semantics() -> None:
+    risk = torch.tensor([0.8, 0.2, 0.1, 0.8])
+    time = torch.tensor([1.0, 2.0, 3.0, 1.0])
+    event = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    metric = Cindex()
+    metric.update(risk[:2], time[:2], event[:2])
+    metric.update(risk[2:], time[2:], event[2:])
 
-    assert torch.allclose(metric.compute(), torch.tensor(1.0))
+    assert concordance_index(risk, time, event) == pytest.approx(0.875)
+    assert metric.compute().item() == pytest.approx(0.875)
+
+
+def test_cluster_entropy_is_normalized() -> None:
+    diagnostics = cluster_assignment_diagnostics(torch.tensor([0, 0, 1, 1]), n_clusters=2)
+
+    assert diagnostics["cluster_entropy"] == pytest.approx(1.0)
+
+
+def test_clustering_accuracy_matches_permuted_labels_across_batches() -> None:
+    metric = ClusteringAccuracy()
+    metric.update(torch.tensor([1, 1]), torch.tensor([0, 0]))
+    metric.update(torch.tensor([0, 0]), torch.tensor([1, 1]))
+
+    assert metric.compute().item() == pytest.approx(1.0)
 
 
 def make_architecture_config(

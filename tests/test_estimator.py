@@ -259,6 +259,25 @@ def test_select_n_clusters_reuses_one_validation_split(
     assert split_calls == [(8, (0.75, 0.25), config.seed)]
 
 
+def test_select_n_clusters_accepts_explicit_validation_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = simulate_dataset(seed=47)
+    train, validation = data.split([0.75, 0.25], seed=5)
+
+    def unexpected_split(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("explicit validation data must bypass internal splitting")
+
+    monkeypatch.setattr(ClinicalTimeSeriesDataset, "split", unexpected_split)
+    result = TrailsEstimator(tiny_config(data.n_features)).select_n_clusters(
+        train,
+        candidate_clusters=(2, 3),
+        validation_data=validation,
+    )
+
+    assert set(result["bic"]) == {"2", "3"}
+
+
 def test_k_selection_bic_normalization_handles_equal_bic() -> None:
     rows = score_k_selection_rows(
         [

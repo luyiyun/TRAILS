@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import swanlab
 
 from trails.artifacts import (
@@ -356,14 +357,13 @@ def summarize_repeat_metrics(repeats: Sequence[Mapping[str, Any]]) -> dict[str, 
         ]
         if not values:
             continue
-        mean = sum(values) / len(values)
-        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        array = np.asarray(values, dtype=float)
         summary[name] = {
-            "max": max(values),
-            "mean": mean,
-            "min": min(values),
+            "max": float(array.max()),
+            "mean": float(array.mean()),
+            "min": float(array.min()),
             "n": len(values),
-            "std": math.sqrt(variance),
+            "std": float(array.std(ddof=0)),
         }
     return summary
 

@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - mimic_case
+  - _self_
+k_selection:
+  enabled: true
+  candidate_clusters: [2, 3, 4, 5]
+paths:
+  dir: outputs/mimic_select_k/mimic_select_k-${now:%Y%m%d-%H%M%S-%f}

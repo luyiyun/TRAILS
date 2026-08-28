@@ -1,0 +1,34 @@
+# @package _global_
+defaults:
+  - /training: case
+  - _self_
+
+observations_csv: data/real/mimic-iv-3.1/derived/trails_case/observations.csv
+patients_csv: data/real/mimic-iv-3.1/derived/trails_case/patients.csv
+description: "MIMIC-IV v3.1 early Sepsis-3 TRAILS analysis"
+# 默认只做资源与流程检查；正式分析仍从本入口通过 Hydra overrides 调整。
+model:
+  n_clusters: 3
+trainer:
+  min_epochs: 1
+  max_epochs: 1
+  batch_size: 256
+  warmup_epochs: 1
+  gmm_init_iters: 5
+  early_stop: false
+artifacts:
+  names: [history]
+diagnostics:
+  latent_embeddings:
+    enabled: false
+swanlab:
+  enabled: false
+
+paths:
+  dir: outputs/mimic_case/mimic_case-${now:%Y%m%d-%H%M%S-%f}
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.dir}

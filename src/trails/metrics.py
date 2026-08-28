@@ -5,7 +5,10 @@ import math
 import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
+from scipy.stats import entropy
 from scipy.stats.contingency import crosstab
+from sksurv.exceptions import NoComparablePairException
+from sksurv.metrics import concordance_index_censored
 from torch import Tensor
 from torchmetrics import Metric
 
@@ -74,43 +77,39 @@ def weibull_mixture_negative_log_likelihood(
 
 
 def concordance_index(risk_score: Tensor, survival_time: Tensor, event: Tensor) -> float:
-    comparable = 0
-    concordant = 0.0
-    n_samples = int(survival_time.shape[0])
-    for i in range(n_samples):
-        for j in range(n_samples):
-            if survival_time[i] < survival_time[j] and event[i] > 0:
-                comparable += 1
-                if risk_score[i] > risk_score[j]:
-                    concordant += 1.0
-                elif risk_score[i] == risk_score[j]:
-                    concordant += 0.5
-    if comparable == 0:
+    risk = risk_score.detach().cpu().reshape(-1).double().numpy()
+    time = survival_time.detach().cpu().reshape(-1).double().numpy()
+    event_indicator = event.detach().cpu().reshape(-1).bool().numpy()
+    if len(time) < 2 or not event_indicator.any():
         return 0.0
-    return concordant / comparable
+    try:
+        result = concordance_index_censored(event_indicator, time, risk, tied_tol=1e-8)
+    except NoComparablePairException:
+        return 0.0
+    comparable = int(result[1] + result[2] + result[3])
+    return float(result[0]) if comparable > 0 else 0.0
 
 
 def cluster_assignment_diagnostics(pred_cluster: Tensor, *, n_clusters: int) -> dict[str, float]:
     assignments = pred_cluster.detach().cpu().long()
     counts = torch.bincount(assignments, minlength=n_clusters).float()
     fractions = counts / counts.sum().clamp_min(1.0)
-    nonzero_fractions = fractions[fractions > 0]
-    entropy = -torch.sum(nonzero_fractions * torch.log(nonzero_fractions))
-    max_entropy = torch.log(torch.tensor(float(n_clusters))).clamp_min(1e-8)
-    normalized_entropy = torch.clamp(entropy / max_entropy, min=0.0, max=1.0)
+    normalized_entropy = (
+        float(np.clip(entropy(counts.numpy(), base=n_clusters), 0.0, 1.0))
+        if n_clusters > 1 and counts.sum() > 0
+        else 0.0
+    )
     return {
         "cluster_empty_count": float(torch.sum(counts == 0).item()),
         "cluster_min_fraction": float(fractions.min().item()),
         "cluster_max_fraction": float(fractions.max().item()),
-        "cluster_entropy": float(normalized_entropy.item()),
+        "cluster_entropy": normalized_entropy,
     }
 
 
 class Cindex(Metric):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.tied_tol = 1e-8
-
         self.add_state("risk", default=[], dist_reduce_fx="cat")
         self.add_state("time", default=[], dist_reduce_fx="cat")
         self.add_state("event", default=[], dist_reduce_fx="cat")
@@ -120,20 +119,16 @@ class Cindex(Metric):
         self.event: list
 
     def update(self, risk: Tensor, time: Tensor, event: Tensor) -> None:
-        self.risk.append(risk)
-        self.time.append(time)
-        self.event.append(event)
+        self.risk.append(risk.detach())
+        self.time.append(time.detach())
+        self.event.append(event.detach())
 
     def compute(self) -> Tensor:
         risk = torch.cat(self.risk, dim=0).squeeze()
         time = torch.cat(self.time, dim=0)
         event = torch.cat(self.event, dim=0)
 
-        comparable = (time < time[:, None]) & (event > 0)
-        concordant = (risk > risk[:, None] + self.tied_tol) & comparable
-        tied = ((risk - risk[:, None]).abs() <= self.tied_tol) & comparable
-
-        return (concordant.sum() + 0.5 * tied.sum()) / comparable.sum().clamp_min(1.0)
+        return risk.new_tensor(concordance_index(risk, time, event))
 
 
 def cluster_accuracy(pred_cluster: Tensor, true_cluster: Tensor) -> float:
@@ -144,8 +139,8 @@ def cluster_accuracy(pred_cluster: Tensor, true_cluster: Tensor) -> float:
         return 0.0
 
     contingency: np.ndarray = crosstab(prediction, target).count  # type: ignore
-    r, c = linear_sum_assignment(contingency, maximize=True)
-    return contingency[r, c].sum() / float(n_samples)
+    row_indices, column_indices = linear_sum_assignment(contingency, maximize=True)
+    return float(contingency[row_indices, column_indices].sum() / n_samples)
 
 
 class ClusteringAccuracy(Metric):
@@ -164,7 +159,6 @@ class ClusteringAccuracy(Metric):
     def compute(self) -> Tensor:
         pred_cluster = torch.cat(self.pred_cluster, dim=0)
         true_cluster = torch.cat(self.true_cluster, dim=0)
-
         return pred_cluster.new_tensor(
             cluster_accuracy(pred_cluster, true_cluster), dtype=torch.float32
         )
