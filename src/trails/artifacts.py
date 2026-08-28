@@ -1,3 +1,5 @@
+"""保存训练配置、历史、潜空间诊断和可视化产物。"""
+
 from __future__ import annotations
 
 import csv
@@ -23,6 +25,19 @@ ARTIFACT_TOKENS = tuple(sorted((*ARTIFACT_NAMES, "all", "none")))
 
 
 def resolve_artifact_names(tokens: Sequence[str] | None) -> frozenset[str]:
+    """将 CLI 产物选择标记解析为规范名称集合。
+
+    空输入和 ``"all"`` 选择全部产物，单独的 ``"none"`` 关闭全部产物。
+
+    参数：
+        tokens: 用户提供的产物名称、``"all"`` 或 ``"none"``。
+
+    返回：
+        去重后的规范产物名称集合。
+
+    异常：
+        ValueError: 当名称未知或 ``"none"`` 与其他选择组合时抛出。
+    """
     if tokens is None or len(tokens) == 0 or "all" in tokens:
         if "none" in (tokens or ()):
             raise ValueError("--save-artifacts cannot combine 'all' and 'none'.")
@@ -39,6 +54,20 @@ def resolve_artifact_names(tokens: Sequence[str] | None) -> frozenset[str]:
 
 
 def create_timestamped_run_dir(base_dir: str | Path, created_at: datetime | None = None) -> Path:
+    """在基础目录下创建唯一的时间戳运行目录。
+
+    同一秒内目录重名时依次添加两位数字后缀，最多尝试 1000 个候选名称。
+
+    参数：
+        base_dir: 保存运行目录的根路径。
+        created_at: 可选的指定时间；默认使用当前本地时区时间。
+
+    返回：
+        已成功创建的运行目录路径。
+
+    异常：
+        RuntimeError: 当全部候选目录名均已存在时抛出。
+    """
     timestamp = (created_at or datetime.now().astimezone()).strftime("%Y%m%d-%H%M%S")
     root = Path(base_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -55,6 +84,7 @@ def create_timestamped_run_dir(base_dir: str | Path, created_at: datetime | None
 
 
 def save_json(path: str | Path, payload: Mapping[str, Any] | Sequence[Any]) -> None:
+    """以 UTF-8 编码和缩进格式保存 JSON 载荷，并自动创建父目录。"""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
@@ -64,6 +94,7 @@ def save_json(path: str | Path, payload: Mapping[str, Any] | Sequence[Any]) -> N
 
 
 def save_history_csv(path: str | Path, history: Sequence[HistoryEntry]) -> None:
+    """将分阶段训练历史展开为统一字段并保存为 CSV 文件。"""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     rows = flatten_history(history)
@@ -77,6 +108,15 @@ def save_history_csv(path: str | Path, history: Sequence[HistoryEntry]) -> None:
 
 
 def plot_history(path: str | Path, history: Sequence[HistoryEntry]) -> None:
+    """绘制可用的损失、C-index 和聚类恢复训练曲线。
+
+    面板仅包含历史中实际存在数值的指标，并在 warmup 与正式训练阶段发生变化
+    时标记边界。无数值指标时仍会生成带说明的占位图。
+
+    参数：
+        path: 输出图片路径，格式由扩展名决定。
+        history: 每轮训练与验证指标组成的历史记录。
+    """
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -123,6 +163,17 @@ def save_latent_embedding_artifacts(
     *,
     random_state: int,
 ) -> dict[str, str]:
+    """保存指定数据划分的潜空间张量及 PCA/UMAP 投影图。
+
+    参数：
+        root_dir: 运行产物根目录。
+        split_name: 数据划分名称，用于文件名和图标题。
+        diagnostics: 患者潜空间嵌入、簇概率、预测及可选真值标签。
+        random_state: UMAP 降维使用的随机种子。
+
+    返回：
+        包含 ``"data"`` 和 ``"plot"`` 文件路径的字典。
+    """
     destination = Path(root_dir) / "latent_embeddings"
     destination.mkdir(parents=True, exist_ok=True)
 
@@ -152,6 +203,16 @@ def plot_latent_embedding_projection(
     split_name: str,
     random_state: int,
 ) -> None:
+    """绘制按预测簇和可选真值标签着色的 PCA/UMAP 潜空间投影。
+
+    参数：
+        path: 输出图片路径。
+        z: 形状为 ``(n_samples, latent_dim)`` 的潜空间嵌入。
+        pred_cluster: 每个样本的预测簇标签。
+        true_cluster: 可选的参考簇标签。
+        split_name: 显示在图标题中的数据划分名称。
+        random_state: UMAP 降维随机种子。
+    """
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -186,6 +247,7 @@ def plot_latent_embedding_projection(
 
 
 def flatten_history(history: Sequence[HistoryEntry]) -> list[dict[str, Any]]:
+    """将嵌套的训练/验证历史转换为适合 CSV 和绘图的扁平记录。"""
     rows: list[dict[str, Any]] = []
     for entry in history:
         row: dict[str, Any] = {}
@@ -210,12 +272,14 @@ def flatten_history(history: Sequence[HistoryEntry]) -> list[dict[str, Any]]:
 
 
 def _history_metrics(value: object) -> dict[str, int | float]:
+    """从历史子记录中提取数值指标。"""
     if not isinstance(value, Mapping):
         return {}
     return {str(name): metric for name, metric in value.items() if isinstance(metric, int | float)}
 
 
 def _history_fieldnames(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    """按首选顺序生成历史 CSV 字段名。"""
     preferred = [
         "global_epoch",
         "epoch",
@@ -257,6 +321,7 @@ def _history_fieldnames(rows: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def _available_panels(history: Sequence[Mapping[str, Any]]) -> list[tuple[str, list[str]]]:
+    """返回历史中具有数值的绘图面板及指标。"""
     panel_candidates = [
         ("Total loss", ["loss", "val_loss"]),
         (
@@ -281,12 +346,14 @@ def _available_panels(history: Sequence[Mapping[str, Any]]) -> list[tuple[str, l
 
 
 def _x_values(history: Sequence[Mapping[str, Any]]) -> list[float]:
+    """优先使用全局轮次生成历史曲线横坐标。"""
     if all(isinstance(entry.get("global_epoch"), int | float) for entry in history):
         return [float(entry["global_epoch"]) for entry in history]
     return [float(index + 1) for index in range(len(history))]
 
 
 def _metric_values(history: Sequence[Mapping[str, Any]], name: str) -> list[float]:
+    """提取指定指标，并以 NaN 填充缺失轮次。"""
     values: list[float] = []
     for entry in history:
         value = entry.get(name)
@@ -295,6 +362,7 @@ def _metric_values(history: Sequence[Mapping[str, Any]], name: str) -> list[floa
 
 
 def _has_numeric_values(history: Sequence[Mapping[str, Any]], name: str) -> bool:
+    """判断历史中是否存在指定数值指标。"""
     return any(isinstance(entry.get(name), int | float) for entry in history)
 
 
@@ -303,6 +371,7 @@ def _mark_stage_boundary(
     history: Sequence[Mapping[str, Any]],
     x_values: Sequence[float],
 ) -> None:
+    """在曲线上标记第一次训练阶段切换的位置。"""
     stages = [entry.get("stage") for entry in history]
     if not stages or not x_values:
         return
@@ -326,6 +395,7 @@ def _mark_stage_boundary(
 
 
 def _pca_projection(z: Tensor) -> Tensor:
+    """通过 SVD 计算二维 PCA 投影，并处理小样本或单分量情形。"""
     embeddings = z.detach().cpu().float()
     n_samples = int(embeddings.shape[0])
     if n_samples <= 1:
@@ -341,6 +411,7 @@ def _pca_projection(z: Tensor) -> Tensor:
 
 
 def _umap_projection(z: Tensor, *, random_state: int) -> Tensor:
+    """计算二维 UMAP 投影，小于四个样本时退化为 PCA。"""
     embeddings = z.detach().cpu().float()
     n_samples = int(embeddings.shape[0])
     if n_samples <= 3:
@@ -371,6 +442,7 @@ def _plot_labeled_scatter(
     title: str,
     unavailable_text: str,
 ) -> None:
+    """绘制按离散标签着色的二维散点面板。"""
     ax.set_title(title, loc="left", fontsize=11, fontweight="bold")
     ax.grid(True, alpha=0.22)
     ax.spines["top"].set_visible(False)

@@ -1,30 +1,42 @@
+"""面向用户的 TRAILS 单模型估计、推理和持久化接口。"""
+
 from __future__ import annotations
 
-import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import torch
 from torch import Tensor
 
-from .artifacts import save_json
 from .config import TrailsConfig
 from .data import ClinicalTimeSeriesDataset, infer_data_config
 from .diagnostics import LatentDiagnostics
-from .metrics import cluster_assignment_diagnostics, concordance_index, gaussian_log_prob
 from .model import TrailsSurvVaderModel
 from .trainer import HistoryEntry, TrailsTrainer
 
 HistoryCallback = Callable[[HistoryEntry], None]
-type SelectionMetricValue = int | float
-type SelectionMetricRow = dict[str, SelectionMetricValue]
-type KSelectionMetrics = dict[str, dict[str, float]]
 
 
 class TrailsEstimator:
+    """封装 TRAILS 模型、训练器和训练历史的高级估计器。
+
+    估计器负责校验数据特征维度、设置特征均值和 mTAN 参考时间范围，并提供
+    拟合、预测、评价及检查点保存/加载的一致接口。
+
+    属性：
+        config: 完整且不可变的 TRAILS 配置。
+        model: Surv-VaDER 神经网络模型。
+        trainer: 与模型和训练配置绑定的训练器。
+        history: 最近一次拟合产生的逐轮历史。
+    """
+
     def __init__(self, config: TrailsConfig | None = None) -> None:
+        """根据配置初始化模型和训练器，并设置模型构造随机种子。
+
+        参数：
+            config: 可选的完整配置；``None`` 时使用 :class:`TrailsConfig` 默认值。
+        """
         self.config = config or TrailsConfig()
         torch.manual_seed(self.config.seed)
         self.model = TrailsSurvVaderModel(self.config.data, self.config.model)
@@ -38,6 +50,22 @@ class TrailsEstimator:
         history_callback: HistoryCallback | None = None,
         validation_data: ClinicalTimeSeriesDataset | None = None,
     ) -> TrailsEstimator:
+        """拟合 TRAILS 模型并返回当前估计器。
+
+        训练前根据数据设置特征均值；mTAN 输入还会根据训练数据的真实观测范围
+        设置全局参考时间网格。显式验证集会直接传给训练器。
+
+        参数：
+            data: 用于拟合的临床时间序列数据集。
+            history_callback: 每完成一个训练轮次后调用的可选回调。
+            validation_data: 可选的独立验证数据集。
+
+        返回：
+            已拟合的当前 :class:`TrailsEstimator`。
+
+        异常：
+            ValueError: 当数据特征维度与配置不一致或 mTAN 数据没有观测时抛出。
+        """
         self._validate_data_config(data)
         if validation_data is not None:
             self._validate_data_config(validation_data)
@@ -53,114 +81,62 @@ class TrailsEstimator:
         return self
 
     def predict(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        """预测每位患者最大后验概率对应的簇标签。
+
+        参数：
+            data: 特征维度与估计器配置一致的数据集。
+
+        返回：
+            形状为 ``(n_samples,)`` 的 CPU 整数张量。
+        """
         self._validate_data_config(data)
         return self.trainer.predict(data)
 
     def predict_proba(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        """预测每位患者对所有高斯混合分量的后验概率。
+
+        参数：
+            data: 特征维度与估计器配置一致的数据集。
+
+        返回：
+            形状为 ``(n_samples, n_clusters)`` 的 CPU 浮点张量，每行和为一。
+        """
         self._validate_data_config(data)
         return self.trainer.predict_proba(data)
 
     def predict_risk(self, data: ClinicalTimeSeriesDataset) -> Tensor:
+        """预测每位患者的连续生存风险分数。
+
+        分数定义为后验簇概率加权 Weibull 尺度的负值，因此预测生存尺度越小，
+        风险分数越大。
+
+        参数：
+            data: 特征维度与估计器配置一致的数据集。
+
+        返回：
+            形状为 ``(n_samples,)`` 的 CPU 浮点张量。
+        """
         self._validate_data_config(data)
         return self.trainer.predict_risk(data)
 
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
+        """计算数据集损失、生存指标、可选聚类指标和簇占用诊断。
+
+        参数：
+            data: 要评价的临床时间序列数据集。
+
+        返回：
+            指标名称到浮点值的字典；参考簇标签存在时包含 ACC、ARI 和 NMI。
+        """
         self._validate_data_config(data)
         return self.trainer.test(data)
 
-    def selection_metrics(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
-        self._validate_data_config(data)
-        outputs, batch = self.trainer._collect_outputs(data)
-        latent = outputs.latent_mean.detach()
-        n_samples = int(latent.shape[0])
-        if n_samples == 0:
-            raise ValueError("Selection metrics require at least one sample.")
-
-        # 用确定性的 latent_mean 评估 VaDE MoG prior，避免采样噪声影响 K 选择。
-        log_prior = torch.log_softmax(self.model.mixture_logits.detach(), dim=-1).unsqueeze(0)
-        component_log_prob = gaussian_log_prob(
-            latent.unsqueeze(1),
-            self.model.mixture_means.detach().unsqueeze(0),
-            self.model.mixture_log_variances.detach().unsqueeze(0),
-        ).sum(dim=-1)
-        log_likelihood = torch.logsumexp(log_prior + component_log_prob, dim=-1)
-        total_log_likelihood = float(log_likelihood.sum().item())
-        mean_nll = float((-log_likelihood).mean().item())
-        n_clusters = self.config.model.n_clusters
-        latent_dim = self.config.model.latent_dim
-        n_parameters = n_clusters * (2 * latent_dim) + (n_clusters - 1)
-        bic = -2.0 * total_log_likelihood + math.log(float(n_samples)) * float(n_parameters)
-
-        pred_cluster = torch.argmax(outputs.cluster_probabilities.detach().cpu(), dim=-1).long()
-        metrics = {
-            "cindex": float(
-                concordance_index(
-                    self.trainer._risk_score(outputs).detach().cpu().float(),
-                    batch["survival_time"].detach().cpu().float(),
-                    batch["event"].detach().cpu().float(),
-                )
-            ),
-            "bic": float(bic),
-            "mean_nll": mean_nll,
-            "n_parameters": float(n_parameters),
-            **cluster_assignment_diagnostics(pred_cluster, n_clusters=n_clusters),
-        }
-        return metrics
-
-    def select_n_clusters(
-        self,
-        data: ClinicalTimeSeriesDataset,
-        *,
-        candidate_clusters: Sequence[int] | None = None,
-        valid_fraction: float | None = None,
-        validation_data: ClinicalTimeSeriesDataset | None = None,
-        inherit_best: bool = False,
-        result_dir: str | Path | None = None,
-    ) -> KSelectionMetrics:
-        self._validate_data_config(data)
-        if validation_data is not None:
-            self._validate_data_config(validation_data)
-        candidates = resolve_candidate_clusters(candidate_clusters, self.config.model.n_clusters)
-        if validation_data is None:
-            valid_fraction = (
-                self.config.trainer.valid_size if valid_fraction is None else valid_fraction
-            )
-            if valid_fraction <= 0.0 or valid_fraction >= 1.0:
-                raise ValueError("valid_fraction must be greater than 0 and less than 1.")
-            train_data, valid_data = data.split(
-                [1.0 - valid_fraction, valid_fraction], seed=self.config.seed
-            )
-        else:
-            train_data, valid_data = data, validation_data
-        rows: list[SelectionMetricRow] = []
-        estimators: dict[int, TrailsEstimator] = {}
-        for n_clusters in candidates:
-            candidate_config = self.config.model_copy(
-                update={
-                    "model": self.config.model.model_copy(update={"n_clusters": n_clusters}),
-                    "trainer": self.config.trainer.model_copy(
-                        update={"seed": self.config.seed, "valid_size": 0.0}
-                    ),
-                }
-            )
-            estimator = self.__class__(candidate_config).fit(
-                train_data,
-                validation_data=valid_data,
-            )
-            metrics = estimator.selection_metrics(valid_data)
-            rows.append({"n_clusters": n_clusters, **metrics})
-            estimators[n_clusters] = estimator
-
-        ranked_rows = score_k_selection_rows(rows)
-        metrics_by_name = selection_rows_to_metrics(ranked_rows)
-        if result_dir is not None:
-            save_k_selection_runs(Path(result_dir), ranked_rows, metrics_by_name, estimators)
-        if inherit_best:
-            best_k = int(ranked_rows[0]["n_clusters"])
-            self._inherit_estimator(estimators[best_k])
-        return metrics_by_name
-
     def latent_diagnostics(self, data: ClinicalTimeSeriesDataset) -> LatentDiagnostics:
+        """提取按数据集顺序排列的患者级潜空间诊断。
+
+        返回 CPU 上的潜空间均值、簇概率、预测簇和原样本索引；数据集带参考簇
+        标签时额外包含 ``true_cluster``。
+        """
         self._validate_data_config(data)
         outputs, batch = self.trainer._collect_outputs(data)
         cluster_probabilities = outputs.cluster_probabilities.detach().cpu()
@@ -175,6 +151,11 @@ class TrailsEstimator:
         return diagnostics
 
     def save(self, path: str | Path) -> None:
+        """保存配置、训练历史和模型状态，并自动创建目标父目录。
+
+        参数：
+            path: PyTorch 检查点目标路径。
+        """
         checkpoint = {
             "config": self.config.model_dump(mode="json"),
             "history": self.history,
@@ -186,6 +167,18 @@ class TrailsEstimator:
 
     @classmethod
     def load(cls, path: str | Path, *, device: str | None = None) -> TrailsEstimator:
+        """从检查点重建估计器，并可覆盖训练设备。
+
+        检查点先映射到 CPU；指定 ``device`` 时仅更新训练器设备配置，随后加载
+        模型参数和历史记录。
+
+        参数：
+            path: :meth:`save` 生成的检查点路径。
+            device: 可选的训练与推理设备覆盖值。
+
+        返回：
+            恢复配置、参数和历史的 :class:`TrailsEstimator`。
+        """
         checkpoint: dict[str, Any] = torch.load(Path(path), map_location="cpu", weights_only=False)
         config = TrailsConfig.model_validate(checkpoint["config"])
         if device is not None:
@@ -198,6 +191,7 @@ class TrailsEstimator:
         return estimator
 
     def _validate_data_config(self, data: ClinicalTimeSeriesDataset) -> None:
+        """校验数据集特征维度是否与估计器配置一致。"""
         inferred = infer_data_config(data)
         if inferred != self.config.data:
             raise ValueError(
@@ -205,136 +199,13 @@ class TrailsEstimator:
                 f"expected {self.config.data}, got {inferred}."
             )
 
-    def _inherit_estimator(self, estimator: TrailsEstimator) -> None:
-        self.config = estimator.config
-        self.model = estimator.model
-        self.trainer = estimator.trainer
-        self.history = list(estimator.history)
-
-
-def resolve_candidate_clusters(
-    candidate_clusters: Sequence[int] | None,
-    max_clusters: int,
-) -> tuple[int, ...]:
-    if candidate_clusters is None:
-        return validate_candidate_clusters(tuple(range(2, max_clusters + 1)))
-    return validate_candidate_clusters(candidate_clusters)
-
-
-def validate_candidate_clusters(candidate_clusters: Sequence[int]) -> tuple[int, ...]:
-    candidates = tuple(int(value) for value in candidate_clusters)
-    if not candidates:
-        raise ValueError("candidate_clusters must contain at least one K value.")
-    if any(value <= 1 for value in candidates):
-        raise ValueError("candidate_clusters values must be greater than 1.")
-    if len(set(candidates)) != len(candidates):
-        raise ValueError("candidate_clusters values must be unique.")
-    return candidates
-
-
-def score_k_selection_rows(rows: list[SelectionMetricRow]) -> list[SelectionMetricRow]:
-    if not rows:
-        raise ValueError("K selection requires at least one candidate row.")
-
-    bics = [float(require_selection_value(row, "bic")) for row in rows]
-    min_bic = min(bics)
-    max_bic = max(bics)
-    bic_range = max_bic - min_bic
-
-    scored_rows: list[SelectionMetricRow] = []
-    for row, bic in zip(rows, bics, strict=True):
-        cindex = float(require_selection_value(row, "cindex"))
-        bic_norm = 0.0 if bic_range == 0.0 else (bic - min_bic) / bic_range
-        selection_score = math.sqrt(cindex**2 + (1.0 - bic_norm) ** 2)
-        scored_rows.append(
-            {
-                **row,
-                "bic_norm": float(bic_norm),
-                "selection_score": float(selection_score),
-            }
-        )
-
-    ranked_rows = sorted(
-        scored_rows,
-        key=lambda row: (
-            -float(require_selection_value(row, "selection_score")),
-            -float(require_selection_value(row, "cindex")),
-            float(require_selection_value(row, "bic")),
-            int(require_selection_value(row, "n_clusters")),
-        ),
-    )
-    return [{**row, "rank": rank} for rank, row in enumerate(ranked_rows, start=1)]
-
-
-def selection_rows_to_metrics(rows: Sequence[SelectionMetricRow]) -> KSelectionMetrics:
-    metrics: KSelectionMetrics = {}
-    for row in rows:
-        n_clusters = int(require_selection_value(row, "n_clusters"))
-        cluster_key = str(n_clusters)
-        for name, value in row.items():
-            if name == "n_clusters":
-                continue
-            metrics.setdefault(name, {})[cluster_key] = float(value)
-    return metrics
-
-
-def selection_metrics_to_rows(metrics: KSelectionMetrics) -> list[SelectionMetricRow]:
-    cluster_keys = sorted({cluster for values in metrics.values() for cluster in values}, key=int)
-    rows: list[SelectionMetricRow] = []
-    for cluster_key in cluster_keys:
-        row: SelectionMetricRow = {"n_clusters": int(cluster_key)}
-        for name, values in metrics.items():
-            if cluster_key in values:
-                row[name] = float(values[cluster_key])
-        rows.append(row)
-    if "rank" in metrics:
-        rows.sort(key=lambda row: float(require_selection_value(row, "rank")))
-    return rows
-
-
-def selected_k_from_selection_metrics(metrics: KSelectionMetrics) -> int:
-    ranks = metrics.get("rank")
-    if not ranks:
-        raise ValueError("K selection metrics must include a rank metric.")
-    best = min(ranks.items(), key=lambda item: (float(item[1]), int(item[0])))
-    if float(best[1]) != 1.0:
-        raise ValueError("K selection metrics must include a rank value of 1.")
-    return int(best[0])
-
-
-def best_selection_metrics(metrics: KSelectionMetrics) -> dict[str, float]:
-    best_key = str(selected_k_from_selection_metrics(metrics))
-    return {name: values[best_key] for name, values in metrics.items() if best_key in values}
-
-
-def save_k_selection_runs(
-    result_dir: Path,
-    rows: Sequence[SelectionMetricRow],
-    metrics_by_name: KSelectionMetrics,
-    estimators: dict[int, TrailsEstimator],
-) -> None:
-    result_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_csv(result_dir / "selection_metrics.csv", index=False)
-    save_json(result_dir / "selection_metrics.json", metrics_by_name)
-    for row in rows:
-        n_clusters = int(require_selection_value(row, "n_clusters"))
-        estimator = estimators[n_clusters]
-        candidate_dir = result_dir / f"k{n_clusters}"
-        candidate_dir.mkdir(parents=True, exist_ok=True)
-        estimator.save(candidate_dir / "model.pt")
-        save_json(candidate_dir / "history.json", estimator.history)
-        save_json(candidate_dir / "metrics.json", dict(row))
-        save_json(candidate_dir / "config.json", estimator.config.model_dump(mode="json"))
-
-
-def require_selection_value(row: SelectionMetricRow, name: str) -> SelectionMetricValue:
-    value = row.get(name)
-    if not isinstance(value, int | float):
-        raise ValueError(f"K selection row is missing numeric field {name!r}.")
-    return value
-
 
 def observed_time_range(data: ClinicalTimeSeriesDataset) -> tuple[float, float]:
+    """返回数据集中所有真实观测时间的全局最小值和最大值。
+
+    数据会转换为 compact 视图，从 ``mask > 0`` 的位置收集时间；没有任何真实
+    观测时抛出 :class:`ValueError`。
+    """
     compact_data = data.with_return_kind("compact")
     min_time: float | None = None
     max_time: float | None = None

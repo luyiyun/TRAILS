@@ -112,7 +112,9 @@ class MimicCohortExporter:
 
     def run(self) -> None:
         if not self.database.is_file():
-            raise FileNotFoundError(f"缺少 {self.database}；请先运行 scripts/mimic_build_sepsis.py")
+            raise FileNotFoundError(
+                f"缺少 {self.database}；请先运行 scripts/mimic/01_build_sepsis.py"
+            )
         self.output_root.mkdir(parents=True, exist_ok=True)
         connection = duckdb.connect(str(self.database))
         self._require_tables(connection)

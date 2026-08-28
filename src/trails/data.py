@@ -1,3 +1,5 @@
+"""TRAILS 纵向临床样本、数据集、批处理和数据加载工具。"""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -27,6 +29,21 @@ logger = getLogger(__name__)
 
 @dataclass(frozen=True)
 class AlignedClinicalSample:
+    """表示共享访视时间轴上的单个患者纵向样本。
+
+    所有特征共享 ``times`` 中的访视时点；某个特征在某次访视是否实际观测由
+    ``mask`` 决定，未观测位置的 ``x`` 不参与模型目标。
+
+    属性：
+        times: 形状为 ``(n_visits,)`` 的访视时间。
+        x: 形状为 ``(n_visits, n_features)`` 的纵向特征值。
+        mask: 与 ``x`` 同形状的观测指示矩阵，取值范围为 ``[0, 1]``。
+        delta_time: 与 ``x`` 同形状，记录各特征距上一次观测经过的时间。
+        survival_time: 正的标量随访或事件时间。
+        event: 标量事件指示，取值范围为 ``[0, 1]``。
+        cluster_label: 可选的标量参考簇标签，仅用于已知真值的评价。
+    """
+
     times: Tensor
     x: Tensor
     mask: Tensor
@@ -36,12 +53,22 @@ class AlignedClinicalSample:
     cluster_label: Tensor | None
 
     def __post_init__(self) -> None:
+        """在冻结样本创建后校验张量形状和值域。"""
         validate_aligned_clinical_sample(self)
 
     def to_aligned(self) -> AlignedClinicalSample:
+        """返回当前 aligned 视图，不复制底层张量。"""
         return self
 
     def to_compact(self) -> CompactClinicalSample:
+        """转换为每个特征拥有独立时间轴的 compact 视图。
+
+        转换仅保留 ``mask`` 标记的真实观测，并按特征分别左对齐；生存结局和
+        可选参考簇标签保持不变。
+
+        返回：
+            与当前样本等价的 :class:`CompactClinicalSample`。
+        """
         observed = self.mask > 0
         feature_lengths = observed.sum(dim=0).long()
         max_length = max(1, int(feature_lengths.max().item()))
@@ -73,6 +100,21 @@ class AlignedClinicalSample:
 
 @dataclass(frozen=True)
 class CompactClinicalSample:
+    """表示按特征独立左对齐的单个患者纵向样本。
+
+    每列对应一个特征自己的观测流，列内前 ``feature_lengths`` 个位置有效，
+    因而不同特征不必共享访视时点。
+
+    属性：
+        times: 形状为 ``(max_observations, n_features)`` 的特征级观测时间。
+        x: 与 ``times`` 同形状的纵向特征值。
+        mask: 与 ``x`` 同形状的左对齐观测指示矩阵。
+        feature_lengths: 形状为 ``(n_features,)`` 的各特征有效观测数。
+        survival_time: 正的标量随访或事件时间。
+        event: 标量事件指示，取值范围为 ``[0, 1]``。
+        cluster_label: 可选的标量参考簇标签，仅用于已知真值的评价。
+    """
+
     times: Tensor
     x: Tensor
     mask: Tensor
@@ -82,12 +124,25 @@ class CompactClinicalSample:
     cluster_label: Tensor | None
 
     def __post_init__(self) -> None:
+        """在冻结样本创建后校验张量形状、值域和左对齐约束。"""
         validate_compact_clinical_sample(self)
 
     def to_compact(self) -> CompactClinicalSample:
+        """返回当前 compact 视图，不复制底层张量。"""
         return self
 
     def to_aligned(self) -> AlignedClinicalSample:
+        """将各特征的独立时间轴合并为共享的 aligned 视图。
+
+        合并后的时间轴是所有真实观测时间的有序并集，未在某时点观测的特征由
+        ``mask`` 标记为缺失，并根据新时间轴重新计算 ``delta_time``。
+
+        返回：
+            与当前样本等价的 :class:`AlignedClinicalSample`。
+
+        异常：
+            ValueError: 当样本没有真实观测，或同一特征包含重复时间时抛出。
+        """
         observed_times = self.times[self.mask > 0].float()
         if observed_times.numel() == 0:
             raise ValueError("compact samples must contain at least one observed value.")
@@ -124,6 +179,22 @@ type DatasetSample = AlignedClinicalSample | CompactClinicalSample
 
 
 class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
+    """管理具有统一特征定义的变长临床时间序列样本集合。
+
+    数据集在初始化时将所有样本转换为指定的 ``return_kind``，而不是在
+    ``__getitem__`` 中按次转换。所有样本必须具有相同特征维度，并且必须全部
+    包含参考簇标签或全部不包含标签。
+
+    属性：
+        samples: 已转换为当前返回视图的患者样本列表。
+        feature_names: 按特征维度顺序排列的变量名称。
+        description: 数据集的人类可读说明。
+        metadata: 模拟机制、患者标识或其他调用方提供的附加信息。
+        feature_means: 根据真实观测位置计算的各特征均值。
+        return_kind: 样本采用 ``"aligned"`` 还是 ``"compact"`` 视图。
+        has_cluster_labels: 是否所有样本都带有参考簇标签。
+    """
+
     def __init__(
         self,
         samples: Sequence[DatasetSample],
@@ -133,6 +204,19 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
         metadata: dict[str, Any] | None = None,
         return_kind: SampleKind = "aligned",
     ) -> None:
+        """构造并校验临床时间序列数据集。
+
+        参数：
+            samples: 至少包含一个 aligned 或 compact 患者样本的序列。
+            feature_names: 与样本特征维度一一对应的变量名称。
+            description: 可选的数据集说明。
+            metadata: 可选的附加元数据字典。
+            return_kind: 数据集内部存储和返回的样本视图。
+
+        异常：
+            ValueError: 当视图类型无效、样本为空、特征维度不一致，或混合使用
+                有标签和无标签样本时抛出。
+        """
         if return_kind not in {"aligned", "compact"}:
             raise ValueError("return_kind must be 'aligned' or 'compact'.")
         input_samples = list(samples)
@@ -161,16 +245,33 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
         self.return_kind: SampleKind = return_kind
 
     def __len__(self) -> int:
+        """返回数据集中的患者样本数。"""
         return len(self.samples)
 
     def __getitem__(self, index: int) -> DatasetSample:
+        """按位置返回当前视图中的患者样本。"""
         return self.samples[index]
 
     @property
     def n_features(self) -> int:
+        """返回每个患者样本包含的纵向特征数。"""
         return len(self.feature_names)
 
     def with_return_kind(self, return_kind: SampleKind) -> ClinicalTimeSeriesDataset:
+        """创建采用指定样本视图的新数据集。
+
+        每个患者样本会通过自身的视图转换方法转换；特征名称、说明和元数据继续
+        传入新数据集，并重新计算特征均值。当前数据集不会被修改。
+
+        参数：
+            return_kind: 目标视图，可选 ``"aligned"`` 或 ``"compact"``。
+
+        返回：
+            采用目标视图的新 :class:`ClinicalTimeSeriesDataset`。
+
+        异常：
+            ValueError: 当目标视图无效或样本无法完成转换时抛出。
+        """
         return ClinicalTimeSeriesDataset(
             self.samples,
             feature_names=self.feature_names,
@@ -180,6 +281,15 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
         )
 
     def save(self, path: str | Path) -> None:
+        """使用 PyTorch 序列化格式保存数据集。
+
+        无论当前返回视图为何，磁盘载荷始终保存 aligned 样本及其
+        ``delta_time``，同时保留特征名称、说明和元数据。目标父目录不存在时
+        会自动创建。
+
+        参数：
+            path: 目标 ``.pt`` 文件路径。
+        """
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         aligned_samples = [sample.to_aligned() for sample in self.samples]
@@ -217,6 +327,29 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
         feature_col: str = "feature",
         value_col: str = "value",
     ) -> None:
+        """将数据集导出为患者表和长格式纵向观测表。
+
+        患者表每位患者一行，包含生存结局和可选参考簇；观测表仅写出
+        ``mask > 0`` 的真实观测。患者 ID 优先使用显式输入，其次使用元数据中
+        的 ``patient_ids``，否则生成 ``sample_<index>``。
+
+        参数：
+            patients_csv: 患者级 CSV 输出路径。
+            observations_csv: 长格式观测 CSV 输出路径。
+            patient_ids: 可选的唯一非空患者 ID 序列。
+            patient_id_col: 患者表 ID 列名。
+            survival_time_col: 患者表生存时间列名。
+            event_col: 患者表事件指示列名。
+            cluster_label_col: 患者表参考簇列名。
+            observation_patient_id_col: 观测表患者 ID 列名。
+            time_col: 观测时间列名。
+            feature_col: 特征名称列名。
+            value_col: 观测值列名。
+
+        异常：
+            ValueError: 当患者 ID 数量或唯一性无效，或任一患者没有真实观测时
+                抛出。
+        """
         resolved_patient_ids = _resolve_csv_patient_ids(
             self,
             explicit_patient_ids=patient_ids,
@@ -270,6 +403,21 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
         *,
         return_kind: SampleKind = "aligned",
     ) -> ClinicalTimeSeriesDataset:
+        """从 PyTorch 序列化文件加载临床时间序列数据集。
+
+        保存的张量先映射到 CPU，并重建为经过校验的 aligned 样本，再根据
+        ``return_kind`` 转换为调用方需要的视图。
+
+        参数：
+            path: 由 :meth:`save` 写出的数据集文件路径。
+            return_kind: 加载后采用的样本视图。
+
+        返回：
+            在 CPU 上重建并采用指定视图的 :class:`ClinicalTimeSeriesDataset`。
+
+        异常：
+            ValueError: 当载荷中的样本不满足数据契约或视图类型无效时抛出。
+        """
         payload: dict[str, Any] = torch.load(Path(path), map_location="cpu", weights_only=False)
         samples = [
             make_clinical_sample(
@@ -310,6 +458,36 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
         metadata: dict[str, Any] | None = None,
         return_kind: SampleKind = "aligned",
     ) -> ClinicalTimeSeriesDataset:
+        """从患者表和长格式纵向观测表构建临床时间序列数据集。
+
+        观测按患者和时间透视为 aligned 样本，缺失位置填零并由 ``mask`` 标记；
+        ``delta_time`` 根据排序后的时间轴计算。若患者表含参考簇列，其原始类别
+        会编码为连续整数，并在元数据中保存类别编码。生成的元数据还记录列映射、
+        特征顺序、患者 ID 和患者级观测摘要。
+
+        参数：
+            patients_csv: 含患者 ID、生存时间、事件和可选参考簇的 CSV。
+            observations_csv: 含患者 ID、时间、特征和值的长格式 CSV。
+            patient_id_col: 患者表 ID 列名。
+            survival_time_col: 患者表生存时间列名。
+            event_col: 患者表事件指示列名。
+            cluster_label_col: 可选参考簇列名；列不存在时按无标签数据处理。
+            observation_id_col: 观测表患者 ID 列名。
+            time_col: 观测时间列名。
+            feature_col: 特征名称列名。
+            value_col: 观测值列名。
+            use_features: 可选的特征筛选及排序序列；为空时使用文件出现顺序。
+            description: 数据集说明。
+            metadata: 与自动生成元数据合并的调用方元数据，同名键由调用方覆盖。
+            return_kind: 返回 ``"aligned"`` 或 ``"compact"`` 样本视图。
+
+        返回：
+            从两个 CSV 文件构建并校验的 :class:`ClinicalTimeSeriesDataset`。
+
+        异常：
+            AssertionError: 当必需列、患者 ID 或观测表基本约束不满足时抛出。
+            ValueError: 当患者没有观测、样本值不满足契约或视图类型无效时抛出。
+        """
         patients_path = Path(patients_csv)
         observations_path = Path(observations_csv)
         metadata = dict(metadata or {})
@@ -534,6 +712,18 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
         )
 
     def split(self, fraction: list[float], seed: int = 0) -> list[ClinicalTimeSeriesDataset]:
+        """按给定比例随机拆分患者，并保持样本视图和患者级元数据对齐。
+
+        参数：
+            fraction: 总和为 ``1`` 的拆分比例；每个比例必须产生正的样本数。
+            seed: 患者索引洗牌使用的随机种子。
+
+        返回：
+            按输入比例顺序排列的独立数据集列表；单个比例时返回当前数据集。
+
+        异常：
+            ValueError: 当比例和不为 ``1`` 或产生无效拆分计数时抛出。
+        """
         if not np.isclose(float(sum(fraction)), 1.0):
             raise ValueError("Split fractions must sum to 1.")
 
@@ -554,6 +744,22 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
         *,
         split_fractions: list[float] | None = None,
     ) -> list[ClinicalTimeSeriesDataset]:
+        """按精确患者数随机拆分数据集。
+
+        拆分会使用 ``seed`` 确定性地打乱索引，并同步切分已知的患者级元数据。
+        ``split_fractions`` 仅用于把原始比例记录到各子集元数据。
+
+        参数：
+            counts: 每个子集的正患者数，总和必须等于数据集长度。
+            seed: 患者索引洗牌使用的随机种子。
+            split_fractions: 可选的原始拆分比例，仅用于元数据。
+
+        返回：
+            按 ``counts`` 顺序排列的独立数据集列表。
+
+        异常：
+            ValueError: 当计数为空、非正或总和与数据集长度不符时抛出。
+        """
         if not counts:
             raise ValueError("Split counts must contain at least one split.")
         if any(count <= 0 for count in counts):
@@ -600,6 +806,7 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
         split_count: int,
         split_fraction: float | None,
     ) -> dict[str, Any]:
+        """复制公共元数据并按患者索引切分已知患者级字段。"""
         metadata = dict(self.metadata)
         for key in PATIENT_LEVEL_METADATA_KEYS:
             if key in metadata:
@@ -622,6 +829,7 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
 
 
 def _slice_patient_metadata(value: Any, indices: np.ndarray, *, source_count: int) -> Any:
+    """按索引切分首维等于原患者数的常见容器。"""
     if isinstance(value, torch.Tensor) and value.ndim > 0 and int(value.shape[0]) == source_count:
         tensor_indices = torch.as_tensor(indices, dtype=torch.long)
         return value[tensor_indices]
@@ -639,6 +847,7 @@ def _resolve_csv_patient_ids(
     *,
     explicit_patient_ids: Sequence[str] | None,
 ) -> list[str]:
+    """按显式输入、元数据和自动生成的优先级解析导出患者 ID。"""
     if explicit_patient_ids is not None:
         return _validate_csv_patient_ids(
             explicit_patient_ids,
@@ -664,6 +873,7 @@ def _validate_csv_patient_ids(
     expected_count: int,
     label: str,
 ) -> list[str]:
+    """规范化并校验患者 ID 的数量、非空性和唯一性。"""
     values = [str(value).strip() for value in patient_ids]
     if len(values) != expected_count:
         raise ValueError(f"{label} length must match dataset length.")
@@ -677,6 +887,7 @@ def _validate_csv_patient_ids(
 
 
 def _is_valid_csv_patient_ids(values: Sequence[str], *, expected_count: int) -> bool:
+    """判断患者 ID 序列是否具有预期数量且非空唯一。"""
     return (
         len(values) == expected_count
         and all(value != "" for value in values)
@@ -694,6 +905,27 @@ def make_clinical_sample(
     event: float | Tensor,
     cluster_label: int | Tensor | None = None,
 ) -> AlignedClinicalSample:
+    """构造经过 dtype 规范化和完整校验的 aligned 临床样本。
+
+    特征、掩码、时间和结局统一转换为 ``float32``，参考簇标签转换为
+    ``long``。本函数不会推导 ``delta_time``，调用方应传入与 ``x`` 同形状的
+    已计算张量。返回对象初始化时会自动执行形状和值域校验。
+
+    参数：
+        times: 形状为 ``(n_visits,)`` 的访视时间。
+        x: 形状为 ``(n_visits, n_features)`` 的特征值。
+        mask: 与 ``x`` 同形状的观测指示矩阵。
+        delta_time: 与 ``x`` 同形状的距上次观测时间。
+        survival_time: 正的随访或事件时间。
+        event: 取值范围为 ``[0, 1]`` 的事件指示。
+        cluster_label: 可选的整数参考簇标签。
+
+    返回：
+        规范化后的 :class:`AlignedClinicalSample`。
+
+    异常：
+        ValueError: 当张量形状、值域或标量约束不满足样本契约时抛出。
+    """
     return AlignedClinicalSample(
         times=times.float(),
         x=x.float(),
@@ -708,6 +940,18 @@ def make_clinical_sample(
 
 
 def compute_delta_time(times: Tensor, mask: Tensor) -> Tensor:
+    """计算每个访视时点上各特征距其上一次观测经过的时间。
+
+    首次访视的间隔固定为零；后续时点若该特征在前一次访视中被观测，则从本次
+    时间差重新累计，否则继续累加缺失期间经过的时间。
+
+    参数：
+        times: 形状为 ``(n_visits,)`` 的共享访视时间。
+        mask: 形状为 ``(n_visits, n_features)`` 的观测指示矩阵。
+
+    返回：
+        与 ``mask`` 同形状、继承其 dtype 和设备的时间间隔张量。
+    """
     delta_time = torch.zeros_like(mask)
     for step in range(1, int(times.shape[0])):
         gap = times[step] - times[step - 1]
@@ -716,6 +960,7 @@ def compute_delta_time(times: Tensor, mask: Tensor) -> Tensor:
 
 
 def validate_aligned_clinical_sample(sample: AlignedClinicalSample) -> None:
+    """校验 aligned 样本的张量形状、值域和标量约束。"""
     if sample.times.ndim != 1:
         raise ValueError("times must have shape (n_visits,).")
     if sample.x.ndim != 2:
@@ -739,6 +984,7 @@ def validate_aligned_clinical_sample(sample: AlignedClinicalSample) -> None:
 
 
 def validate_compact_clinical_sample(sample: CompactClinicalSample) -> None:
+    """校验 compact 样本的张量形状、值域和左对齐约束。"""
     if sample.times.ndim != 2:
         raise ValueError("compact times must have shape (max_observations, n_features).")
     if sample.x.shape != sample.times.shape:
@@ -766,6 +1012,7 @@ def validate_compact_clinical_sample(sample: CompactClinicalSample) -> None:
 
 
 def compute_feature_means(samples: Sequence[DatasetSample]) -> Tensor:
+    """根据样本掩码计算各特征观测值均值，无观测特征返回零。"""
     n_features = int(samples[0].x.shape[-1])
     numerator = torch.zeros(n_features, dtype=torch.float32)
     denominator = torch.zeros(n_features, dtype=torch.float32)
@@ -776,6 +1023,20 @@ def compute_feature_means(samples: Sequence[DatasetSample]) -> Tensor:
 
 
 def clinical_collate_fn(samples: list[DatasetSample]) -> Batch:
+    """将同一视图的变长患者样本整理为补零批次。
+
+    根据首个样本选择 aligned 或 compact 批处理路径，并拒绝混合视图或混合
+    标签状态。输出包含模型输入、生存结局和可选参考簇标签。
+
+    参数：
+        samples: 非空且视图类型一致的患者样本列表。
+
+    返回：
+        aligned 或 compact 张量批次字典。
+
+    异常：
+        ValueError: 当输入为空、混合样本视图或混合标签状态时抛出。
+    """
     if not samples:
         raise ValueError("clinical_collate_fn requires at least one sample.")
     if isinstance(samples[0], CompactClinicalSample):
@@ -788,6 +1049,12 @@ def clinical_collate_fn(samples: list[DatasetSample]) -> Batch:
 
 
 def collate_aligned_samples(samples: list[AlignedClinicalSample]) -> AlignedBatch:
+    """将 aligned 样本补齐到批次最大访视数并堆叠结局。
+
+    返回批次包含 ``times``、``x``、``mask``、``delta_time``、
+    ``sequence_lengths``、``survival_time``、``event`` 和可选
+    ``cluster_label``。
+    """
     batch_size = len(samples)
     max_length = max(int(sample.times.shape[0]) for sample in samples)
     n_features = int(samples[0].x.shape[-1])
@@ -829,6 +1096,11 @@ def collate_aligned_samples(samples: list[AlignedClinicalSample]) -> AlignedBatc
 
 
 def collate_compact_samples(samples: list[CompactClinicalSample]) -> CompactBatch:
+    """将 compact 样本补齐到批次最大特征流长度并堆叠结局。
+
+    返回批次包含 ``times``、``x``、``mask``、``feature_lengths``、
+    ``survival_time``、``event`` 和可选 ``cluster_label``。
+    """
     batch_size = len(samples)
     max_length = max(int(sample.x.shape[0]) for sample in samples)
     n_features = int(samples[0].x.shape[-1])
@@ -867,6 +1139,7 @@ def collate_compact_samples(samples: list[CompactClinicalSample]) -> CompactBatc
 
 
 def infer_data_config(dataset: ClinicalTimeSeriesDataset) -> DataConfig:
+    """根据数据集特征数构造模型数据配置。"""
     return DataConfig(n_features=dataset.n_features)
 
 
@@ -876,6 +1149,16 @@ def make_data_loader(
     *,
     shuffle: bool,
 ) -> DataLoader[Batch]:
+    """使用训练配置中的批大小规则创建临床数据加载器。
+
+    参数：
+        data: 要迭代的临床时间序列数据集。
+        trainer_config: 提供显式或自动批大小的训练配置。
+        shuffle: 是否在每轮迭代前打乱患者顺序。
+
+    返回：
+        使用 :func:`clinical_collate_fn` 的 PyTorch 数据加载器。
+    """
     return cast(
         DataLoader[Batch],
         DataLoader(

@@ -1,12 +1,12 @@
 import logging
-import math
 from pathlib import Path
 from typing import Literal
 
 import pytest
 import torch
 
-from trails.config import (
+from trails import (
+    ClinicalTimeSeriesDataset,
     DataConfig,
     DecoderConfig,
     EncoderConfig,
@@ -14,16 +14,10 @@ from trails.config import (
     EncoderMappingConfig,
     ModelConfig,
     TrailsConfig,
+    TrailsEstimator,
     TrainerConfig,
 )
-from trails.data import ClinicalTimeSeriesDataset, make_clinical_sample
-from trails.estimator import (
-    TrailsEstimator,
-    observed_time_range,
-    score_k_selection_rows,
-    selected_k_from_selection_metrics,
-    selection_metrics_to_rows,
-)
+from trails.data import make_clinical_sample
 from trails_simulate import (
     ClinicalTimeSeriesDatasetGenerator,
     ClinicalTimeSeriesDatasetGeneratorConfig,
@@ -149,27 +143,12 @@ def test_estimator_fit_predict_test() -> None:
 
 
 @pytest.mark.parametrize("kind", ["mtan", "mtan2"])
-def test_mtan_estimator_sets_training_reference_time_grid(kind: Literal["mtan", "mtan2"]) -> None:
+def test_mtan_estimator_fit_and_predict(kind: Literal["mtan", "mtan2"]) -> None:
     data = simulate_dataset(seed=37)
     config = tiny_mtan_config(data.n_features, kind=kind)
     estimator = TrailsEstimator(config).fit(data)
-    min_time, max_time = observed_time_range(data)
-    reference_times = estimator.model.reference_times
-    assert reference_times is not None
-    expected = torch.linspace(
-        min_time,
-        max_time,
-        config.model.encoder.input.num_ref_points,
-        dtype=reference_times.dtype,
-        device=reference_times.device,
-    )
 
-    assert torch.allclose(reference_times, expected)
-    saved_reference_times = reference_times.clone()
-    estimator.predict(data)
-    prediction_reference_times = estimator.model.reference_times
-    assert prediction_reference_times is not None
-    assert torch.allclose(prediction_reference_times, saved_reference_times)
+    assert estimator.predict(data).shape == (8,)
 
 
 def test_estimator_latent_diagnostics_exports_labels_and_embeddings() -> None:
@@ -189,106 +168,6 @@ def test_estimator_latent_diagnostics_exports_labels_and_embeddings() -> None:
         torch.ones(8),
         atol=1e-5,
     )
-
-
-def test_estimator_selection_metrics_include_cindex_and_bic() -> None:
-    data = simulate_dataset(seed=29)
-    estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data)
-    metrics = estimator.selection_metrics(data)
-
-    for name in ["cindex", "bic", "mean_nll", "n_parameters"]:
-        assert name in metrics
-        assert math.isfinite(metrics[name])
-    assert metrics["n_parameters"] == pytest.approx(17.0)
-    assert "cluster_empty_count" in metrics
-    assert "cluster_entropy" in metrics
-
-
-def test_select_n_clusters_scores_ranks_and_can_inherit_best(tmp_path: Path) -> None:
-    data = simulate_dataset(seed=41)
-    estimator = TrailsEstimator(tiny_config(data.n_features))
-    result = estimator.select_n_clusters(
-        data,
-        candidate_clusters=(2, 3),
-        valid_fraction=0.25,
-        inherit_best=True,
-        result_dir=tmp_path / "k_selection",
-    )
-
-    selected_k = selected_k_from_selection_metrics(result)
-    rows = selection_metrics_to_rows(result)
-    assert selected_k in {2, 3}
-    assert estimator.config.model.n_clusters == selected_k
-    assert estimator.history
-    assert set(result["bic"]) == {"2", "3"}
-    assert {int(row["n_clusters"]) for row in rows} == {2, 3}
-    assert [int(row["rank"]) for row in rows] == [1, 2]
-    for row in rows:
-        assert 0.0 <= float(row["bic_norm"]) <= 1.0
-        assert math.isfinite(float(row["selection_score"]))
-    assert (tmp_path / "k_selection" / "selection_metrics.csv").exists()
-    assert (tmp_path / "k_selection" / "selection_metrics.json").exists()
-    for n_clusters in [2, 3]:
-        candidate_dir = tmp_path / "k_selection" / f"k{n_clusters}"
-        assert (candidate_dir / "model.pt").exists()
-        assert (candidate_dir / "history.json").exists()
-        assert (candidate_dir / "metrics.json").exists()
-        assert (candidate_dir / "config.json").exists()
-
-
-def test_select_n_clusters_reuses_one_validation_split(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    data = simulate_dataset(seed=43)
-    config = tiny_config_with_validation(data.n_features)
-    split_calls: list[tuple[int, tuple[float, ...], int]] = []
-    original_split = ClinicalTimeSeriesDataset.split
-
-    def tracking_split(
-        self: ClinicalTimeSeriesDataset,
-        fraction: list[float],
-        seed: int = 0,
-    ) -> list[ClinicalTimeSeriesDataset]:
-        split_calls.append((len(self), tuple(fraction), seed))
-        return original_split(self, fraction, seed)
-
-    monkeypatch.setattr(ClinicalTimeSeriesDataset, "split", tracking_split)
-
-    TrailsEstimator(config).select_n_clusters(data, candidate_clusters=(2, 3))
-
-    assert split_calls == [(8, (0.75, 0.25), config.seed)]
-
-
-def test_select_n_clusters_accepts_explicit_validation_data(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    data = simulate_dataset(seed=47)
-    train, validation = data.split([0.75, 0.25], seed=5)
-
-    def unexpected_split(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("explicit validation data must bypass internal splitting")
-
-    monkeypatch.setattr(ClinicalTimeSeriesDataset, "split", unexpected_split)
-    result = TrailsEstimator(tiny_config(data.n_features)).select_n_clusters(
-        train,
-        candidate_clusters=(2, 3),
-        validation_data=validation,
-    )
-
-    assert set(result["bic"]) == {"2", "3"}
-
-
-def test_k_selection_bic_normalization_handles_equal_bic() -> None:
-    rows = score_k_selection_rows(
-        [
-            {"n_clusters": 2, "cindex": 0.3, "bic": 10.0, "mean_nll": 1.0},
-            {"n_clusters": 3, "cindex": 0.7, "bic": 10.0, "mean_nll": 1.1},
-        ]
-    )
-
-    assert [float(row["bic_norm"]) for row in rows] == [0.0, 0.0]
-    assert int(rows[0]["n_clusters"]) == 3
-    assert int(rows[0]["rank"]) == 1
 
 
 def test_fit_with_explicit_validation_data_warns_and_uses_it(

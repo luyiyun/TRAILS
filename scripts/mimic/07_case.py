@@ -8,10 +8,14 @@ import pandas as pd
 import torch
 from omegaconf import DictConfig
 
+from trails import (
+    ClinicalTimeSeriesDataset,
+    DataConfig,
+    TrailsConfig,
+    TrailsEstimator,
+    resolve_batch_size,
+)
 from trails.artifacts import save_history_csv, save_json
-from trails.config import DataConfig, TrailsConfig, resolve_batch_size
-from trails.data import ClinicalTimeSeriesDataset
-from trails.estimator import TrailsEstimator
 from trails_case.config import CaseApplicationConfig
 from trails_case.evaluation import (
     CaseResultTables,
@@ -56,7 +60,7 @@ def _cluster_feature_summary(
 
 def run(config: CaseApplicationConfig) -> dict[str, object]:
     if config.k_selection.enabled:
-        raise ValueError("K 选择实验已移至 scripts/mimic_select_k.py")
+        raise ValueError("K 选择实验已移至 scripts/mimic/06_select_k.py")
     run_dir = config.paths.dir
     run_dir.mkdir(parents=True, exist_ok=True)
     patients_csv = resolve_input_path(config.patients_csv)
@@ -146,7 +150,7 @@ def run(config: CaseApplicationConfig) -> dict[str, object]:
     return summary
 
 
-@hydra.main(config_path="../configs", config_name="mimic_case", version_base="1.3")
+@hydra.main(config_path="../../configs", config_name="mimic_case", version_base="1.3")
 def main(raw_config: DictConfig) -> None:
     config = CaseApplicationConfig.model_validate(resolved_payload(raw_config))
     run(config)

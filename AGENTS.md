@@ -19,7 +19,7 @@ items.
 - `src/trails_simulate/`: synthetic clinical data generation; imports `trails`.
 - `src/trails_case/`: real-data/case-study utilities; imports `trails` plus
   shared command config models from `trails_simulate.config`.
-- `tests/`: smoke, data, model, estimator, CLI, and architecture tests.
+- `tests/`: tests for the user-facing API exported from `src/trails/__init__.py`.
 
 ## Import Boundaries
 
@@ -81,8 +81,9 @@ clean reusable method library.
 - 对于较为复杂的基础设施逻辑（例如多进程进度条），优先使用内聚的面向对象
   封装，避免将状态、上下文和协调逻辑分散在多个松散 helper 中。
 - Avoid `try/except` unless the code can recover or add useful diagnostics.
-- Add or update tests for every substantial behavior change.
-- MIMIC preprocessing and EDA scripts do not need separate tests unless requested.
+- 仅测试 `src/trails/__init__.py` 中 `__all__` 导出的用户 API 及其公开方法。
+  不为辅助函数、内部实现、`src/` 下其他包或 `scripts/` 下的命令脚本添加测试；
+  发现这类既有测试时删除，而不是继续维护。
 - MIMIC preprocessing and EDA scripts use fixed project paths without CLI arguments unless requested.
 - Update this file when architecture decisions change.
 
@@ -217,8 +218,9 @@ clean reusable method library.
 - MIMIC-specific command entrypoints share the fixed stratified split and train-only
   longitudinal feature transformation implemented in `trails_case.mimic`; command
   scripts do not import one another.
-- `scripts/mimic_select_k.py` runs the multi-seed K-selection experiment;
-  `scripts/mimic_case.py` is reserved for locked final-model evaluation.
+- `scripts/mimic/01_build_sepsis.py` through `07_case.py` form the ordered MIMIC
+  analysis workflow. `06_select_k.py` runs multi-seed K selection, while
+  `07_case.py` is reserved for locked final-model evaluation.
 - In generic `scripts/case.py`, `k_selection.enabled=true` runs estimator-level holdout K selection before
   final case training. Empty `k_selection.candidate_clusters` means
   `2..model.n_clusters`; candidates are scored by validation C-index and

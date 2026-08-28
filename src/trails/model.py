@@ -1,3 +1,5 @@
+"""TRAILS 的异步序列编码、重建、VaDE 聚类与 Weibull 生存模型。"""
+
 from __future__ import annotations
 
 import math
@@ -19,6 +21,19 @@ from .metrics import (
 
 @dataclass(frozen=True)
 class TrailsModelOutput:
+    """一次模型前向传播的完整输出。
+
+    属性：
+        reconstruction: 与输入纵向值布局一致的重建张量。
+        latent_mean: 患者变分后验均值。
+        latent_log_variance: 患者变分后验对数方差。
+        latent: 训练时重参数采样、评价时取均值的潜变量。
+        cluster_logits: VaDE 高斯混合后验的未归一化对数分数。
+        cluster_probabilities: 归一化后的后验簇概率。
+        weibull_shape: 每位患者、每个簇的 Weibull 形状参数。
+        weibull_scale: 每位患者、每个簇的 Weibull 尺度参数。
+    """
+
     reconstruction: Tensor
     latent_mean: Tensor
     latent_log_variance: Tensor
@@ -31,6 +46,8 @@ class TrailsModelOutput:
 
 @dataclass(frozen=True)
 class TrailsLossBreakdown:
+    """总损失、原始分量、有效权重和可选不确定性参数的明细。"""
+
     loss: Tensor
     reconstruction_loss: Tensor
     survival_loss: Tensor
@@ -43,6 +60,7 @@ class TrailsLossBreakdown:
     vade_kl_log_variance: Tensor | None = None
 
     def items(self) -> tuple[tuple[str, Tensor], ...]:
+        """返回所有非空损失字段的名称与张量对。"""
         values: list[tuple[str, Tensor | None]] = [
             ("loss", self.loss),
             ("reconstruction_loss", self.reconstruction_loss),
@@ -59,7 +77,10 @@ class TrailsLossBreakdown:
 
 
 class GRUDCell(nn.Module):
+    """对输入和隐状态应用缺失时间衰减的 GRU-D 单步单元。"""
+
     def __init__(self, input_size: int, hidden_size: int) -> None:
+        """创建特征级输入衰减、隐状态衰减和 GRUCell。"""
         super().__init__()
         self.input_decay = nn.Linear(input_size, input_size)
         self.hidden_decay = nn.Linear(input_size, hidden_size)
@@ -74,6 +95,11 @@ class GRUDCell(nn.Module):
         last_observed: Tensor,
         feature_means: Tensor,
     ) -> tuple[Tensor, Tensor]:
+        """执行一个时间步的衰减插补和循环状态更新。
+
+        缺失输入在最近观测与总体特征均值之间按 ``delta_t`` 衰减插补，隐状态
+        单独衰减后送入 GRU。返回下一隐状态和更新后的最近观测值。
+        """
         gamma_x = torch.exp(-torch.relu(self.input_decay(delta_t)))
         gamma_h = torch.exp(-torch.relu(self.hidden_decay(delta_t)))
         mean = feature_means.unsqueeze(0).expand_as(x_t)
@@ -86,16 +112,21 @@ class GRUDCell(nn.Module):
 
 
 class SequencePool(nn.Module):
+    """通过可学习时间注意力把变长隐序列汇总为患者表示。"""
+
     def __init__(self, hidden_size: int) -> None:
+        """创建将每个有效时间步映射为标量分数的线性层。"""
         super().__init__()
         self.score = nn.Linear(hidden_size, 1)
 
     def forward(self, hidden_sequence: Tensor, sequence_lengths: Tensor) -> Tensor:
+        """对有效时间步加权求和，返回患者级隐表示。"""
         # SeqPool：只在有效访问上归一化时间权重，再汇总为病人级表示。
         weights = self.attention_weights(hidden_sequence, sequence_lengths)
         return torch.sum(weights.unsqueeze(-1) * hidden_sequence, dim=1)
 
     def attention_weights(self, hidden_sequence: Tensor, sequence_lengths: Tensor) -> Tensor:
+        """返回仅在各患者有效时间步上归一化的注意力权重。"""
         _batch_size, max_length, _hidden_size = hidden_sequence.shape
         steps = torch.arange(max_length, device=hidden_sequence.device).unsqueeze(0)
         active = steps < sequence_lengths.to(hidden_sequence.device).unsqueeze(1)
@@ -109,6 +140,7 @@ def sequence_padding_mask(
     max_length: int,
     device: torch.device,
 ) -> Tensor:
+    """根据序列长度生成 ``True`` 表示补齐位置的二维掩码。"""
     lengths = sequence_lengths.to(device)
     steps = torch.arange(max_length, device=device).unsqueeze(0)
     return steps >= lengths.unsqueeze(1)
@@ -121,12 +153,14 @@ def active_sequence_mask(
     dtype: torch.dtype,
     device: torch.device,
 ) -> Tensor:
+    """生成形状为 ``(batch, max_length, 1)`` 的有效位置数值掩码。"""
     return (
         (~sequence_padding_mask(sequence_lengths, max_length, device)).to(dtype=dtype).unsqueeze(-1)
     )
 
 
 def visit_time_features(times: Tensor) -> Tensor:
+    """把访视时间扩展为原值、``log1p``、正弦和余弦四维特征。"""
     nonnegative_times = times.clamp_min(0.0)
     return torch.stack(
         [
@@ -140,7 +174,10 @@ def visit_time_features(times: Tensor) -> Tensor:
 
 
 class GRUDInputLayer(nn.Module):
+    """沿 aligned 访视时间轴运行 GRU-D 的异步输入层。"""
+
     def __init__(self, input_size: int, hidden_size: int) -> None:
+        """创建指定特征数和隐状态宽度的 GRU-D 输入层。"""
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -155,6 +192,11 @@ class GRUDInputLayer(nn.Module):
         sequence_lengths: Tensor,
         feature_means: Tensor,
     ) -> Tensor:
+        """编码补齐后的 aligned 批次并返回逐访视隐状态。
+
+        超过患者真实序列长度的位置保持上一隐状态不变；缺失值由单步 GRU-D
+        衰减规则处理。
+        """
         batch_size, max_length, _n_features = x.shape
         hidden = x.new_zeros(batch_size, self.hidden_size)
         last_observed = feature_means.unsqueeze(0).expand(batch_size, self.input_size)
@@ -178,12 +220,18 @@ class GRUDInputLayer(nn.Module):
 
 
 class MTANInputLayer(nn.Module):
+    """把 aligned ``(B, T, D)`` 观测映射到全局参考时间网格的原始 mTAN 输入层。
+
+    注意力值由 ``x`` 与 ``mask`` 拼接，查询为训练数据范围内等距参考时间点。
+    """
+
     def __init__(
         self,
         input_size: int,
         config: EncoderInputConfig,
         dropout: float,
     ) -> None:
+        """根据输入配置创建时间嵌入、多时间注意力和参考时间 buffer。"""
         super().__init__()
         self.input_size = input_size
         self.hidden_size = config.hidden_dim
@@ -207,6 +255,7 @@ class MTANInputLayer(nn.Module):
         )
 
     def set_reference_time_range(self, min_time: float, max_time: float) -> None:
+        """将参考时间 buffer 更新为给定闭区间上的等距网格。"""
         if max_time < min_time:
             raise ValueError("max_time must be greater than or equal to min_time.")
         reference_times = torch.linspace(
@@ -225,6 +274,11 @@ class MTANInputLayer(nn.Module):
         x: Tensor,
         mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        """将 aligned 观测注意到参考网格。
+
+        返回编码序列、每位患者共享的参考时间以及均等于参考点数的序列长度。
+        输入特征数或 aligned 时间张量维度不匹配时抛出 :class:`ValueError`。
+        """
         batch_size, _max_length, n_features = x.shape
         if n_features != self.input_size:
             raise ValueError(f"Expected {self.input_size} features, got {n_features}.")
@@ -256,12 +310,19 @@ class MTANInputLayer(nn.Module):
 
 
 class MTAN2InputLayer(nn.Module):
+    """分别编码每个特征观测流并在参考时间网格拼接的 mTAN2 输入层。
+
+    compact 输入被重排为 ``B * D`` 条特征级序列，经共享注意力和前馈网络后
+    拼接为 ``(B, reference_points, D * hidden_dim)``。
+    """
+
     def __init__(
         self,
         input_size: int,
         config: EncoderInputConfig,
         dropout: float,
     ) -> None:
+        """创建时间/数值投影、多头注意力、前馈层和参考时间 buffer。"""
         super().__init__()
         self.input_size = input_size
         self.hidden_size = config.hidden_dim
@@ -302,6 +363,7 @@ class MTAN2InputLayer(nn.Module):
         )
 
     def set_reference_time_range(self, min_time: float, max_time: float) -> None:
+        """将参考时间 buffer 更新为给定闭区间上的等距网格。"""
         if max_time < min_time:
             raise ValueError("max_time must be greater than or equal to min_time.")
         reference_times = torch.linspace(
@@ -320,6 +382,11 @@ class MTAN2InputLayer(nn.Module):
         x: Tensor,
         mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        """编码 compact 特征流并返回拼接后的参考时间序列。
+
+        没有任何观测的特征流输出保持为零。返回编码序列、患者级参考时间和固定
+        序列长度。
+        """
         batch_size, max_length, n_features = x.shape
         if n_features != self.input_size:
             raise ValueError(f"Expected {self.input_size} features, got {n_features}.")
@@ -378,7 +445,10 @@ class MTAN2InputLayer(nn.Module):
 
 
 class TimeEmbedding(nn.Module):
+    """为 mTAN2 提供可学习线性或固定正余弦时间嵌入。"""
+
     def __init__(self, *, embedding_dim: int, learn_embedding: bool, frequency: float) -> None:
+        """配置嵌入宽度、是否学习投影以及固定嵌入频率尺度。"""
         super().__init__()
         self.embedding_dim = embedding_dim
         self.learn_embedding = learn_embedding
@@ -389,11 +459,13 @@ class TimeEmbedding(nn.Module):
             self.linear = None
 
     def forward(self, times: Tensor) -> Tensor:
+        """根据配置返回可学习线性或固定时间嵌入。"""
         if self.learn_embedding:
             return self._required_linear(times.unsqueeze(-1))
         return self.fixed_time_embedding(times)
 
     def fixed_time_embedding(self, times: Tensor) -> Tensor:
+        """计算宽度为 ``embedding_dim`` 的交替正弦/余弦嵌入。"""
         position = 48.0 * times.unsqueeze(-1)
         embedding = times.new_zeros(*times.shape, self.embedding_dim)
         div_term = torch.exp(
@@ -406,13 +478,17 @@ class TimeEmbedding(nn.Module):
         return embedding
 
     def _required_linear(self, times: Tensor) -> Tensor:
+        """调用必须已初始化的可学习线性时间投影。"""
         if self.linear is None:
             raise RuntimeError("learned time embedding linear layer is not initialized.")
         return self.linear(times)
 
 
 class OriginalMTANTimeEmbedding(nn.Module):
+    """实现原始 mTAN 的线性加周期时间嵌入或固定正余弦嵌入。"""
+
     def __init__(self, *, embedding_dim: int, learn_embedding: bool, frequency: float) -> None:
+        """按原始 mTAN 结构创建一维线性项和周期投影。"""
         super().__init__()
         self.embedding_dim = embedding_dim
         self.learn_embedding = learn_embedding
@@ -425,11 +501,13 @@ class OriginalMTANTimeEmbedding(nn.Module):
             self.periodic = None
 
     def forward(self, times: Tensor) -> Tensor:
+        """根据配置返回原始 mTAN 的可学习或固定时间嵌入。"""
         if self.learn_embedding:
             return self._learned_time_embedding(times.unsqueeze(-1))
         return self.fixed_time_embedding(times)
 
     def fixed_time_embedding(self, times: Tensor) -> Tensor:
+        """计算宽度为 ``embedding_dim`` 的交替正弦/余弦嵌入。"""
         position = 48.0 * times.unsqueeze(-1)
         embedding = times.new_zeros(*times.shape, self.embedding_dim)
         div_term = torch.exp(
@@ -442,6 +520,7 @@ class OriginalMTANTimeEmbedding(nn.Module):
         return embedding
 
     def _learned_time_embedding(self, times: Tensor) -> Tensor:
+        """拼接可学习线性时间项与正弦周期项。"""
         if self.linear is None or self.periodic is None:
             raise RuntimeError("learned mTAN time embedding layers are not initialized.")
         linear = self.linear(times)
@@ -450,6 +529,12 @@ class OriginalMTANTimeEmbedding(nn.Module):
 
 
 class MultiTimeAttention(nn.Module):
+    """原始 mTAN 的按值维度独立屏蔽多头时间注意力。
+
+    查询和键来自时间嵌入；每个输入值维度拥有独立观测掩码，所有注意力头的
+    结果拼接后投影到目标隐藏宽度。
+    """
+
     def __init__(
         self,
         *,
@@ -459,6 +544,7 @@ class MultiTimeAttention(nn.Module):
         n_heads: int,
         dropout: float,
     ) -> None:
+        """创建时间查询/键投影和多头输出投影。"""
         super().__init__()
         if time_embedding_dim % n_heads != 0:
             raise ValueError("time_embedding_dim must be divisible by n_heads.")
@@ -478,6 +564,11 @@ class MultiTimeAttention(nn.Module):
         value: Tensor,
         mask: Tensor | None = None,
     ) -> Tensor:
+        """从键时间上的值计算每个查询时间的隐藏表示。
+
+        ``mask`` 可为 ``(B, T)`` 或与 ``value`` 同形状；特征宽度和掩码形状
+        不满足构造契约时抛出 :class:`ValueError`。
+        """
         batch_size, _sequence_length, value_dim = value.shape
         if value_dim != self.input_dim:
             raise ValueError(f"Expected {self.input_dim} value features, got {value_dim}.")
@@ -509,6 +600,7 @@ class MultiTimeAttention(nn.Module):
         return self.output_projection(attended)
 
     def _attention(self, query: Tensor, key: Tensor, value: Tensor, mask: Tensor | None) -> Tensor:
+        """计算缩放点积注意力并按值维度汇总。"""
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(float(query.shape[-1]))
         scores = scores.unsqueeze(-1).repeat_interleave(value.shape[-1], dim=-1)
         if mask is not None:
@@ -519,6 +611,8 @@ class MultiTimeAttention(nn.Module):
 
 
 class MTAN2MultiTimeAttention(nn.Module):
+    """用于特征级 mTAN2 序列的标准掩码多头时间注意力。"""
+
     def __init__(
         self,
         *,
@@ -529,6 +623,7 @@ class MTAN2MultiTimeAttention(nn.Module):
         n_heads: int,
         dropout: float,
     ) -> None:
+        """创建查询、键和输出投影，并校验隐藏宽度可分头。"""
         super().__init__()
         if hidden_dim % n_heads != 0:
             raise ValueError("hidden_dim must be divisible by n_heads.")
@@ -550,6 +645,7 @@ class MTAN2MultiTimeAttention(nn.Module):
         value: Tensor,
         mask: Tensor,
     ) -> Tensor:
+        """在有效键时间上计算多头注意力并投影为隐藏表示。"""
         batch_size, query_length, _embed_dim = query.shape
         key_length = int(key.shape[1])
         query_heads = self.query_projection(query).view(
@@ -586,6 +682,7 @@ class MTAN2MultiTimeAttention(nn.Module):
 
 
 def masked_softmax(scores: Tensor, mask: Tensor) -> Tensor:
+    """在最后一维仅对有效位置执行数值稳定的 softmax。"""
     mask_float = mask.to(dtype=scores.dtype)
     masked_scores = scores.masked_fill(~mask, -1e9)
     shifted = masked_scores - masked_scores.amax(dim=-1, keepdim=True)
@@ -594,6 +691,8 @@ def masked_softmax(scores: Tensor, mask: Tensor) -> Tensor:
 
 
 class RecurrentMappingLayer(nn.Module):
+    """使用 GRU 或 LSTM 映射输入序列并清零补齐位置。"""
+
     def __init__(
         self,
         *,
@@ -603,6 +702,7 @@ class RecurrentMappingLayer(nn.Module):
         n_layers: int,
         dropout: float,
     ) -> None:
+        """创建批次优先的多层循环映射网络。"""
         super().__init__()
         recurrent_dropout = dropout if n_layers > 1 else 0.0
         rnn_cls = nn.GRU if kind == "gru" else nn.LSTM
@@ -615,6 +715,7 @@ class RecurrentMappingLayer(nn.Module):
         )
 
     def forward(self, sequence: Tensor, times: Tensor, sequence_lengths: Tensor) -> Tensor:
+        """映射输入序列；``times`` 仅为统一映射接口保留。"""
         del times
         encoded, _hidden = self.rnn(sequence)
         return encoded * active_sequence_mask(
@@ -626,6 +727,8 @@ class RecurrentMappingLayer(nn.Module):
 
 
 class TransformerMappingLayer(nn.Module):
+    """融合访视时间特征并应用 Transformer Encoder 的序列映射层。"""
+
     def __init__(
         self,
         *,
@@ -635,6 +738,7 @@ class TransformerMappingLayer(nn.Module):
         n_heads: int,
         dropout: float,
     ) -> None:
+        """创建输入/时间投影和多层 Transformer Encoder。"""
         super().__init__()
         self.input_projection = nn.Linear(input_dim, hidden_dim)
         self.time_projection = nn.Linear(4, hidden_dim)
@@ -649,6 +753,7 @@ class TransformerMappingLayer(nn.Module):
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
 
     def forward(self, sequence: Tensor, times: Tensor, sequence_lengths: Tensor) -> Tensor:
+        """编码有效序列位置，并将补齐位置输出清零。"""
         padding_mask = sequence_padding_mask(sequence_lengths, sequence.shape[1], sequence.device)
         tokens = self.input_projection(sequence) + self.time_projection(visit_time_features(times))
         encoded = self.transformer(tokens, src_key_padding_mask=padding_mask)
@@ -661,6 +766,12 @@ class TransformerMappingLayer(nn.Module):
 
 
 class TrailsEncoder(nn.Module):
+    """组合异步输入层、时序映射层和患者级 SeqPool。
+
+    输入层可选 GRU-D、aligned mTAN 或 compact mTAN2；映射层可选 GRU、LSTM
+    或 Transformer。前向传播返回患者级表示及解码可复用的映射时间与长度。
+    """
+
     def __init__(
         self,
         data_config: DataConfig,
@@ -668,6 +779,7 @@ class TrailsEncoder(nn.Module):
         *,
         dropout: float,
     ) -> None:
+        """根据数据维度和编码器配置组装输入、映射与池化组件。"""
         super().__init__()
         self.encoder_config = encoder_config
         if encoder_config.input.kind == "grud":
@@ -714,11 +826,13 @@ class TrailsEncoder(nn.Module):
         self.seq_pool = SequencePool(encoder_config.mapping.hidden_dim)
 
     def set_reference_time_range(self, min_time: float, max_time: float) -> None:
+        """为 mTAN 输入设置参考时间范围；GRU-D 输入不执行操作。"""
         if isinstance(self.input_layer, (MTANInputLayer, MTAN2InputLayer)):
             self.input_layer.set_reference_time_range(min_time, max_time)
 
     @property
     def reference_times(self) -> Tensor | None:
+        """返回 mTAN 参考时间 buffer；GRU-D 输入返回 ``None``。"""
         if isinstance(self.input_layer, (MTANInputLayer, MTAN2InputLayer)):
             return self.input_layer.reference_times
         return None
@@ -733,6 +847,11 @@ class TrailsEncoder(nn.Module):
         sequence_lengths: Tensor | None,
         feature_means: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        """编码 aligned 或 compact 批次并汇总为患者表示。
+
+        GRU-D 要求 ``delta_time`` 和 ``sequence_lengths``；mTAN 变体自行产生
+        参考时间序列。返回患者表示、映射时间和映射序列长度。
+        """
         if self.encoder_config.input.kind == "grud":
             if delta_time is None or sequence_lengths is None:
                 raise ValueError("GRUD encoder requires delta_time and sequence_lengths.")
@@ -756,6 +875,11 @@ class TrailsEncoder(nn.Module):
 
 
 class RecurrentDecoder(nn.Module):
+    """使用 GRU/LSTM 从患者潜变量重建指定时间点的多变量观测。
+
+    潜变量可以投影为循环网络初始状态，也可在每个时间步与时间值拼接。
+    """
+
     def __init__(
         self,
         *,
@@ -764,6 +888,7 @@ class RecurrentDecoder(nn.Module):
         latent_dim: int,
         dropout: float,
     ) -> None:
+        """根据循环架构和条件注入方式创建解码器。"""
         super().__init__()
         self.decoder_config = decoder_config
         recurrent_dropout = dropout if decoder_config.n_layers > 1 else 0.0
@@ -792,6 +917,7 @@ class RecurrentDecoder(nn.Module):
         self.reconstruction_head = nn.Linear(decoder_config.hidden_dim, data_config.n_features)
 
     def forward(self, latent: Tensor, times: Tensor, sequence_lengths: Tensor) -> Tensor:
+        """在给定时间网格上解码并返回全部特征的重建值。"""
         del sequence_lengths
         if self.decoder_config.conditioning == "initial_state":
             decoded = self._decode_with_initial_state(latent, times)
@@ -800,6 +926,7 @@ class RecurrentDecoder(nn.Module):
         return self.reconstruction_head(decoded)
 
     def _decode_with_initial_state(self, latent: Tensor, times: Tensor) -> Tensor:
+        """把潜变量映射为 GRU/LSTM 初始状态后按时间解码。"""
         if self.initial_hidden is None:
             raise RuntimeError("initial hidden layer is required for initial_state decoding.")
         batch_size = latent.shape[0]
@@ -823,6 +950,7 @@ class RecurrentDecoder(nn.Module):
         return decoded
 
     def _decode_with_concat_time(self, latent: Tensor, times: Tensor) -> Tensor:
+        """在每个时间步拼接潜变量与时间后执行循环解码。"""
         repeated_latent = latent.unsqueeze(1).expand(-1, times.shape[1], -1)
         decoder_input = torch.cat([times.unsqueeze(-1), repeated_latent], dim=-1)
         decoded, _state = self.rnn(decoder_input)
@@ -830,6 +958,8 @@ class RecurrentDecoder(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
+    """把重复潜变量与时间拼接后通过 Transformer 重建纵向观测。"""
+
     def __init__(
         self,
         *,
@@ -838,6 +968,7 @@ class TransformerDecoder(nn.Module):
         latent_dim: int,
         dropout: float,
     ) -> None:
+        """创建输入投影、多层 Transformer Encoder 和特征重建头。"""
         super().__init__()
         self.input_projection = nn.Linear(latent_dim + 1, decoder_config.hidden_dim)
         layer = nn.TransformerEncoderLayer(
@@ -852,6 +983,7 @@ class TransformerDecoder(nn.Module):
         self.reconstruction_head = nn.Linear(decoder_config.hidden_dim, data_config.n_features)
 
     def forward(self, latent: Tensor, times: Tensor, sequence_lengths: Tensor) -> Tensor:
+        """在有效时间位置上解码潜变量并返回多特征重建。"""
         repeated_latent = latent.unsqueeze(1).expand(-1, times.shape[1], -1)
         decoder_input = torch.cat([times.unsqueeze(-1), repeated_latent], dim=-1)
         padding_mask = sequence_padding_mask(sequence_lengths, times.shape[1], times.device)
@@ -863,7 +995,15 @@ class TransformerDecoder(nn.Module):
 
 
 class TrailsSurvVaderModel(nn.Module):
+    """联合纵向重建、VaDE 聚类和簇特异 Weibull 生存风险的核心模型。
+
+    编码器把异步纵向序列汇总为患者表示，变分层产生潜变量；高斯混合先验给出
+    后验簇概率，解码器重建纵向输入，生存头为每个簇输出正的 Weibull 形状与
+    尺度参数。损失可使用固定权重或可学习同方差不确定性权重。
+    """
+
     def __init__(self, data_config: DataConfig, model_config: ModelConfig) -> None:
+        """根据数据和模型配置组装编码器、潜空间、解码器、混合先验与生存头。"""
         super().__init__()
         self.data_config = data_config
         self.model_config = model_config
@@ -924,6 +1064,7 @@ class TrailsSurvVaderModel(nn.Module):
                 )
 
     def set_feature_means(self, feature_means: Tensor) -> None:
+        """更新 GRU-D 缺失值衰减使用的各特征训练集均值。"""
         if feature_means.shape != self.feature_means.shape:
             raise ValueError(
                 f"feature_means must have shape {tuple(self.feature_means.shape)}, "
@@ -933,13 +1074,16 @@ class TrailsSurvVaderModel(nn.Module):
 
     @property
     def feature_means(self) -> Tensor:
+        """返回注册为 buffer 的特征均值张量。"""
         return cast(Tensor, self._buffers["_feature_means"])
 
     def set_reference_time_range(self, min_time: float, max_time: float) -> None:
+        """把训练数据观测时间范围传给编码器中的 mTAN 输入层。"""
         self.encoder.set_reference_time_range(min_time, max_time)
 
     @property
     def reference_times(self) -> Tensor | None:
+        """返回 mTAN 参考时间；非 mTAN 输入返回 ``None``。"""
         return self.encoder.reference_times
 
     def set_mixture_parameters(
@@ -948,6 +1092,11 @@ class TrailsSurvVaderModel(nn.Module):
         means: Tensor,
         variances: Tensor,
     ) -> None:
+        """用给定混合比例、均值和对角方差初始化 VaDE 先验。
+
+        输入形状必须分别为 ``(K,)`` 和 ``(K, latent_dim)``；概率与方差在取
+        对数前限制最小值为 ``1e-6``，参数复制过程不记录梯度。
+        """
         expected_prior_shape = (self.model_config.n_clusters,)
         expected_component_shape = (self.model_config.n_clusters, self.model_config.latent_dim)
         if prior_probabilities.shape != expected_prior_shape:
@@ -983,6 +1132,16 @@ class TrailsSurvVaderModel(nn.Module):
         sequence_lengths: Tensor | None = None,
         feature_lengths: Tensor | None = None,
     ) -> TrailsModelOutput:
+        """执行编码、潜变量采样、重建、聚类和生存参数预测。
+
+        aligned 输入提供 ``delta_time`` 与 ``sequence_lengths``；compact mTAN2
+        输入通过 ``feature_lengths`` 标识视图。训练模式使用重参数采样，评价
+        模式直接使用潜空间均值。
+
+        返回：
+            包含重建、潜变量、簇后验和 Weibull 参数的
+            :class:`TrailsModelOutput`。
+        """
         hidden, encoder_times, encoder_sequence_lengths = self.encoder(
             times=times,
             x=x,
@@ -1029,6 +1188,7 @@ class TrailsSurvVaderModel(nn.Module):
         encoder_sequence_lengths: Tensor,
         feature_lengths: Tensor | None,
     ) -> Tensor:
+        """按 aligned 或 compact 输入布局解码并还原重建张量。"""
         if feature_lengths is None:
             if aligned_sequence_lengths is None:
                 raise ValueError("Aligned reconstruction requires sequence_lengths.")
@@ -1060,6 +1220,16 @@ class TrailsSurvVaderModel(nn.Module):
         *,
         include_vade_kl: bool,
     ) -> TrailsLossBreakdown:
+        """计算重建、生存、VaDE KL 及其固定或不确定性加权总损失。
+
+        参数：
+            output: 当前批次模型输出。
+            batch: 含真实纵向值、掩码和生存结局的批次。
+            include_vade_kl: 是否在当前阶段启用 VaDE KL 分量。
+
+        返回：
+            原始损失、有效权重和总损失组成的 :class:`TrailsLossBreakdown`。
+        """
         reconstruction = masked_mse(output.reconstruction, batch["x"], batch["mask"])
         survival = weibull_mixture_negative_log_likelihood(
             output.cluster_logits,
@@ -1096,6 +1266,7 @@ class TrailsSurvVaderModel(nn.Module):
         )
 
     def _sample_latent(self, mean: Tensor, log_variance: Tensor) -> Tensor:
+        """训练时执行重参数采样，评价时直接返回后验均值。"""
         if not self.training:
             return mean
         noise = torch.randn_like(mean)
@@ -1108,6 +1279,7 @@ class TrailsSurvVaderModel(nn.Module):
         survival: Tensor,
         vade_kl: Tensor,
     ) -> TrailsLossBreakdown:
+        """使用配置中的固定权重组合三个损失分量。"""
         config = self.model_config.loss
         reconstruction_weight = reconstruction.new_tensor(config.reconstruction_weight)
         survival_weight = reconstruction.new_tensor(config.survival_weight)
@@ -1135,6 +1307,7 @@ class TrailsSurvVaderModel(nn.Module):
         vade_kl: Tensor,
         include_vade_kl: bool,
     ) -> TrailsLossBreakdown:
+        """使用可学习对数方差组合启用的多任务损失。"""
         # 多任务不确定性加权：s=log(sigma^2)，用可学习噪声自动调节各 loss 贡献。
         reconstruction_term = self._uncertainty_weighted_loss("reconstruction", reconstruction)
         survival_term = self._uncertainty_weighted_loss("survival", survival)
@@ -1159,14 +1332,17 @@ class TrailsSurvVaderModel(nn.Module):
         )
 
     def _uncertainty_weighted_loss(self, name: str, loss: Tensor) -> Tensor:
+        """计算单项同方差不确定性加权损失。"""
         log_variance = self.loss_log_variances[name]
         return 0.5 * torch.exp(-log_variance) * loss + 0.5 * log_variance
 
     def _cluster_logits(self, latent: Tensor) -> Tensor:
+        """计算包含混合比例先验的各簇后验 logits。"""
         log_prior = torch.log_softmax(self.mixture_logits, dim=-1)
         return log_prior.unsqueeze(0) + self._component_log_prob(latent)
 
     def _component_log_prob(self, latent: Tensor) -> Tensor:
+        """计算潜变量在各对角高斯混合分量下的对数密度。"""
         centered = latent.unsqueeze(1) - self.mixture_means.unsqueeze(0)
         log_variance = self.mixture_log_variances.unsqueeze(0)
         variance = torch.exp(log_variance)
@@ -1179,6 +1355,11 @@ class TrailsSurvVaderModel(nn.Module):
 
 
 def build_survival_head(model_config: ModelConfig) -> nn.Sequential:
+    """构建输出每簇 Weibull 形状与尺度原始值的生存头。
+
+    可选隐藏层均保持 ``latent_dim`` 宽度并使用 ReLU，最终输出宽度为
+    ``n_clusters * 2``。
+    """
     layers: list[nn.Module] = []
     for _layer in range(model_config.survival_head_hidden_layers):
         layers.append(nn.Linear(model_config.latent_dim, model_config.latent_dim))

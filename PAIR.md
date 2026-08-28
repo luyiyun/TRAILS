@@ -21,21 +21,23 @@
 
 ## 进行中任务
 
-- [ ] MIMIC 真实数据实例验证：共同制定并执行研究计划
+- [ ] MIMIC 真实数据实例验证：已保存检查点，当前暂停
+- [x] 整理 `src/trails` 文档注释：已完成
+- [x] 重构 K 选择架构：已完成
 
 ### MIMIC 真实数据实例验证
 
 - 目标：验证 TRAILS 相对合理基线的优势，并发现稳定、可解释且有临床意义的轨迹亚型。
-- 当前状态：远端原始特征重提取已完成并通过聚合审计；正式初始 K 选择运行 `mimic-k-initial-20260828-110305` 正在执行并由临时 heartbeat 监控。
+- 当前状态：正式初始 K 选择已完成、聚合结果已验证取回并分析；没有候选 K 通过预设门槛，等待 navigator 决定是否仍按机械扩展规则增加至5 seeds，当前暂停主动推进。
 - 已确认决定：共同讨论研究计划；每批上限 200 行；真实数据和患者级衍生物默认留在远端，仅取回获批聚合结果与图表；主分析采用成人首次 ICU 脓毒症队列、入 ICU 后 0–48 小时轨迹、48 小时 landmark、landmark 后 28 天全因死亡结局；早期 Sepsis-3 使用相对 ICU 入科 `[-6 h, +24 h]`，同时输出完整 Sepsis-3；主分析纳入 48 小时前已转出 ICU 但仍存活者，另以 ICU LOS≥48 小时做敏感性分析；MIMIC 预处理/EDA 脚本默认不写单独测试、不提供 CLI 参数，除非 navigator 另行指定。
 - 当前检查点：94,458 个 ICU stay 中 41,296 个符合 Sepsis-3，37,628 个符合 early Sepsis-3；每名成人取最早 early stay 后为 29,418 人，存活至 48 小时的主队列为 28,133 人，ICU LOS≥48 小时敏感性队列为 18,180 人。
 - 队列规则：复现官方 mimic-code 的疑似感染与滚动 SOFA；基线 SOFA 未知时按 0；同时记录 Sepsis-3 与其早期子集；每人取最早符合早期 Sepsis-3 的 ICU stay；轨迹窗为 ICU 入科后 0–48 小时；仅纳入 landmark 时存活者；主要结局为其后 28 天全因死亡。
-- 下一小批：初始 K 选择终态后，仅取回5个聚合选择文件与有界运行记录；依据 `preliminary_selected_k` 和 `expansion_scope` 决定5-seed扩展范围，不运行 sealed test。
-- 风险或待决定事项：远端现有 `observations.csv` 是旧版全队列标准化结果，正式训练前必须重跑 `mimic_extract_features.py` 生成原始值和 `left_icu_before_48h`；当前独立命令只完成预设3 seeds的初选，并输出下一阶段应只扩展入选K还是扩展全部K，5-seed扩展与medoid锁模尚未实现。随机 test 只能称为内部留出验证，不能称为外部验证。
+- 下一小批：navigator 审查初选结果后，决定是否实现并运行5-seed扩展；在此之前不运行 sealed test，也不提交更多模型。
+- 风险或待决定事项：脚本机械给出 `expansion_scope=all_candidates`，但现有最差占用记录会保留，K=2和K=4因空簇、K=5因最小簇1.44%已不可能通过当前门槛；K=3虽无占用违规，但3-seed平均ARI仅0.325，新增7个seed-pair平均ARI需约0.932才可能达到0.75。需决定继续全部扩展的科研价值，或在不查看sealed test的前提下重新审查稳定性策略。随机test只能称为内部留出验证，不能称为外部验证。
 - 涉及文件：本批新增 `scripts/mimic_select_k.py` 184行和 `configs/mimic_select_k.yaml` 9行；`mimic_case.py` 新增3行并纯删除K选择实现/分支；`AGENTS.md` 新增或修改3行。手写新增/修改共199行，低于200行，`PAIR.md` 不计入。
 - 验证记录：Ruff format/check、Pyright 均通过；完整 pytest 为 `144 passed, 3 warnings`。Hydra配置组合确认独立命令默认启用K=2–5；12模型合成smoke得到12条指标、12条稳定性记录、4条K汇总和12个模型；`mimic_case.py` 会拒绝K选择开关并指向新命令；`git diff --check` 通过。首次smoke仅因验证命令使用了错误的生成器import路径而在产品代码执行前失败，修正验证import后通过。
-- 远端记录：资源运行 `mimic-case-resource-scipy-20260827-202635` 已完成。新运行 `mimic-feature-raw-20260828-110002` 在快照 `fbc1bd82` 上 exit code 0：28,133 人、其中9,953人48小时前离开ICU，9,422,116条原始观测、23变量、0–48小时、无非有限值和重复键、最低覆盖57.83%；仅取回两个聚合文件与有界记录。正式 `mimic-k-initial-20260828-110305` 已以同一快照提交，PID 737357，3 seeds×K=2–5、100–300 epochs、warmup 20、batch 256，患者级输入/模型/标签均留远端。
-- 最近交接：独立 K 选择代码获批后已同步；原始输入重提取通过，正式初始 K 选择已耐久提交并运行中，临时 monitor 每30分钟检查一次且禁止重复提交。
+- 远端记录：资源运行 `mimic-case-resource-scipy-20260827-202635` 已完成。`mimic-feature-raw-20260828-110002` 在快照 `fbc1bd82` 上exit code 0。正式 `mimic-k-initial-20260828-110305` 同快照运行10.97小时后exit code 0，完成3 seeds×K=2–5共12模型；seed winner为4/5/4，所有K均未通过门槛，`preliminary_selected_k=null`、`expansion_scope=all_candidates`，sealed test未评估。仅取回5个聚合文件与有界记录至 `remote-results/mimic-k-initial-20260828-110305/`，患者级输入、模型、标签和分配均留远端。
+- 最近交接：初始K选择终态、聚合完整性、隐私边界和本地复核均已完成；K=3平均C-index 0.659、平均ARI 0.325且无小簇，K=4平均C-index最高为0.672但存在空簇且ARI仅0.140。等待navigator审查是否继续5-seed扩展。
 
 #### 正式建模方案（已确认）
 
@@ -54,4 +56,5 @@
 
 ## 已完成记忆
 
-- 暂无。
+- 2026-08-28：完成 `src/trails` 全部模块和定义的中文 docstring 整理；公共 API 使用详细说明，内部辅助对象使用一句话说明，未改变运行逻辑或公开签名。
+- 2026-08-28：完成 K 选择架构重构；`ClusterNumberSelector`、配置和 DataFrame 结果对象统一承载单/多 seed 选择、稳定性、门槛、one-SE 与保存，`TrailsEstimator` 不再包含选择逻辑，MIMIC `06_select_k.py` 已使用新 API。通用 case/SwanLab 的旧字段迁移属于后续独立整理范围。

@@ -133,7 +133,9 @@ def main() -> None:
         "time_unit": "hours since ICU intime",
         "duplicate_rule": "median within identical patient-time-feature",
         "missing_rule": "no imputation; absence is represented by TRAILS mask",
-        "value_scale": "raw; train-only winsorization and standardization occur in mimic_case.py",
+        "value_scale": (
+            "raw; train-only winsorization and standardization occur in scripts/mimic/07_case.py"
+        ),
     }
     (output_root / "extraction_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
