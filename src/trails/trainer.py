@@ -300,24 +300,6 @@ class TrailsTrainer:
             self.model.load_state_dict(early_stopper.best_state)
         return history
 
-    def predict(self, data: ClinicalTimeSeriesDataset) -> Tensor:
-        """在 CPU 上返回每位患者最大后验概率对应的簇标签。"""
-        data = data.with_return_kind(self._model_return_kind())
-        outputs, _batch = self._collect_outputs(data)
-        return torch.argmax(outputs.cluster_probabilities, dim=-1).cpu()
-
-    def predict_proba(self, data: ClinicalTimeSeriesDataset) -> Tensor:
-        """在 CPU 上返回形状为 ``(n_samples, n_clusters)`` 的簇概率。"""
-        data = data.with_return_kind(self._model_return_kind())
-        outputs, _batch = self._collect_outputs(data)
-        return outputs.cluster_probabilities.cpu()
-
-    def predict_risk(self, data: ClinicalTimeSeriesDataset) -> Tensor:
-        """在 CPU 上返回负后验加权 Weibull 尺度作为生存风险分数。"""
-        data = data.with_return_kind(self._model_return_kind())
-        outputs, _batch = self._collect_outputs(data)
-        return self._risk_score(outputs).cpu()
-
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
         """在完整数据集上计算损失、预测指标和簇占用诊断。
 

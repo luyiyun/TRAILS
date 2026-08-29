@@ -15,6 +15,7 @@ from trails import (
     ModelConfig,
     TrailsConfig,
     TrailsEstimator,
+    TrailsPrediction,
     TrainerConfig,
 )
 from trails.data import make_clinical_sample
@@ -120,13 +121,19 @@ def simulate_dataset(seed: int) -> ClinicalTimeSeriesDataset:
 def test_estimator_fit_predict_test() -> None:
     data = simulate_dataset(seed=13)
     estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data)
-    predictions = estimator.predict(data)
-    probabilities = estimator.predict_proba(data)
+    prediction = estimator.predict(data)
+    predictions = prediction.predict()
+    probabilities = prediction.predict_proba()
+    survival = prediction.survival([0.0, 7.0, 14.0])
     metrics = estimator.test(data)
 
     assert predictions.shape == (8,)
     assert probabilities.shape == (8, 2)
+    assert prediction.risk_score().shape == (8,)
     assert torch.allclose(probabilities.sum(dim=-1), torch.ones(8), atol=1e-5)
+    assert survival.shape == (8, 3)
+    assert torch.allclose(survival[:, 0], torch.ones(8), atol=1e-6)
+    assert bool(((survival[:, :-1] - survival[:, 1:]) >= 0).all())
     assert set(predictions.tolist()) <= {0, 1}
     assert not any(key.startswith("val_") for key in estimator.history[-1])
     assert metrics["loss"] > 0
@@ -148,13 +155,13 @@ def test_mtan_estimator_fit_and_predict(kind: Literal["mtan", "mtan2"]) -> None:
     config = tiny_mtan_config(data.n_features, kind=kind)
     estimator = TrailsEstimator(config).fit(data)
 
-    assert estimator.predict(data).shape == (8,)
+    assert estimator.predict(data).predict().shape == (8,)
 
 
 def test_estimator_latent_diagnostics_exports_labels_and_embeddings() -> None:
     data = simulate_dataset(seed=23)
     estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data)
-    diagnostics = estimator.latent_diagnostics(data)
+    diagnostics = estimator.predict(data).latent_diagnostics()
 
     assert diagnostics["z"].shape == (8, 4)
     assert diagnostics["cluster_probabilities"].shape == (8, 2)
@@ -219,5 +226,9 @@ def test_estimator_save_load(tmp_path: Path) -> None:
     path = tmp_path / "trails.pt"
     estimator.save(path)
     loaded = TrailsEstimator.load(path)
+    prediction_path = tmp_path / "prediction.pt"
+    estimator.predict(data).save(prediction_path)
+    loaded_prediction = TrailsPrediction.load(prediction_path)
 
-    assert torch.equal(estimator.predict(data), loaded.predict(data))
+    assert torch.equal(estimator.predict(data).predict(), loaded.predict(data).predict())
+    assert torch.equal(estimator.predict(data).risk_score(), loaded_prediction.risk_score())

@@ -141,7 +141,8 @@ uv run python scripts/summary.py 'train_roots=[outputs/train/base-...]' 'baselin
 `scripts/train.py`、`scripts/baseline.py` 和 `scripts/optim.py` 都会递归扫描
 `paths.data_root` 下所有 sibling `train.pt`/`test.pt` 目录；也可以用
 `paths.explicit_split.enabled=true` 加 `paths.explicit_split.train_data/test_data`
-显式指定单个 split。命令根配置在 `configs/<command>.yaml`；Hydra 元数据和命令输出保存在
+显式指定单个 split。通用命令根配置在 `configs/<command>.yaml`，MIMIC 命令配置集中在
+`configs/mimic/`；Hydra 元数据和命令输出保存在
 同一个 `paths.dir`，默认由 `paths.root`、`paths.prefix` 和 `paths.suffix` 组合，也可以手动
 覆盖，例如 `paths.dir=outputs/train/my-run`。`paths.data_root` 和 explicit split 默认值由
 train、baseline、optim 各自的根配置直接声明。输入路径（如 `paths.data_root`、summary roots、

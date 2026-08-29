@@ -91,8 +91,10 @@ def test_selector_runs_shared_split_and_selects_across_seeds(
 
     monkeypatch.setattr(selection_module.TrailsEstimator, "fit", fake_fit)
     monkeypatch.setattr(ClusterNumberSelector, "_calculate_candidate_metrics", fake_metrics)
+    prediction = Mock()
+    prediction.predict.return_value = torch.tensor([0, 1, 0])
     monkeypatch.setattr(
-        selection_module.TrailsEstimator, "predict", lambda estimator, data: torch.tensor([0, 1, 0])
+        selection_module.TrailsEstimator, "predict", lambda estimator, data: prediction
     )
     data: Any = Mock()
     data.split.return_value = [data, data]

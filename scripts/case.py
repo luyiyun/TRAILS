@@ -1,57 +1,170 @@
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import hydra
 import swanlab
+import torch
 from omegaconf import DictConfig
 
-from trails.artifacts import resolve_artifact_names, save_json
+from trails.artifacts import (
+    plot_history,
+    resolve_artifact_names,
+    save_history_csv,
+    save_json,
+    save_latent_embedding_artifacts,
+)
 from trails.config import DataConfig, TrailsConfig, resolve_batch_size
 from trails.data import ClinicalTimeSeriesDataset
-from trails.estimator import (
-    KSelectionMetrics,
-    TrailsEstimator,
-    best_selection_metrics,
-    selected_k_from_selection_metrics,
-)
+from trails.estimator import TrailsEstimator
 from trails.progress import configure_tqdm_logging
+from trails.selection import ClusterNumberSelectionResult, ClusterNumberSelector
+from trails.trainer import HistoryEntry
 from trails_case.config import CaseApplicationConfig
-from trails_case.data import case_dataset_summary, patient_summaries_from_metadata
 from trails_case.evaluation import (
+    CasePatientSummary,
     CaseResultTables,
     evaluate_case_predictions,
     json_safe_metrics,
     prediction_payload_from_case_dataset,
     save_prediction_payload,
 )
-from trails_case.outputs import (
-    CaseOutputPaths,
-    compact_log_path,
-    configure_torch_threads,
-    k_selection_payload,
-    output_payload,
-    resolve_input_path,
-    resolve_output_path,
-    save_case_training_artifacts,
-)
 from trails_case.selection import case_k_selection_candidates, case_k_selection_valid_fraction
-from trails_case.summary import format_case_summary
-from trails_case.swanlab import (
-    log_swanlab_case_metrics,
-    log_swanlab_history,
-    start_swanlab_run,
-)
 from trails_simulate.config import resolved_payload
 
 LOGGER = logging.getLogger(__name__)
 
 
+def resolve_input_path(path: Path, base_dir: Path | None = None) -> Path:
+    return path if path.is_absolute() else (base_dir or Path.cwd()) / path
+
+
+def resolve_output_path(path: Path, run_dir: Path) -> Path:
+    return path if path.is_absolute() else run_dir / path
+
+
+@dataclass(frozen=True)
+class CaseOutputPaths:
+    dataset: Path
+    dataset_summary: Path
+    predictions: Path
+    patient_clusters: Path
+    cluster_summary: Path
+    cluster_feature_summary: Path
+    summary: Path
+
+    @classmethod
+    def from_config(cls, config: CaseApplicationConfig) -> CaseOutputPaths:
+        run_dir = config.paths.dir
+        return cls(
+            dataset=resolve_output_path(config.outputs.dataset, run_dir),
+            dataset_summary=resolve_output_path(config.outputs.dataset_summary, run_dir),
+            predictions=resolve_output_path(config.outputs.predictions, run_dir),
+            patient_clusters=resolve_output_path(config.outputs.patient_clusters, run_dir),
+            cluster_summary=resolve_output_path(config.outputs.cluster_summary, run_dir),
+            cluster_feature_summary=resolve_output_path(
+                config.outputs.cluster_feature_summary,
+                run_dir,
+            ),
+            summary=resolve_output_path(config.outputs.summary, run_dir),
+        )
+
+
+def output_payload(
+    outputs: CaseOutputPaths,
+    k_selection_result_dir: Path | None = None,
+) -> dict[str, str]:
+    payload = {
+        "case_summary": str(outputs.summary),
+        "cluster_feature_summary": str(outputs.cluster_feature_summary),
+        "cluster_summary": str(outputs.cluster_summary),
+        "dataset": str(outputs.dataset),
+        "dataset_summary": str(outputs.dataset_summary),
+        "patient_clusters": str(outputs.patient_clusters),
+        "predictions": str(outputs.predictions),
+    }
+    if k_selection_result_dir is not None:
+        payload["k_selection"] = str(k_selection_result_dir)
+    return payload
+
+
+def k_selection_payload(
+    result: ClusterNumberSelectionResult,
+    result_dir: Path | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = result.to_payload()
+    if result_dir is not None:
+        payload["result_dir"] = str(result_dir)
+    return payload
+
+
+def format_case_summary(result: Mapping[str, Any]) -> str:
+    outputs = dict(result["outputs"])
+    data = dict(result["data"])
+    metrics = dict(result["metrics"])
+    lines = [
+        "TRAILS case complete",
+        f"Run dir: {result['run_dir']}",
+        f"Patients: {data['n_patients']}",
+        f"Features: {data['n_features']}",
+        f"Observations: {data['n_observations']}",
+        "",
+        "Saved outputs:",
+        f"  summary: {outputs['case_summary']}",
+        f"  patient clusters: {outputs['patient_clusters']}",
+        f"  cluster summary: {outputs['cluster_summary']}",
+        f"  feature summary: {outputs['cluster_feature_summary']}",
+        f"  model predictions: {outputs['predictions']}",
+        f"  dataset: {outputs['dataset']}",
+    ]
+    metric_parts: list[str] = []
+    for name in (
+        "cindex",
+        "acc",
+        "ari",
+        "nmi",
+        "cluster_empty_count",
+        "cluster_min_fraction",
+        "cluster_max_fraction",
+        "cluster_entropy",
+    ):
+        value = metrics.get(name)
+        if not isinstance(value, int | float):
+            continue
+        number = float(value)
+        if math.isnan(number) or math.isinf(number):
+            formatted = str(number)
+        elif abs(number) >= 1000 or 0 < abs(number) < 0.001:
+            formatted = f"{number:.4e}"
+        else:
+            formatted = f"{number:.4f}"
+        metric_parts.append(f"{name}={formatted}")
+    if metric_parts:
+        lines.extend(["", f"Metrics: {', '.join(metric_parts)}"])
+    return "\n".join(lines)
+
+
+def log_swanlab_history(entry: HistoryEntry) -> None:
+    metrics = {
+        "epoch/global": entry["global_epoch"],
+        "epoch/local": entry["epoch"],
+        **{f"train/{key}": value for key, value in entry["train"].items()},
+    }
+    if "valid" in entry:
+        metrics.update({f"val/{key}": value for key, value in entry["valid"].items()})
+    swanlab.log(metrics, step=entry["global_epoch"])
+
+
 def run(config: CaseApplicationConfig) -> dict[str, Any]:
     # 1. config and output paths
-    configure_torch_threads(config.parallel.torch_threads)
+    if config.parallel.torch_threads is not None:
+        torch.set_num_threads(config.parallel.torch_threads)
     run_dir = config.paths.dir
     run_dir.mkdir(parents=True, exist_ok=True)
     outputs = CaseOutputPaths.from_config(config)
@@ -78,9 +191,50 @@ def run(config: CaseApplicationConfig) -> dict[str, Any]:
         },
     )
     dataset.save(outputs.dataset)
-    dataset_summary = case_dataset_summary(dataset)
+
+    raw_summaries = dataset.metadata.get("patient_summaries", [])
+    if not isinstance(raw_summaries, Sequence) or isinstance(raw_summaries, str | bytes):
+        raise ValueError("dataset metadata patient_summaries must be a sequence.")
+    patient_summaries: list[CasePatientSummary] = []
+    for raw_summary in raw_summaries:
+        if not isinstance(raw_summary, Mapping):
+            raise ValueError("dataset metadata patient_summaries entries must be mappings.")
+        patient_summaries.append(
+            CasePatientSummary(
+                patient_id=str(raw_summary["patient_id"]),
+                sample_index=int(raw_summary["sample_index"]),
+                n_observations=int(raw_summary["n_observations"]),
+                n_visits=int(raw_summary["n_visits"]),
+                first_time=float(raw_summary["first_time"]),
+                last_time=float(raw_summary["last_time"]),
+                missing_fraction=float(raw_summary["missing_fraction"]),
+            )
+        )
+
+    event_count = sum(float(sample.event) for sample in dataset)
+    feature_observation_counts = {
+        feature: int(
+            sum(float(sample.to_aligned().mask[:, index].sum()) for sample in dataset.samples)
+        )
+        for index, feature in enumerate(dataset.feature_names)
+    }
+    dataset_summary = {
+        "censoring_rate": 1.0 - event_count / len(dataset),
+        "description": dataset.description,
+        "event_rate": event_count / len(dataset),
+        "feature_observation_counts": feature_observation_counts,
+        "features": dataset.feature_names,
+        "has_cluster_labels": dataset.has_cluster_labels,
+        "n_features": dataset.n_features,
+        "n_observations": int(sum(summary.n_observations for summary in patient_summaries)),
+        "n_patients": len(dataset),
+        "patient_summaries": [asdict(summary) for summary in patient_summaries],
+        "source": {
+            "observations_csv": dataset.metadata.get("observations_csv"),
+            "patients_csv": dataset.metadata.get("patients_csv"),
+        },
+    }
     save_json(outputs.dataset_summary, dataset_summary)
-    patient_summaries = patient_summaries_from_metadata(dataset.metadata)
 
     # 3. configure TRAILS
     seed = config.trainer.seed
@@ -96,7 +250,7 @@ def run(config: CaseApplicationConfig) -> dict[str, Any]:
         ),
         seed=seed,
     )
-    k_selection_metrics: KSelectionMetrics | None = None
+    k_selection_result: ClusterNumberSelectionResult | None = None
     k_selection_result_dir: Path | None = None
     estimator = TrailsEstimator(trails_config)
     if config.k_selection.enabled:
@@ -104,35 +258,55 @@ def run(config: CaseApplicationConfig) -> dict[str, Any]:
             config.k_selection.result_dir,
             run_dir,
         )
-        k_selection_metrics = estimator.select_n_clusters(
-            dataset,
-            candidate_clusters=case_k_selection_candidates(config),
+        selector = ClusterNumberSelector(
+            case_k_selection_candidates(config),
+            seeds=seed,
             valid_fraction=case_k_selection_valid_fraction(config),
-            inherit_best=True,
-            result_dir=k_selection_result_dir,
+            estimator_config=trails_config,
         )
+        k_selection_result = selector.select(dataset)
+        k_selection_result.save(k_selection_result_dir)
+        if k_selection_result.selected_k is None:
+            raise RuntimeError("No candidate K passed the configured selection gates.")
+        estimator = k_selection_result.selected_estimators[seed]
         trails_config = estimator.config
-        selected_k = selected_k_from_selection_metrics(k_selection_metrics)
-        best_metrics = best_selection_metrics(k_selection_metrics)
+        best_metrics = k_selection_result.run_metrics.loc[
+            k_selection_result.run_metrics["n_clusters"] == k_selection_result.selected_k
+        ].iloc[0]
         LOGGER.info(
             "Selected case K=%s score=%.4g cindex=%.4g bic=%.4g",
-            selected_k,
+            k_selection_result.selected_k,
             best_metrics["selection_score"],
             best_metrics["cindex"],
             best_metrics["bic"],
         )
 
     # 4. train and predict
-    start_swanlab_run(
-        config.swanlab,
-        trails_config,
-        config,
-        outputs,
-        artifacts,
-        config.diagnostics,
-        k_selection_metrics=k_selection_metrics,
-        k_selection_result_dir=k_selection_result_dir,
-    )
+    if config.swanlab.enabled:
+        experiment_name = config.swanlab.experiment or datetime.now().astimezone().strftime(
+            "trails-case-%Y%m%d-%H%M%S"
+        )
+        init_kwargs: dict[str, Any] = {
+            "project": config.swanlab.project,
+            "experiment_name": experiment_name,
+            "config": {
+                "case": config.model_dump(mode="json"),
+                "config": trails_config.model_dump(mode="json"),
+                "diagnostics": config.diagnostics.model_dump(mode="json"),
+                "outputs": output_payload(outputs, k_selection_result_dir),
+                "save_artifacts": sorted(artifacts),
+                "swanlab": config.swanlab.model_dump(mode="json"),
+            },
+        }
+        if k_selection_result is not None:
+            init_kwargs["config"]["k_selection"] = k_selection_payload(
+                k_selection_result,
+                k_selection_result_dir,
+            )
+        if config.swanlab.mode is not None:
+            init_kwargs["mode"] = config.swanlab.mode
+        swanlab.init(**init_kwargs)
+
     try:
         if config.k_selection.enabled:
             if config.swanlab.enabled:
@@ -143,35 +317,103 @@ def run(config: CaseApplicationConfig) -> dict[str, Any]:
                 dataset,
                 history_callback=log_swanlab_history if config.swanlab.enabled else None,
             )
+        model_prediction = estimator.predict(dataset)
         prediction = prediction_payload_from_case_dataset(
             dataset,
             patient_ids=list(dataset.metadata["patient_ids"]),
-            pred_cluster=estimator.predict(dataset),
-            risk_score=estimator.predict_risk(dataset),
-            cluster_probabilities=estimator.predict_proba(dataset),
+            pred_cluster=model_prediction.predict(),
+            risk_score=model_prediction.risk_score(),
+            cluster_probabilities=model_prediction.predict_proba(),
         )
-        metrics = evaluate_case_predictions(
-            prediction,
-            n_clusters=trails_config.model.n_clusters,
-        )
+        metrics = evaluate_case_predictions(dataset, model_prediction)
         if config.swanlab.enabled:
-            log_swanlab_case_metrics(metrics, estimator.history, k_selection_metrics)
+            step = int(float(estimator.history[-1]["global_epoch"])) if estimator.history else 0
+            swanlab_metrics: dict[str, float | int] = {
+                f"case/{name}": value for name, value in metrics.items()
+            }
+            if k_selection_result is not None:
+                if k_selection_result.selected_k is None:
+                    raise ValueError("Cannot log K selection metrics without a selected K.")
+                selected_k = k_selection_result.selected_k
+                selected = k_selection_result.run_metrics.loc[
+                    k_selection_result.run_metrics["n_clusters"] == selected_k
+                ]
+                swanlab_metrics.update(
+                    {
+                        "selection/selected_k": selected_k,
+                        "selection/best_cindex": float(selected["cindex"].mean()),
+                        "selection/best_bic": float(selected["bic"].mean()),
+                        "selection/best_score": float(selected["selection_score"].mean()),
+                    }
+                )
+            swanlab.log(swanlab_metrics, step=step)
     finally:
         if config.swanlab.enabled:
             swanlab.finish()
 
     # 5. save artifacts and prediction tables
-    save_case_training_artifacts(
-        config=config,
-        trails_config=trails_config,
-        estimator=estimator,
-        dataset=dataset,
-        metrics=metrics,
-        outputs=outputs,
-        artifacts=artifacts,
-        k_selection_metrics=k_selection_metrics,
-        k_selection_result_dir=k_selection_result_dir,
-    )
+    should_save_diagnostics = config.diagnostics.latent_embeddings.enabled
+    if artifacts or should_save_diagnostics:
+        artifact_run_dir = outputs.summary.parent
+        if "config" in artifacts:
+            run_config: dict[str, Any] = {
+                "artifacts": sorted(artifacts),
+                "case": config.model_dump(mode="json"),
+                "config": trails_config.model_dump(mode="json"),
+                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "diagnostics": config.diagnostics.model_dump(mode="json"),
+                "outputs": output_payload(outputs, k_selection_result_dir),
+                "swanlab": config.swanlab.model_dump(mode="json"),
+                "train_args": {
+                    "batch_size": trails_config.trainer.batch_size,
+                    "clusters": trails_config.model.n_clusters,
+                    "decoder_conditioning": trails_config.model.decoder.conditioning,
+                    "decoder_hidden_dim": trails_config.model.decoder.hidden_dim,
+                    "decoder_kind": trails_config.model.decoder.kind,
+                    "decoder_n_layers": trails_config.model.decoder.n_layers,
+                    "dropout": trails_config.model.dropout,
+                    "encoder_input_hidden_dim": trails_config.model.encoder.input.hidden_dim,
+                    "encoder_input_kind": trails_config.model.encoder.input.kind,
+                    "encoder_mapping_hidden_dim": trails_config.model.encoder.mapping.hidden_dim,
+                    "encoder_mapping_kind": trails_config.model.encoder.mapping.kind,
+                    "encoder_mapping_n_layers": trails_config.model.encoder.mapping.n_layers,
+                    "epochs": trails_config.trainer.max_epochs,
+                    "latent_dim": trails_config.model.latent_dim,
+                    "learning_rate": trails_config.trainer.learning_rate,
+                    "loss_cluster_weight": trails_config.model.loss.cluster_weight,
+                    "loss_reconstruction_weight": trails_config.model.loss.reconstruction_weight,
+                    "loss_survival_weight": trails_config.model.loss.survival_weight,
+                    "loss_weighting": trails_config.model.loss.weighting,
+                    "seed": trails_config.seed,
+                    "survival_head_hidden_layers": (
+                        trails_config.model.survival_head_hidden_layers
+                    ),
+                    "warmup_epochs": trails_config.trainer.warmup_epochs,
+                },
+            }
+            if k_selection_result is not None:
+                run_config["k_selection"] = k_selection_payload(
+                    k_selection_result,
+                    k_selection_result_dir,
+                )
+            save_json(artifact_run_dir / "config.json", run_config)
+        if "history" in artifacts:
+            save_json(artifact_run_dir / "history.json", estimator.history)
+            save_history_csv(artifact_run_dir / "history.csv", estimator.history)
+        if "test" in artifacts:
+            save_json(artifact_run_dir / "case_metrics.json", json_safe_metrics(metrics))
+        if "model" in artifacts:
+            estimator.save(artifact_run_dir / "model.pt")
+        if "plot" in artifacts:
+            plot_history(artifact_run_dir / "history.png", estimator.history)
+        if should_save_diagnostics:
+            diagnostics = model_prediction.latent_diagnostics()
+            save_latent_embedding_artifacts(
+                artifact_run_dir,
+                "case",
+                diagnostics,
+                random_state=trails_config.seed,
+            )
     if config.artifacts.save is not None:
         estimator.save(resolve_output_path(config.artifacts.save, run_dir))
 
@@ -207,15 +449,21 @@ def run(config: CaseApplicationConfig) -> dict[str, Any]:
             "trails_config": trails_config.model_dump(mode="json"),
         },
     }
-    if k_selection_metrics is not None:
-        summary["k_selection"] = k_selection_payload(k_selection_metrics, k_selection_result_dir)
+    if k_selection_result is not None:
+        summary["k_selection"] = k_selection_payload(k_selection_result, k_selection_result_dir)
     save_json(outputs.summary, summary)
+    path_parts = outputs.patient_clusters.parts
+    prediction_log_path = (
+        str(outputs.patient_clusters)
+        if len(path_parts) <= 4
+        else str(Path("...").joinpath(*path_parts[-4:]))
+    )
     LOGGER.info(
         "Completed case run: patients=%s features=%s k=%s prediction=%s",
         len(dataset),
         dataset.n_features,
         trails_config.model.n_clusters,
-        compact_log_path(outputs.patient_clusters),
+        prediction_log_path,
     )
     return summary
 

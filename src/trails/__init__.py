@@ -24,6 +24,7 @@ from .data import (
     clinical_collate_fn,
 )
 from .estimator import TrailsEstimator
+from .prediction import TrailsPrediction
 from .selection import ClusterNumberSelectionResult, ClusterNumberSelector
 
 __all__ = [
@@ -43,6 +44,7 @@ __all__ = [
     "TrailsConfig",
     "TrainerConfig",
     "TrailsEstimator",
+    "TrailsPrediction",
     "clinical_collate_fn",
     "resolve_batch_size",
 ]

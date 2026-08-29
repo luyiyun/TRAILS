@@ -13,11 +13,13 @@ items.
 
 ## Layout
 
-- `scripts/`: one Hydra CLI script per command. Use `uv run python scripts/<command>.py ...`.
+- `scripts/`: one Hydra CLI entrypoint per command. Top-level commands use
+  `uv run python scripts/<command>.py ...`; numbered MIMIC commands use
+  `uv run python -m scripts.mimic.<numbered_command> ...`.
 - `configs/`: Hydra command roots plus shared simulation, training, baseline, optimization, summary, and case configuration.
 - `src/trails/`: reusable core code: data, model, trainer, estimator, metrics.
 - `src/trails_simulate/`: synthetic clinical data generation; imports `trails`.
-- `src/trails_case/`: real-data/case-study utilities; imports `trails` plus
+- `src/trails_case/`: shared generic case-study utilities; imports `trails` plus
   shared command config models from `trails_simulate.config`.
 - `tests/`: tests for the user-facing API exported from `src/trails/__init__.py`.
 
@@ -28,6 +30,7 @@ Allowed dependencies:
 - `scripts/* -> trails`
 - `scripts/* -> trails_simulate`
 - `scripts/* -> trails_case`
+- `scripts.mimic command modules -> scripts.mimic` non-command support modules
 - `trails_simulate -> trails`
 - `trails_case -> trails`
 - `trails_case -> trails_simulate.config` for shared command config models only
@@ -38,6 +41,7 @@ Forbidden dependencies:
 - `trails -> trails_case`
 - `trails -> scripts`
 - `trails_case -> trails_simulate` runtime modules outside `trails_simulate.config`
+- MIMIC command modules importing another numbered command module
 
 Keep command orchestration out of `src/trails`; the main package should remain a
 clean reusable method library.
@@ -49,6 +53,9 @@ clean reusable method library.
 - Train existing splits: `uv run python scripts/train.py training=base paths.data_root=data/simulated/base`
 - Train with mTAN-style input: `uv run python scripts/train.py training=mtan paths.data_root=data/simulated/base`
 - Run real-data case modeling: `uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv`
+- Generate MIMIC patient splits: `uv run python -m scripts.mimic.06_split`
+- Run fixed-K MIMIC modeling: `uv run python -m scripts.mimic.07_run`
+- Evaluate frozen MIMIC test predictions: `uv run python -m scripts.mimic.08_evaluate input_dir=outputs/mimic_case/<run>`
 - Run lightweight baselines on existing splits: `uv run python scripts/baseline.py paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run python scripts/optim.py paths.data_root=data/simulated/base`
 - Summarize train and baseline results: `uv run python scripts/summary.py 'train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'baseline_roots=[outputs/baseline/base-...]' 'train_labels=[base,mtan]' 'baseline_labels=[kmeans]'`
@@ -91,9 +98,10 @@ clean reusable method library.
 
 - Package name: `trails`.
 - CLI lives in command-specific Hydra scripts under `scripts/`; no package console script is configured.
-- Each command script has its own root config at `configs/<command>.yaml`.
-  `scripts/simulate.py` generates train/test split simulation data. Training and
-  baseline comparison are separate scripts.
+- Non-MIMIC command scripts use root configs at `configs/<command>.yaml`; Hydra
+  configs for `scripts/mimic/` live under `configs/mimic/`. `scripts/simulate.py`
+  generates train/test split simulation data, while training and baseline
+  comparison are separate scripts.
 - Simulation scenarios live under `configs/simulation/`: `quick`, `base`,
   `imbalance`, `censored`, and `high_dimension`. `quick` is for smoke tests;
   the other four are paper simulation scenes.
@@ -103,8 +111,8 @@ clean reusable method library.
 - `trainer.batch_size: null` means the trainer resolves batch size from
   the loaded training split size using a conservative automatic rule; explicit
   integer overrides keep their exact value.
-- Command-level root configs live at `configs/<command>.yaml` and compose only the
-  fields needed by that script. Simulation, baseline, summary, case, and training
+- Command-level root configs compose only the fields needed by their script and
+  follow the config locations above. Simulation, baseline, summary, case, and training
   fields are flattened into the command root after preset composition; `paths`
   remains the shared path namespace, and `optim` intentionally keeps its
   `optim.*` namespace. Generator parameters live under `generator`, while TRAILS
@@ -174,6 +182,10 @@ clean reusable method library.
   number of latent-width hidden layers before the Weibull output.
 - Validation and test metrics include ACC/ARI/NMI only when true cluster labels are
   available; test metrics also report predicted-cluster occupancy diagnostics.
+- `TrailsEstimator.predict()` performs one forward pass and returns a
+  `TrailsPrediction`. Its ordinary methods `predict()`, `predict_proba()`,
+  `risk_score()`, and `survival()` derive cluster labels, posterior probabilities,
+  risk scores, and survival curves from the saved latent and Weibull mixture parameters.
 - Train and baseline commands recursively discover all sibling `train.pt`/`test.pt`
   directories under `paths.data_root`, infer K from dataset metadata when present,
   and save unified prediction payloads under mirrored run directories plus
@@ -215,12 +227,42 @@ clean reusable method library.
   only for internal early stopping, and saves the converted dataset, model,
   history, predictions, patient-level clusters, cluster summaries, feature
   summaries, and `case_summary.json` under `paths.dir`.
-- MIMIC-specific command entrypoints share the fixed stratified split and train-only
-  longitudinal feature transformation implemented in `trails_case.mimic`; command
-  scripts do not import one another.
-- `scripts/mimic/01_build_sepsis.py` through `07_case.py` form the ordered MIMIC
-  analysis workflow. `06_select_k.py` runs multi-seed K selection, while
-  `07_case.py` is reserved for locked final-model evaluation.
+- MIMIC-specific command entrypoints consume the ID-only external split and share
+  the train-only longitudinal feature transformation implemented in
+  `scripts.mimic.data`; command modules import only non-command support modules
+  from the workflow package and do not import one another.
+- MIMIC patient inputs and each frozen split preserve baseline `age`, `gender`,
+  `race`, and sepsis-onset `sofa_score` covariates for adjusted descriptive Cox
+  analysis; these variables are not added to the longitudinal clustering inputs.
+- `scripts/mimic/01_build_sepsis.py` through `07_run.py` form the current ordered
+  MIMIC analysis workflow. `06_split.py` saves ID-only train/validation/test
+  partitions, and `07_run.py` trains on one fixed-K split and exports per-split
+  datasets, complete `TrailsPrediction` objects, patient-level tables, metrics,
+  the model, preprocessing parameters, history, and a run manifest. Their Hydra
+  command configs live under `configs/mimic/`.
+  K selection is currently excluded as unfinished.
+- `scripts/mimic/08_evaluate.py` evaluates the saved validation and test
+  predictions separately, always estimates censoring from train, and writes
+  split-specific artifacts under `evaluation/validation/` and `evaluation/test/`.
+  It consumes each frozen split's `dataset.pt` and `model_prediction.pt` without
+  retraining or a case-specific payload, and reports Harrell and IPCW C-index,
+  cumulative/dynamic AUC, daily Brier scores and IBS, quantile-group Kaplan-Meier
+  calibration, global log-rank, and cluster-level survival summaries. Its local
+  `SurvivalCalibration` class owns calibration calculation and plotting; each
+  evaluated split saves calibration panels, predicted-cluster Kaplan-Meier curves,
+  and a dynamic-AUC/Brier/calibration-error time-metrics panel as PNG/PDF.
+- `AdjustedCoxAnalysis` uses the train split's lowest-mean-risk cluster as the
+  shared validation/test reference and reports cluster hazard ratios adjusted for
+  age, gender, grouped race, and sepsis-onset SOFA with lifelines' default Efron
+  ties handling; forest plots show only the adjusted cluster effects. Each split
+  also saves a descriptive clinical-characteristics table with Overall and every
+  configured cluster column; it reports age as mean (SD), SOFA as median [IQR],
+  and gender, grouped race, and numeric missingness as n (%) without hypothesis
+  tests. `ClusterTrajectoryAnalysis` restores longitudinal values to clinical
+  units using the train-fitted preprocessing parameters, bins the 0–48 hour
+  window at configurable four-hour intervals, first takes each patient's median
+  within a feature-bin, and then saves cluster median/IQR tables and PNG/PDF
+  trajectory panels for validation and test.
 - In generic `scripts/case.py`, `k_selection.enabled=true` runs estimator-level holdout K selection before
   final case training. Empty `k_selection.candidate_clusters` means
   `2..model.n_clusters`; candidates are scored by validation C-index and

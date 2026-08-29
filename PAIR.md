@@ -21,23 +21,41 @@
 
 ## 进行中任务
 
-- [ ] MIMIC 真实数据实例验证：已保存检查点，当前暂停
+- [ ] MIMIC 真实数据实例验证：纵向轨迹第十七批待审查
 - [x] 整理 `src/trails` 文档注释：已完成
 - [x] 重构 K 选择架构：已完成
 
 ### MIMIC 真实数据实例验证
 
 - 目标：验证 TRAILS 相对合理基线的优势，并发现稳定、可解释且有临床意义的轨迹亚型。
-- 当前状态：正式初始 K 选择已完成、聚合结果已验证取回并分析；没有候选 K 通过预设门槛，等待 navigator 决定是否仍按机械扩展规则增加至5 seeds，当前暂停主动推进。
-- 已确认决定：共同讨论研究计划；每批上限 200 行；真实数据和患者级衍生物默认留在远端，仅取回获批聚合结果与图表；主分析采用成人首次 ICU 脓毒症队列、入 ICU 后 0–48 小时轨迹、48 小时 landmark、landmark 后 28 天全因死亡结局；早期 Sepsis-3 使用相对 ICU 入科 `[-6 h, +24 h]`，同时输出完整 Sepsis-3；主分析纳入 48 小时前已转出 ICU 但仍存活者，另以 ICU LOS≥48 小时做敏感性分析；MIMIC 预处理/EDA 脚本默认不写单独测试、不提供 CLI 参数，除非 navigator 另行指定。
+- 当前状态：初始 K 选择未产生有效结论；navigator 已决定暂缓 K 选择，先固定 K 跑通数据划分、训练/完整推理和后续正式评价流水线。
+- 已确认决定：共同讨论研究计划；每批上限 200 行；真实数据和患者级衍生物默认留在远端，仅取回获批聚合结果与图表；主分析采用成人首次 ICU 脓毒症队列、入 ICU 后 0–48 小时轨迹、48 小时 landmark 和之后 28 天全因死亡；按 `28天事件 × 48小时前离开ICU` 分层生成默认 64%/16%/20% 的 train/validation/test ID，split seeds、比例和路径均可通过 Hydra 调整，ID 文件只记录 `patient_id`；MIMIC Hydra 配置集中到 `configs/mimic/`；统一 `07_run.py` 使用 train 训练、validation 早停并直接保存 train/validation/test 的完整预测与模型产物，不区分 pilot/final；正式评价由后续脚本完成；K 选择脚本移出编号序列并标记未完成，待完整分析后再插入并统一重编号；保留现有数字编号文件名，将 `scripts/mimic` 作为工作流包通过 `python -m` 执行，单次使用逻辑留在入口脚本、MIMIC内部复用逻辑留在同目录普通模块、跨工作流复用才保留在`src/`。
 - 当前检查点：94,458 个 ICU stay 中 41,296 个符合 Sepsis-3，37,628 个符合 early Sepsis-3；每名成人取最早 early stay 后为 29,418 人，存活至 48 小时的主队列为 28,133 人，ICU LOS≥48 小时敏感性队列为 18,180 人。
 - 队列规则：复现官方 mimic-code 的疑似感染与滚动 SOFA；基线 SOFA 未知时按 0；同时记录 Sepsis-3 与其早期子集；每人取最早符合早期 Sepsis-3 的 ICU stay；轨迹窗为 ICU 入科后 0–48 小时；仅纳入 landmark 时存活者；主要结局为其后 28 天全因死亡。
-- 下一小批：navigator 审查初选结果后，决定是否实现并运行5-seed扩展；在此之前不运行 sealed test，也不提交更多模型。
-- 风险或待决定事项：脚本机械给出 `expansion_scope=all_candidates`，但现有最差占用记录会保留，K=2和K=4因空簇、K=5因最小簇1.44%已不可能通过当前门槛；K=3虽无占用违规，但3-seed平均ARI仅0.325，新增7个seed-pair平均ARI需约0.932才可能达到0.75。需决定继续全部扩展的科研价值，或在不查看sealed test的前提下重新审查稳定性策略。随机test只能称为内部留出验证，不能称为外部验证。
-- 涉及文件：本批新增 `scripts/mimic_select_k.py` 184行和 `configs/mimic_select_k.yaml` 9行；`mimic_case.py` 新增3行并纯删除K选择实现/分支；`AGENTS.md` 新增或修改3行。手写新增/修改共199行，低于200行，`PAIR.md` 不计入。
-- 验证记录：Ruff format/check、Pyright 均通过；完整 pytest 为 `144 passed, 3 warnings`。Hydra配置组合确认独立命令默认启用K=2–5；12模型合成smoke得到12条指标、12条稳定性记录、4条K汇总和12个模型；`mimic_case.py` 会拒绝K选择开关并指向新命令；`git diff --check` 通过。首次smoke仅因验证命令使用了错误的生成器import路径而在产品代码执行前失败，修正验证import后通过。
+- 下一小批：navigator确认第十七批后冻结`08_evaluate.py`，随后按已定方向转入固定K、固定seed的`07_run.py`训练效率与可接受结果探索，不继续扩张08范围。
+- 风险或待决定事项：MIMIC编号命令现在统一要求从项目根目录使用`python -m scripts.mimic.<编号命令>`，不能再把带相对导入的`07_run.py`作为文件路径直接执行；`configs/mimic/run.yaml`仍沿用原有1 epoch流程检查默认值。多个split seeds与model seeds必须保持独立，随机test只能称为内部留出验证。
+- 暂缓整理：`CaseResultTables`当前只在`scripts/case.py`中直接使用，负责生成患者簇、簇汇总和簇特征汇总三类表；其未使用包装函数和`CasePredictionPayload`依赖等待后续专门整理`scripts/case.py`时一并处理，本批不改动该类。
+- 涉及文件：本批新增`src/trails/prediction.py`，修改`src/trails/{__init__,estimator,trainer,selection}.py`、`src/trails_simulate/training.py`、`scripts/{case,mimic/07_run}.py`及两个公共API测试文件，共173行新增/修改低于200行上限；`AGENTS.md`与`PAIR.md`记录不计入。
+- 涉及文件：本批修改`src/trails_case/evaluation.py`、`scripts/case.py`、`scripts/mimic/07_run.py`和`scripts/mimic/08_evaluate.py`，共58行新增/修改及对无人调用包装函数的纯删除，低于200行上限；`AGENTS.md`与`PAIR.md`记录不计入。
+- 验证记录：Ruff format/check、Pyright均通过；完整pytest为`41 passed, 1 warning`；60例train/30例test三簇合成端到端smoke仅保存`dataset.pt + model_prediction.pt`即完成Harrell/IPCW C-index、7/14/21天动AUC、log-rank和簇汇总，确认不需要`predictions.pt`；`git diff --check`通过。
+- 涉及文件：本批修改`scripts/mimic/08_evaluate.py`、`scripts/mimic/config.py`和`configs/mimic/evaluate.yaml`，共92行新增/修改低于200行上限；`AGENTS.md`与`PAIR.md`记录不计入。
+- 验证记录：Ruff format/check、Pyright均通过；完整pytest为`41 passed, 1 warning`；120例train/60例test合成删失数据smoke确认动态AUC仅为7/14/21天，Brier、IBS和加权校准误差完整覆盖1–27天，`calibration.csv`每天均覆盖全60人；完全相同预测的单组回退亦已验证；`git diff --check`通过。初次Pyright遇到NumPy/pandas/KM第三方存根歧义，规范输入类型后已从Ruff开始重跑全套检查；字段拆分修订后再次重跑全套。
+- 涉及文件：本批修改`scripts/mimic/08_evaluate.py`，共95行新增/修改低于200行上限；`AGENTS.md`与`PAIR.md`记录不计入。评价流程同时读取train/validation/test，validation和test均以train估计删失分布并分别输出；当前分位数组KM校准保留基于`scikit-survival`的实现，未引入需要lifelines拟合器且方法定义不同的平滑校准接口。
+- 验证记录：Ruff format/check、Pyright均通过；完整pytest为`41 passed, 1 warning`；72例train、48例validation、54例test的三簇合成smoke确认两套评价目录、标签、train删失参考、1–27天Brier与校准产物均完整生成；`git diff --check`通过。
+- 涉及文件：本批仅修改`scripts/mimic/08_evaluate.py`，共136行新增/修改低于200行上限；新增脚本内部`SurvivalCalibration`类，`calculate()`缓存完整1–27天分组KM表和加权绝对误差，`plot()`复用缓存并为validation/test分别保存7/14/21天PNG/PDF校准面板。
+- 验证记录：Ruff format/check、Pyright均通过；完整pytest为`41 passed, 1 warning`；72例train、48例validation、54例test端到端smoke确认两套PNG/PDF及JSON路径均生成，validation PNG已完成视觉检查；`git diff --check`通过。
+- 涉及文件：本批仅修改`scripts/mimic/08_evaluate.py`，新增76行低于200行上限；validation/test分别新增预测簇KM图及动态AUC、逐日Brier、逐日分组校准误差三面板图，PNG/PDF路径均写入评价JSON，未改变既有指标计算。
+- 验证记录：使用`MPLCONFIGDIR=/tmp/mpl`完成Ruff format/check、Pyright和完整pytest，结果为`41 passed, 1 warning`；72例train、48例validation、54例test端到端smoke确认两套新增PNG/PDF及JSON路径，validation的KM图和时间指标图已完成视觉检查；`git diff --check`通过。
+- 涉及文件：本批修改`scripts/mimic/04_extract_features.py`、`scripts/mimic/data.py`和`scripts/mimic/07_run.py`，共28行新增/修改低于200行上限；age、gender、race和脓毒症识别时sofa_score进入patients.csv、split dataset元数据及patient_outputs.csv，但不进入聚类特征。
+- 验证记录：使用`MPLCONFIGDIR=/tmp/mpl`完成Ruff format/check、Pyright和完整pytest，结果为`41 passed, 1 warning`；14例患者的临时CSV→三split dataset→07患者输出smoke确认四项协变量的字段、患者顺序和值完整保持；`git diff --check`通过。
+- 涉及文件：本批修改`scripts/mimic/08_evaluate.py`和`pyproject.toml`，共192行手写新增/修改低于200行上限；`uv.lock`为工具生成。新增lifelines 0.30依赖、`AdjustedCoxAnalysis`、train低风险统一参考簇、validation/test独立调整Cox表/JSON及森林图；数值缺失采用透明complete-case计数，种族合并为五组。
+- 验证记录：使用`MPLCONFIGDIR=/tmp/mpl`完成Ruff format/check、Pyright和完整pytest，最终结果为`41 passed, 1 warning`；Pyright首次暴露pandas存根歧义后改用显式Series/NumPy并全量重跑。600例独立Cox探针及360例train、300例validation、300例test端到端smoke通过；第一次周期性smoke人工制造完全共线后改为独立随机协变量，最终两套参考簇、HR/CI表和PNG/PDF均验证，森林图已视觉检查；`git diff --check`通过。
+- 涉及文件：本批仅修改`scripts/mimic/08_evaluate.py`，共135行手写新增/修改低于200行上限；新增`ClusterClinicalCharacteristics`，为validation/test分别保存Overall及每个配置簇的13行临床特征宽表；年龄为mean (SD)，SOFA为median [IQR]，性别、五类种族和数值缺失为n (%)，保留空簇列且不做p值检验。
+- 验证记录：仅对本批脚本执行Ruff format/check以避开未审查的K-selection工作树变更，Pyright和完整pytest均按全项目运行，结果为`41 passed, 1 warning`；360例train、300例validation、300例test端到端smoke确认两套13行描述表和JSON索引，独立空簇探针确认空簇列及单患者SD边界；`git diff --check`通过。
+- 涉及文件：本批修改`scripts/mimic/08_evaluate.py`、`scripts/mimic/config.py`和`configs/mimic/evaluate.yaml`，共175行手写新增/修改低于200行上限，另有5行纯删除；新增`ClusterTrajectoryAnalysis`和可调4小时时间箱，validation/test分别保存完整变量-时间箱-配置簇网格的患者层median/IQR、患者数、观测数及PNG/PDF面板，数值按训练预处理参数还原到截尾后的临床单位。
+- 验证记录：仅对本批Python文件执行Ruff format/check，Pyright和完整pytest按全项目运行，最终为`41 passed, 1 warning`；Pyright首次发现pandas quantile存根歧义，改用NumPy分位点后从格式化起全量重跑。360例train、300例validation、300例test端到端smoke确认两套CSV/PNG/PDF和JSON索引，独立核算确认临床单位逆变换、患者层聚合及人数/观测数，23变量合成探针确认828行完整网格并完成图形视觉检查；`git diff --check`通过。
+- 最近交接：第十六批已获navigator审查通过并进入暂存区；第十七批纵向轨迹已完成。driver判断`08_evaluate.py`已达到当前固定模型评价范围的完成标准，请navigator审查并确认。
 - 远端记录：资源运行 `mimic-case-resource-scipy-20260827-202635` 已完成。`mimic-feature-raw-20260828-110002` 在快照 `fbc1bd82` 上exit code 0。正式 `mimic-k-initial-20260828-110305` 同快照运行10.97小时后exit code 0，完成3 seeds×K=2–5共12模型；seed winner为4/5/4，所有K均未通过门槛，`preliminary_selected_k=null`、`expansion_scope=all_candidates`，sealed test未评估。仅取回5个聚合文件与有界记录至 `remote-results/mimic-k-initial-20260828-110305/`，患者级输入、模型、标签和分配均留远端。
-- 最近交接：初始K选择终态、聚合完整性、隐私边界和本地复核均已完成；K=3平均C-index 0.659、平均ARI 0.325且无小簇，K=4平均C-index最高为0.672但存在空簇且ARI仅0.140。等待navigator审查是否继续5-seed扩展。
 
 #### 正式建模方案（已确认）
 

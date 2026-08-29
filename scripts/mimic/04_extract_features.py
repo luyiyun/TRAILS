@@ -52,7 +52,7 @@ def main() -> None:
         raise ValueError(f"DuckDB 缺少必要表：{missing}")
 
     patients = connection.execute(
-        "SELECT stay_id AS patient_id, survival_time, event, "
+        "SELECT stay_id AS patient_id, age, gender, race, sofa_score, survival_time, event, "
         "CAST(outtime < landmark_time AS INTEGER) AS left_icu_before_48h "
         "FROM trails_cohort_primary ORDER BY stay_id"
     ).df()
@@ -99,7 +99,6 @@ def main() -> None:
     expected_patients = set(patients["patient_id"].unique())
     if observed_patients != expected_patients:
         raise ValueError(f"有 {len(expected_patients - observed_patients)} 名患者没有任何观测")
-
     grouped = observations.groupby("feature", sort=False)["value"]
     feature_summary = grouped.agg(n_observations="size").reset_index()
     patient_counts = observations.groupby("feature")["patient_id"].nunique()
@@ -134,7 +133,7 @@ def main() -> None:
         "duplicate_rule": "median within identical patient-time-feature",
         "missing_rule": "no imputation; absence is represented by TRAILS mask",
         "value_scale": (
-            "raw; train-only winsorization and standardization occur in scripts/mimic/07_case.py"
+            "raw; train-only winsorization and standardization occur in scripts/mimic/07_run.py"
         ),
     }
     (output_root / "extraction_summary.json").write_text(

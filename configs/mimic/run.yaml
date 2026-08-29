@@ -6,6 +6,11 @@ defaults:
 observations_csv: data/real/mimic-iv-3.1/derived/trails_case/observations.csv
 patients_csv: data/real/mimic-iv-3.1/derived/trails_case/patients.csv
 description: "MIMIC-IV v3.1 early Sepsis-3 TRAILS analysis"
+split:
+  seed: 20260517
+  dir: data/real/mimic-iv-3.1/derived/trails_splits/seed-${split.seed}
+outputs:
+  summary: run_manifest.json
 # 默认只做资源与流程检查；正式分析仍从本入口通过 Hydra overrides 调整。
 model:
   n_clusters: 3

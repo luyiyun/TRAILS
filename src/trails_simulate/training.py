@@ -83,11 +83,12 @@ def fit_training_run(
             dataset,
             history_callback=log_swanlab_history if config.swanlab.enabled else None,
         )
+        model_prediction = estimator.predict(test_dataset)
         prediction = prediction_payload_from_dataset(
             test_dataset,
-            pred_cluster=estimator.predict(test_dataset),
-            risk_score=estimator.predict_risk(test_dataset),
-            cluster_probabilities=estimator.predict_proba(test_dataset),
+            pred_cluster=model_prediction.predict(),
+            risk_score=model_prediction.risk_score(),
+            cluster_probabilities=model_prediction.predict_proba(),
         )
         metrics = evaluate_predictions(
             prediction,
@@ -186,7 +187,7 @@ def save_latent_embedding_diagnostics(
     split_datasets.append(("test", test_dataset))
 
     for split_name, split_dataset in split_datasets:
-        diagnostics = estimator.latent_diagnostics(split_dataset)
+        diagnostics = estimator.predict(split_dataset).latent_diagnostics()
         save_latent_embedding_artifacts(
             run_dir,
             split_name,

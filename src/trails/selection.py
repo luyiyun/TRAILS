@@ -226,7 +226,9 @@ class ClusterNumberSelector:
                     }
                 )
                 estimators[(seed, n_clusters)] = estimator
-                cluster_assignments[(seed, n_clusters)] = estimator.predict(valid_data).numpy()
+                cluster_assignments[(seed, n_clusters)] = (
+                    estimator.predict(valid_data).predict().numpy()
+                )
             candidate_scores = self._score_and_rank_candidates(pd.DataFrame(candidate_metrics))
             candidate_scores.insert(0, "seed", seed)
             run_scores.append(candidate_scores)

@@ -14,8 +14,18 @@ from torch import Tensor
 
 from trails.data import ClinicalTimeSeriesDataset
 from trails.metrics import cluster_accuracy, cluster_assignment_diagnostics, concordance_index
+from trails.prediction import TrailsPrediction
 
-from .data import CasePatientSummary
+
+@dataclass(frozen=True)
+class CasePatientSummary:
+    patient_id: str
+    sample_index: int
+    n_observations: int
+    n_visits: int
+    first_time: float
+    last_time: float
+    missing_fraction: float
 
 
 class CasePredictionPayload(TypedDict):
@@ -65,22 +75,26 @@ def prediction_payload_from_case_dataset(
 
 
 def evaluate_case_predictions(
-    payload: CasePredictionPayload,
-    *,
-    n_clusters: int,
+    data: ClinicalTimeSeriesDataset,
+    prediction: TrailsPrediction,
 ) -> dict[str, float]:
-    pred_cluster = payload["pred_cluster"].detach().cpu().long()
+    if len(data) != len(prediction.predict_proba()):
+        raise ValueError("Dataset and prediction must contain the same number of samples.")
+    pred_cluster = prediction.predict()
+    survival_time = torch.stack([data[index].survival_time for index in range(len(data))]).float()
+    event = torch.stack([data[index].event for index in range(len(data))]).float()
+    n_clusters = int(prediction.predict_proba().shape[1])
     metrics = {
         "cindex": float(
             concordance_index(
-                payload["risk_score"].detach().cpu().float(),
-                payload["survival_time"].detach().cpu().float(),
-                payload["event"].detach().cpu().float(),
+                prediction.risk_score(),
+                survival_time,
+                event,
             )
         ),
         **cluster_assignment_diagnostics(pred_cluster, n_clusters=n_clusters),
     }
-    true_cluster = payload.get("true_cluster")
+    true_cluster = prediction.true_cluster
     if true_cluster is not None:
         y_true = true_cluster.detach().cpu().numpy()
         y_pred = pred_cluster.numpy()
@@ -271,59 +285,6 @@ class CaseResultTables:
         write_dataframe_csv(path, self.cluster_feature_summary(data, n_clusters=n_clusters))
 
 
-def save_patient_clusters_csv(
-    path: Path,
-    *,
-    payload: CasePredictionPayload,
-    patient_summaries: Sequence[CasePatientSummary],
-) -> None:
-    CaseResultTables(payload).save_patient_clusters_csv(
-        path,
-        patient_summaries=patient_summaries,
-    )
-
-
-def patient_cluster_rows(
-    *,
-    payload: CasePredictionPayload,
-    patient_summaries: Sequence[CasePatientSummary],
-    probability_columns: Sequence[str],
-) -> list[dict[str, Any]]:
-    frame = CaseResultTables(payload).patient_clusters(patient_summaries)
-    columns = [*patient_cluster_base_columns(), *probability_columns, *patient_summary_columns()]
-    return dataframe_records(cast(pd.DataFrame, frame[columns]))
-
-
-def cluster_summary_rows(
-    payload: CasePredictionPayload,
-    *,
-    n_clusters: int,
-) -> list[dict[str, Any]]:
-    return dataframe_records(CaseResultTables(payload).cluster_summary(n_clusters=n_clusters))
-
-
-def cluster_feature_summary_rows(
-    data: ClinicalTimeSeriesDataset,
-    payload: CasePredictionPayload,
-    *,
-    n_clusters: int,
-) -> list[dict[str, Any]]:
-    frame = CaseResultTables(payload).cluster_feature_summary(data, n_clusters=n_clusters)
-    return dataframe_records(frame)
-
-
-def save_cluster_summary_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    write_csv(
-        path,
-        rows,
-        fieldnames=CLUSTER_SUMMARY_COLUMNS,
-    )
-
-
-def save_cluster_feature_summary_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    write_csv(path, rows, fieldnames=CLUSTER_FEATURE_SUMMARY_COLUMNS)
-
-
 def json_safe_metrics(metrics: Mapping[str, float]) -> dict[str, float | str]:
     payload: dict[str, float | str] = {}
     for name, value in metrics.items():
@@ -332,23 +293,9 @@ def json_safe_metrics(metrics: Mapping[str, float]) -> dict[str, float | str]:
     return payload
 
 
-def write_csv(
-    path: Path,
-    rows: Sequence[Mapping[str, Any]],
-    *,
-    fieldnames: Sequence[str],
-) -> None:
-    frame = pd.DataFrame(rows, columns=list(fieldnames))
-    write_dataframe_csv(path, frame)
-
-
 def write_dataframe_csv(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path, index=False)
-
-
-def dataframe_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
-    return cast(list[dict[str, Any]], frame.to_dict(orient="records"))
 
 
 def tensor_array(tensor: Tensor, *, dtype: Any) -> np.ndarray:
@@ -396,17 +343,4 @@ CLUSTER_SUMMARY_COLUMNS = [
     "median_survival_time",
     "mean_risk_score",
     "median_risk_score",
-]
-
-CLUSTER_FEATURE_SUMMARY_COLUMNS = [
-    "pred_cluster",
-    "feature",
-    "n_patients",
-    "n_patients_observed",
-    "n_observations",
-    "mean_value",
-    "std_value",
-    "min_value",
-    "max_value",
-    "mean_time",
 ]

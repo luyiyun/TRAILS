@@ -7,12 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch import Tensor
 
 from .config import TrailsConfig
 from .data import ClinicalTimeSeriesDataset, infer_data_config
-from .diagnostics import LatentDiagnostics
 from .model import TrailsSurvVaderModel
+from .prediction import TrailsPrediction
 from .trainer import HistoryEntry, TrailsTrainer
 
 HistoryCallback = Callable[[HistoryEntry], None]
@@ -80,44 +79,26 @@ class TrailsEstimator:
         )
         return self
 
-    def predict(self, data: ClinicalTimeSeriesDataset) -> Tensor:
-        """预测每位患者最大后验概率对应的簇标签。
+    def predict(self, data: ClinicalTimeSeriesDataset) -> TrailsPrediction:
+        """一次推理返回可派生全部患者级预测的结构化对象。
 
         参数：
             data: 特征维度与估计器配置一致的数据集。
 
         返回：
-            形状为 ``(n_samples,)`` 的 CPU 整数张量。
+            CPU 上的 :class:`TrailsPrediction`，包含潜表示、簇后验和 Weibull 参数。
         """
         self._validate_data_config(data)
-        return self.trainer.predict(data)
-
-    def predict_proba(self, data: ClinicalTimeSeriesDataset) -> Tensor:
-        """预测每位患者对所有高斯混合分量的后验概率。
-
-        参数：
-            data: 特征维度与估计器配置一致的数据集。
-
-        返回：
-            形状为 ``(n_samples, n_clusters)`` 的 CPU 浮点张量，每行和为一。
-        """
-        self._validate_data_config(data)
-        return self.trainer.predict_proba(data)
-
-    def predict_risk(self, data: ClinicalTimeSeriesDataset) -> Tensor:
-        """预测每位患者的连续生存风险分数。
-
-        分数定义为后验簇概率加权 Weibull 尺度的负值，因此预测生存尺度越小，
-        风险分数越大。
-
-        参数：
-            data: 特征维度与估计器配置一致的数据集。
-
-        返回：
-            形状为 ``(n_samples,)`` 的 CPU 浮点张量。
-        """
-        self._validate_data_config(data)
-        return self.trainer.predict_risk(data)
+        outputs, batch = self.trainer._collect_outputs(data)
+        return TrailsPrediction(
+            latent_representation=outputs.latent_mean.detach().cpu(),
+            cluster_probabilities=outputs.cluster_probabilities.detach().cpu(),
+            weibull_shape=outputs.weibull_shape.detach().cpu(),
+            weibull_scale=outputs.weibull_scale.detach().cpu(),
+            true_cluster=(
+                batch["cluster_label"].detach().cpu().long() if "cluster_label" in batch else None
+            ),
+        )
 
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
         """计算数据集损失、生存指标、可选聚类指标和簇占用诊断。
@@ -130,25 +111,6 @@ class TrailsEstimator:
         """
         self._validate_data_config(data)
         return self.trainer.test(data)
-
-    def latent_diagnostics(self, data: ClinicalTimeSeriesDataset) -> LatentDiagnostics:
-        """提取按数据集顺序排列的患者级潜空间诊断。
-
-        返回 CPU 上的潜空间均值、簇概率、预测簇和原样本索引；数据集带参考簇
-        标签时额外包含 ``true_cluster``。
-        """
-        self._validate_data_config(data)
-        outputs, batch = self.trainer._collect_outputs(data)
-        cluster_probabilities = outputs.cluster_probabilities.detach().cpu()
-        diagnostics: LatentDiagnostics = {
-            "z": outputs.latent_mean.detach().cpu(),
-            "cluster_probabilities": cluster_probabilities,
-            "pred_cluster": torch.argmax(cluster_probabilities, dim=-1).long(),
-            "sample_index": torch.arange(len(data), dtype=torch.long),
-        }
-        if "cluster_label" in batch:
-            diagnostics["true_cluster"] = batch["cluster_label"].detach().cpu().long()
-        return diagnostics
 
     def save(self, path: str | Path) -> None:
         """保存配置、训练历史和模型状态，并自动创建目标父目录。

@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import hydra
+import pandas as pd
+import torch
+from omegaconf import DictConfig
+
+from trails import (
+    ClinicalTimeSeriesDataset,
+    DataConfig,
+    TrailsConfig,
+    TrailsEstimator,
+    resolve_batch_size,
+)
+from trails.artifacts import save_history_csv, save_json
+from trails_case.evaluation import (
+    evaluate_case_predictions,
+)
+from trails_simulate.config import resolved_payload
+
+from .config import MimicApplicationConfig
+from .data import BASELINE_COVARIATE_COLUMNS, prepare_mimic_datasets
+from .paths import resolve_input_path, resolve_output_path
+
+
+def _save_split_outputs(
+    run_dir: Path,
+    split_name: str,
+    dataset: ClinicalTimeSeriesDataset,
+    estimator: TrailsEstimator,
+) -> dict[str, float]:
+    split_dir = run_dir / split_name
+    patient_ids = list(dataset.metadata["patient_ids"])
+    model_prediction = estimator.predict(dataset)
+    pred_cluster = model_prediction.predict()
+    probabilities = model_prediction.predict_proba()
+    risk_score = model_prediction.risk_score()
+    survival_time = torch.stack([dataset[index].survival_time for index in range(len(dataset))])
+    event = torch.stack([dataset[index].event for index in range(len(dataset))])
+    metrics = evaluate_case_predictions(dataset, model_prediction)
+
+    dataset.save(split_dir / "dataset.pt")
+    model_prediction.save(split_dir / "model_prediction.pt")
+    frame = pd.DataFrame(
+        {
+            "patient_id": patient_ids,
+            "pred_cluster": pred_cluster.numpy(),
+            "risk_score": risk_score.numpy(),
+            "survival_time": survival_time.numpy(),
+            "event": event.numpy(),
+        }
+    )
+    raw_covariates = dataset.metadata.get("baseline_covariates")
+    if not isinstance(raw_covariates, list):
+        raise ValueError(f"{split_name} dataset缺少baseline_covariates")
+    covariates = pd.DataFrame(raw_covariates)
+    required_covariates = {"patient_id", *BASELINE_COVARIATE_COLUMNS}
+    if missing := sorted(required_covariates - set(covariates.columns)):
+        raise ValueError(f"{split_name} baseline_covariates缺少字段：{missing}")
+    frame = frame.merge(
+        covariates.loc[:, ["patient_id", *BASELINE_COVARIATE_COLUMNS]],
+        on="patient_id",
+        how="left",
+        validate="one_to_one",
+        sort=False,
+    )
+    for index in range(probabilities.shape[1]):
+        frame[f"cluster_probability_{index}"] = probabilities[:, index]
+    for index in range(model_prediction.latent_representation.shape[1]):
+        frame[f"latent_{index}"] = model_prediction.latent_representation[:, index]
+    frame.to_csv(split_dir / "patient_outputs.csv", index=False)
+    save_json(split_dir / "metrics.json", metrics)
+    return metrics
+
+
+def run(config: MimicApplicationConfig) -> dict[str, object]:
+    if config.k_selection.enabled:
+        raise ValueError("K 选择草案位于 scripts/mimic/_unfinished/select_k.py，当前尚未完成")
+    run_dir = config.paths.dir
+    run_dir.mkdir(parents=True, exist_ok=True)
+    patients_csv = resolve_input_path(config.patients_csv)
+    observations_csv = resolve_input_path(config.observations_csv)
+    split_dir = resolve_input_path(config.split.dir)
+    required = [patients_csv, observations_csv]
+    if missing := [str(path) for path in required if not path.is_file()]:
+        raise FileNotFoundError(f"缺少 MIMIC 建模输入：{missing}")
+    if not split_dir.is_dir():
+        raise FileNotFoundError(f"缺少 MIMIC 正式划分目录：{split_dir}")
+    device = config.trainer.device
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("MIMIC TRAILS 分析要求可用 CUDA GPU")
+
+    load_started = time.perf_counter()
+    datasets, transformer = prepare_mimic_datasets(
+        patients_csv,
+        observations_csv,
+        split_dir,
+        config.split.seed,
+        config.feature_order,
+        config.description,
+    )
+    train = datasets["train"]
+    validation = datasets["validation"]
+    load_seconds = time.perf_counter() - load_started
+    trails_config = TrailsConfig(
+        data=DataConfig(n_features=train.n_features),
+        model=config.model,
+        trainer=config.trainer.model_copy(
+            update={
+                "batch_size": resolve_batch_size(len(train), config.trainer.batch_size),
+                "valid_size": 0.0,
+            }
+        ),
+        seed=config.trainer.seed,
+    )
+    if device.startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats(device)
+
+    training_started = time.perf_counter()
+    estimator = TrailsEstimator(trails_config).fit(train, validation_data=validation)
+    training_seconds = time.perf_counter() - training_started
+
+    inference_started = time.perf_counter()
+    split_metrics = {
+        name: _save_split_outputs(run_dir, name, dataset, estimator)
+        for name, dataset in datasets.items()
+    }
+    inference_seconds = time.perf_counter() - inference_started
+
+    estimator.save(run_dir / "model.pt")
+    assert transformer.parameters_ is not None
+    transformer.parameters_.to_csv(run_dir / "preprocessing_parameters.csv", index=False)
+    save_history_csv(run_dir / "training_history.csv", estimator.history)
+    save_json(run_dir / "training_history.json", estimator.history)
+    peak_memory = (
+        torch.cuda.max_memory_allocated(device) / 1024**3 if device.startswith("cuda") else 0.0
+    )
+    summary = {
+        "data": {
+            "split_seed": config.split.seed,
+            "split_dir": str(split_dir),
+            "split_sizes": {name: len(data) for name, data in datasets.items()},
+            "n_features": train.n_features,
+        },
+        "metrics": split_metrics,
+        "resources": {
+            "device": device,
+            "batch_size": trails_config.trainer.batch_size,
+            "load_seconds": load_seconds,
+            "training_seconds": training_seconds,
+            "inference_seconds": inference_seconds,
+            "peak_gpu_memory_gib": peak_memory,
+        },
+        "application": config.model_dump(mode="json"),
+        "training": trails_config.model_dump(mode="json"),
+        "k_selection": None,
+    }
+    save_json(resolve_output_path(config.outputs.summary, run_dir), summary)
+    return summary
+
+
+@hydra.main(config_path="../../configs", config_name="mimic/run", version_base="1.3")
+def main(raw_config: DictConfig) -> None:
+    config = MimicApplicationConfig.model_validate(resolved_payload(raw_config))
+    run(config)
+
+
+if __name__ == "__main__":
+    main()

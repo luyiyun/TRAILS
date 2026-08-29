@@ -2,15 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import cast
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 
 from trails.data import ClinicalTimeSeriesDataset
 
-SPLIT_SEED = 20260517
+BASELINE_COVARIATE_COLUMNS = ("age", "gender", "race", "sofa_score")
 
 
 class LongitudinalFeatureTransformer:
@@ -62,32 +60,43 @@ class LongitudinalFeatureTransformer:
 def prepare_mimic_datasets(
     patients_csv: Path,
     observations_csv: Path,
+    split_dir: Path,
+    split_seed: int,
     feature_order: tuple[str, ...],
     description: str,
 ) -> tuple[dict[str, ClinicalTimeSeriesDataset], LongitudinalFeatureTransformer]:
     patients = pd.read_csv(patients_csv, dtype={"patient_id": str})
     observations = pd.read_csv(observations_csv, dtype={"patient_id": str})
-    required = {"patient_id", "survival_time", "event", "left_icu_before_48h"}
+    required = {
+        "patient_id",
+        "survival_time",
+        "event",
+        "left_icu_before_48h",
+        *BASELINE_COVARIATE_COLUMNS,
+    }
     if missing := sorted(required - set(patients.columns)):
         raise ValueError(f"patients.csv 缺少正式划分字段：{missing}")
+    if bool(patients["patient_id"].duplicated().to_numpy().any()):
+        raise ValueError("patients.csv 的 patient_id 必须唯一")
 
-    # 固定划分只依赖结局与48小时前转出状态，模型 seed 的变化不会改变样本组成。
-    strata = patients["event"].astype(str) + ":" + patients["left_icu_before_48h"].astype(str)
-    first_split = train_test_split(
-        patients, test_size=0.20, random_state=SPLIT_SEED, stratify=strata
-    )
-    train_valid = cast(pd.DataFrame, first_split[0])
-    test = cast(pd.DataFrame, first_split[1])
-    train_valid_strata = (
-        train_valid["event"].astype(str) + ":" + train_valid["left_icu_before_48h"].astype(str)
-    )
-    second_split = train_test_split(
-        train_valid, test_size=0.20, random_state=SPLIT_SEED, stratify=train_valid_strata
-    )
+    id_frames: dict[str, pd.DataFrame] = {}
+    for split_name in ("train", "validation", "test"):
+        ids_path = split_dir / f"{split_name}_ids.csv"
+        if not ids_path.is_file():
+            raise FileNotFoundError(f"缺少正式划分文件：{ids_path}")
+        ids = pd.read_csv(ids_path, dtype={"patient_id": str})
+        if list(ids.columns) != ["patient_id"]:
+            raise ValueError(f"{ids_path} 必须只包含 patient_id 列")
+        id_frames[split_name] = ids
+
+    combined_ids = pd.concat(id_frames.values(), ignore_index=True)
+    if bool(combined_ids["patient_id"].duplicated().to_numpy().any()):
+        raise ValueError("train、validation 和 test patient_id 存在重复")
+    if set(combined_ids["patient_id"]) != set(patients["patient_id"]):
+        raise ValueError("正式划分 patient_id 并集与 patients.csv 不一致")
     patient_splits = {
-        "train": cast(pd.DataFrame, second_split[0]),
-        "validation": cast(pd.DataFrame, second_split[1]),
-        "test": test,
+        name: ids.merge(patients, on="patient_id", how="left", validate="one_to_one", sort=False)
+        for name, ids in id_frames.items()
     }
 
     split_observations = {
@@ -112,6 +121,13 @@ def prepare_mimic_datasets(
                 observations_csv=observations_path,
                 use_features=feature_order,
                 description=f"{description} ({split_name})",
-                metadata={"split_name": split_name, "split_seed": SPLIT_SEED},
+                metadata={
+                    "split_name": split_name,
+                    "split_seed": split_seed,
+                    "split_ids_csv": str(split_dir / f"{split_name}_ids.csv"),
+                    "baseline_covariates": split_patients.loc[
+                        :, ["patient_id", *BASELINE_COVARIATE_COLUMNS]
+                    ].to_dict(orient="records"),
+                },
             )
     return datasets, transformer

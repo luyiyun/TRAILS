@@ -23,6 +23,7 @@ dependencies = [
     "torchmetrics>=1.9.0",
     "tqdm>=4.67.3",
     "umap-learn>=0.5.12",
+    "lifelines>=0.30,<0.31",
 ]
 
 [build-system]
