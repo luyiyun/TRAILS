@@ -1,8 +1,11 @@
 # @package _global_
 paths:
   patients_csv: data/real/mimic-iv-3.1/derived/trails_case/patients.csv
+  observations_csv: data/real/mimic-iv-3.1/derived/trails_case/observations.csv
   dir: data/real/mimic-iv-3.1/derived/trails_splits
 
+description: "MIMIC-IV v3.1 early Sepsis-3 TRAILS analysis"
+feature_order: []
 split:
   seeds: [20260517]
   train_fraction: 0.64

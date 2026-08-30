@@ -23,3 +23,6 @@ multirun
 # Local remote-execution state and retrieved artifacts
 .remote-run/
 remote-results/
+
+# Local pair-programming state
+/.pair/

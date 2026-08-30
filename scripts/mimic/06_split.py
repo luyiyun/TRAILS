@@ -12,18 +12,23 @@ import pandas as pd
 from omegaconf import DictConfig
 from sklearn.model_selection import train_test_split
 
+from .data import prepare_mimic_datasets
+
 
 def run(config: DictConfig) -> None:
     patients_csv = Path(str(config.paths.patients_csv)).resolve()
+    observations_csv = Path(str(config.paths.observations_csv)).resolve()
     output_root = Path(str(config.paths.dir)).resolve()
     split_seeds = tuple(int(seed) for seed in config.split.seeds)
+    feature_order = tuple(str(feature) for feature in config.feature_order)
+    description = str(config.description)
     fractions = {
         "train": float(config.split.train_fraction),
         "validation": float(config.split.validation_fraction),
         "test": float(config.split.test_fraction),
     }
-    if not patients_csv.is_file():
-        raise FileNotFoundError(f"缺少 {patients_csv}；请先完成 MIMIC 特征提取")
+    if missing := [str(path) for path in (patients_csv, observations_csv) if not path.is_file()]:
+        raise FileNotFoundError(f"缺少 MIMIC 特征输入：{missing}")
     if not split_seeds:
         raise ValueError("split.seeds 不能为空")
     if len(set(split_seeds)) != len(split_seeds):
@@ -88,6 +93,20 @@ def run(config: DictConfig) -> None:
                 index=False,
             )
 
+        # 固定ID后立即拟合train预处理并保存tensor dataset，训练脚本不再重复解析长表。
+        datasets, transformer = prepare_mimic_datasets(
+            patients_csv,
+            observations_csv,
+            seed_root,
+            seed,
+            feature_order,
+            description,
+        )
+        for name, dataset in datasets.items():
+            dataset.save(seed_root / name / "dataset.pt")
+        assert transformer.parameters_ is not None
+        transformer.parameters_.to_csv(seed_root / "preprocessing_parameters.csv", index=False)
+
         manifest = {
             "dataset": "MIMIC-IV v3.1 primary early Sepsis-3 cohort",
             "generated_at_utc": datetime.now(UTC).isoformat(),
@@ -99,7 +118,13 @@ def run(config: DictConfig) -> None:
             "n_patients": len(patients),
             "split_counts": {name: len(frame) for name, frame in splits.items()},
             "id_columns": ["patient_id"],
-            "outputs": [f"{name}_ids.csv" for name in splits],
+            "feature_order": datasets["train"].feature_names,
+            "preprocessing": "train-only 1/99% winsorization and standardization",
+            "outputs": [
+                *[f"{name}_ids.csv" for name in splits],
+                *[f"{name}/dataset.pt" for name in splits],
+                "preprocessing_parameters.csv",
+            ],
         }
         (seed_root / "split_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),

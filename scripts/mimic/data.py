@@ -67,6 +67,9 @@ def prepare_mimic_datasets(
 ) -> tuple[dict[str, ClinicalTimeSeriesDataset], LongitudinalFeatureTransformer]:
     patients = pd.read_csv(patients_csv, dtype={"patient_id": str})
     observations = pd.read_csv(observations_csv, dtype={"patient_id": str})
+    resolved_feature_order = feature_order or tuple(
+        str(feature) for feature in observations["feature"].drop_duplicates()
+    )
     required = {
         "patient_id",
         "survival_time",
@@ -119,7 +122,7 @@ def prepare_mimic_datasets(
             datasets[split_name] = ClinicalTimeSeriesDataset.load_from_csv(
                 patients_csv=patients_path,
                 observations_csv=observations_path,
-                use_features=feature_order,
+                use_features=resolved_feature_order,
                 description=f"{description} ({split_name})",
                 metadata={
                     "split_name": split_name,

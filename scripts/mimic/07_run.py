@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import time
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from trails_case.evaluation import (
 from trails_simulate.config import resolved_payload
 
 from .config import MimicApplicationConfig
-from .data import BASELINE_COVARIATE_COLUMNS, prepare_mimic_datasets
+from .data import BASELINE_COVARIATE_COLUMNS
 from .paths import resolve_input_path, resolve_output_path
 
 
@@ -81,27 +82,26 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
         raise ValueError("K 选择草案位于 scripts/mimic/_unfinished/select_k.py，当前尚未完成")
     run_dir = config.paths.dir
     run_dir.mkdir(parents=True, exist_ok=True)
-    patients_csv = resolve_input_path(config.patients_csv)
-    observations_csv = resolve_input_path(config.observations_csv)
     split_dir = resolve_input_path(config.split.dir)
-    required = [patients_csv, observations_csv]
+    dataset_paths = {
+        name: split_dir / name / "dataset.pt" for name in ("train", "validation", "test")
+    }
+    preprocessing_parameters = split_dir / "preprocessing_parameters.csv"
+    required = [*dataset_paths.values(), preprocessing_parameters]
     if missing := [str(path) for path in required if not path.is_file()]:
-        raise FileNotFoundError(f"缺少 MIMIC 建模输入：{missing}")
-    if not split_dir.is_dir():
-        raise FileNotFoundError(f"缺少 MIMIC 正式划分目录：{split_dir}")
+        raise FileNotFoundError(f"缺少 MIMIC tensor dataset；请先运行06_split：{missing}")
     device = config.trainer.device
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("MIMIC TRAILS 分析要求可用 CUDA GPU")
 
     load_started = time.perf_counter()
-    datasets, transformer = prepare_mimic_datasets(
-        patients_csv,
-        observations_csv,
-        split_dir,
-        config.split.seed,
-        config.feature_order,
-        config.description,
-    )
+    datasets = {name: ClinicalTimeSeriesDataset.load(path) for name, path in dataset_paths.items()}
+    for name, dataset in datasets.items():
+        if (
+            dataset.metadata.get("split_name") != name
+            or dataset.metadata.get("split_seed") != config.split.seed
+        ):
+            raise ValueError(f"{dataset_paths[name]} 的split元数据与当前配置不一致")
     train = datasets["train"]
     validation = datasets["validation"]
     load_seconds = time.perf_counter() - load_started
@@ -117,7 +117,8 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
         seed=config.trainer.seed,
     )
     if device.startswith("cuda"):
-        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.set_device(torch.device(device))
+        torch.cuda.reset_peak_memory_stats(torch.device(device))
 
     training_started = time.perf_counter()
     estimator = TrailsEstimator(trails_config).fit(train, validation_data=validation)
@@ -131,12 +132,13 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
     inference_seconds = time.perf_counter() - inference_started
 
     estimator.save(run_dir / "model.pt")
-    assert transformer.parameters_ is not None
-    transformer.parameters_.to_csv(run_dir / "preprocessing_parameters.csv", index=False)
+    shutil.copy2(preprocessing_parameters, run_dir / "preprocessing_parameters.csv")
     save_history_csv(run_dir / "training_history.csv", estimator.history)
     save_json(run_dir / "training_history.json", estimator.history)
     peak_memory = (
-        torch.cuda.max_memory_allocated(device) / 1024**3 if device.startswith("cuda") else 0.0
+        torch.cuda.max_memory_allocated(torch.device(device)) / 1024**3
+        if device.startswith("cuda")
+        else 0.0
     )
     summary = {
         "data": {

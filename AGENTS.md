@@ -53,7 +53,7 @@ clean reusable method library.
 - Train existing splits: `uv run python scripts/train.py training=base paths.data_root=data/simulated/base`
 - Train with mTAN-style input: `uv run python scripts/train.py training=mtan paths.data_root=data/simulated/base`
 - Run real-data case modeling: `uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv`
-- Generate MIMIC patient splits: `uv run python -m scripts.mimic.06_split`
+- Generate MIMIC patient splits and tensor datasets: `uv run python -m scripts.mimic.06_split`
 - Run fixed-K MIMIC modeling: `uv run python -m scripts.mimic.07_run`
 - Evaluate frozen MIMIC test predictions: `uv run python -m scripts.mimic.08_evaluate input_dir=outputs/mimic_case/<run>`
 - Run lightweight baselines on existing splits: `uv run python scripts/baseline.py paths.data_root=data/simulated/base`
@@ -227,19 +227,21 @@ clean reusable method library.
   only for internal early stopping, and saves the converted dataset, model,
   history, predictions, patient-level clusters, cluster summaries, feature
   summaries, and `case_summary.json` under `paths.dir`.
-- MIMIC-specific command entrypoints consume the ID-only external split and share
-  the train-only longitudinal feature transformation implemented in
-  `scripts.mimic.data`; command modules import only non-command support modules
-  from the workflow package and do not import one another.
+- MIMIC `06_split.py` saves the ID-only external split plus train-fitted
+  train/validation/test tensor datasets and preprocessing parameters. Later commands
+  consume these frozen datasets; command modules import only non-command support
+  modules from the workflow package and do not import one another.
 - MIMIC patient inputs and each frozen split preserve baseline `age`, `gender`,
   `race`, and sepsis-onset `sofa_score` covariates for adjusted descriptive Cox
   analysis; these variables are not added to the longitudinal clustering inputs.
 - `scripts/mimic/01_build_sepsis.py` through `07_run.py` form the current ordered
   MIMIC analysis workflow. `06_split.py` saves ID-only train/validation/test
-  partitions, and `07_run.py` trains on one fixed-K split and exports per-split
+  partitions and their tensor datasets, and `07_run.py` trains on one fixed-K split and exports per-split
   datasets, complete `TrailsPrediction` objects, patient-level tables, metrics,
   the model, preprocessing parameters, history, and a run manifest. Their Hydra
-  command configs live under `configs/mimic/`.
+  command configs live under `configs/mimic/`; `split.yaml` declares
+  `feature_order: []`, which preserves the observed CSV order by default and can
+  be overridden directly through Hydra.
   K selection is currently excluded as unfinished.
 - `scripts/mimic/08_evaluate.py` evaluates the saved validation and test
   predictions separately, always estimates censoring from train, and writes
@@ -288,11 +290,12 @@ If any step fails, fix it before considering the change complete.
 <!-- pair-programming:active:start -->
 ## 结对编程（已启用）
 
-本项目默认使用已安装的全局 `$pair-programming` skill。除非用户在当前请求中明确指定不用，否则所有编码任务开始前都必须自动调用该 skill，并读取和维护根目录 `PAIR.md`。Codex 担任 driver，用户担任 navigator。
+本项目默认使用已安装的全局 `$pair-programming` skill。除非用户在当前请求中明确指定不用，否则所有编码任务开始前都必须自动调用该 skill，并读取和维护 `.pair/PAIR.md` 及其当前任务文件。Codex 担任 driver，用户担任 navigator。
 
-- 每批手写代码、测试和配置的新增与修改不得超过 navigator 确认的 200 行，而且必须形成语法完整、逻辑完整、可审查的最小单元；纯删除不限行数，同一重构中尽量先删除已确认废弃的内容，再添加替代代码。
+- `.pair/` 默认由项目根 `.gitignore` 排除；`.pair/PAIR.md` 只保存任务索引，每个任务的计划树和过程保存在 `.pair/tasks/` 的独立 Markdown 文件中。
+- 每批手写代码、测试和配置的新增与修改不得超过 navigator 确认的行数（默认 200 行），而且必须形成语法完整、逻辑完整、可审查的最小单元；纯删除不限行数，同一重构中尽量先删除已确认废弃的内容，再添加替代代码。
 - 每批完成后进行必要的最小验证，向 navigator 汇报改动和验证结果，然后停止并等待审查；未经通过不得开始下一批。
 - 优先采用简单务实的实现、中文解释性注释和静态类型；不添加当前需求之外的抽象、工具函数、测试或校验。
 - navigator 明确说明、暂存或提交的代码改动视为已确认决定，后续不得回退；未说明且未暂存的意外差异应先询问确认。
-- 每次编码前同步 `PAIR.md`；并行任务、暂停点、风险、决定、交接和完成记忆均记录在其中。
+- 每次编码前同步索引和当前任务树；并行任务、暂停点、风险、决定、交接和完成记忆均按 skill 约定记录。
 <!-- pair-programming:active:end -->
