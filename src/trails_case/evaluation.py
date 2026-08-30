@@ -77,6 +77,7 @@ def prediction_payload_from_case_dataset(
 def evaluate_case_predictions(
     data: ClinicalTimeSeriesDataset,
     prediction: TrailsPrediction,
+    risk_horizon: float,
 ) -> dict[str, float]:
     if len(data) != len(prediction.predict_proba()):
         raise ValueError("Dataset and prediction must contain the same number of samples.")
@@ -87,7 +88,7 @@ def evaluate_case_predictions(
     metrics = {
         "cindex": float(
             concordance_index(
-                prediction.risk_score(),
+                prediction.risk_score(risk_horizon),
                 survival_time,
                 event,
             )

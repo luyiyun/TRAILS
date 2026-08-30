@@ -11,11 +11,12 @@ import torch
 from torch import Tensor
 
 from .diagnostics import LatentDiagnostics
+from .metrics import weibull_event_probability
 
 
 @dataclass(frozen=True)
 class TrailsPrediction:
-    """保存潜空间、簇后验和 Weibull 混合分布参数。
+    """保存潜空间、簇后验和患者 Weibull 分布参数。
 
     同一个对象可以派生簇标签、簇概率、风险分数和任意时间网格上的
     生存曲线，避免为每种下游产物重复执行模型前向推理。
@@ -23,8 +24,8 @@ class TrailsPrediction:
     属性：
         latent_representation: 形状为 ``(n_samples, latent_dim)`` 的确定性潜表示。
         cluster_probabilities: 形状为 ``(n_samples, n_clusters)`` 的后验簇概率。
-        weibull_shape: 每位患者、每个簇的 Weibull 形状参数。
-        weibull_scale: 每位患者、每个簇的 Weibull 尺度参数。
+        weibull_shape: 每位患者的 Weibull 形状参数。
+        weibull_scale: 每位患者的 Weibull 尺度参数。
         true_cluster: 数据集提供的可选参考簇标签。
     """
 
@@ -42,16 +43,12 @@ class TrailsPrediction:
         """返回每位患者对全部簇的后验概率。"""
         return self.cluster_probabilities
 
-    def risk_score(self) -> Tensor:
-        """返回负后验加权 Weibull 尺度作为连续生存风险分数。"""
-        expected_scale = torch.sum(
-            self.cluster_probabilities * self.weibull_scale,
-            dim=-1,
-        )
-        return -expected_scale
+    def risk_score(self, horizon: float) -> Tensor:
+        """返回指定时间窗内的 Weibull 事件概率 ``1 - S(horizon)``。"""
+        return weibull_event_probability(self.weibull_shape, self.weibull_scale, horizon)
 
     def survival(self, times: Sequence[float] | Tensor) -> Tensor:
-        """返回后验加权 Weibull 混合生存曲线。
+        """返回每位患者的 Weibull 生存曲线。
 
         参数：
             times: 非空、有限、非负且严格递增的一维时间网格。
@@ -72,8 +69,7 @@ class TrailsPrediction:
             raise ValueError("times must be strictly increasing.")
         shape = self.weibull_shape.unsqueeze(1)
         scale = self.weibull_scale.unsqueeze(1)
-        component_survival = torch.exp(-torch.pow(time_grid.reshape(1, -1, 1) / scale, shape))
-        return torch.sum(self.cluster_probabilities.unsqueeze(1) * component_survival, dim=-1)
+        return torch.exp(-torch.pow(time_grid.unsqueeze(0) / scale, shape))
 
     def latent_diagnostics(self) -> LatentDiagnostics:
         """返回与现有潜空间诊断产物兼容的张量映射。"""

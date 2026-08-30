@@ -87,7 +87,7 @@ def fit_training_run(
         prediction = prediction_payload_from_dataset(
             test_dataset,
             pred_cluster=model_prediction.predict(),
-            risk_score=model_prediction.risk_score(),
+            risk_score=model_prediction.risk_score(trails_config.trainer.risk_horizon),
             cluster_probabilities=model_prediction.predict_proba(),
         )
         metrics = evaluate_predictions(
@@ -239,6 +239,12 @@ def log_swanlab_history(entry: HistoryEntry) -> None:
     }
     if "valid" in entry:
         metrics.update({f"val/{k}": v for k, v in entry["valid"].items()})
+    for name in ("best_global_epoch", "best_monitor_value"):
+        value = entry.get(name)
+        if value is not None:
+            metrics[f"early_stopping/{name}"] = value
+    if entry.get("early_stopped"):
+        metrics["early_stopping/stopped"] = 1
     step = entry["global_epoch"]
     swanlab.log(metrics, step=step)
 

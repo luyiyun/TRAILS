@@ -138,7 +138,8 @@ clean reusable method library.
   plus the discovered split index.
 - Validation data is cut internally from `train.pt` by `trainer.valid_size`, is
   not saved as a separate `val.pt`, and is used for early stopping; if no validation
-  split is requested, early stopping monitors the training metric instead.
+  split is requested, early stopping monitors the training metric instead. The
+  monitor can be total loss, survival loss, or C-index.
 - Hydra metadata and command outputs go under the single user-visible `paths.dir`
   directory. Each command root config sets `hydra.run.dir: ${paths.dir}` and
   defines `paths.root`, `paths.prefix`, and `paths.suffix`, which compose the
@@ -177,15 +178,17 @@ clean reusable method library.
   repeated latent plus visit-time input.
 - Clustering uses a VaDE-style learnable Gaussian mixture latent prior,
   initialized by deterministic k-means after warmup.
-- The survival head remains a cluster-specific Weibull mixture whose mixture
-  weights are the VaDE posterior cluster probabilities, with a configurable
-  number of latent-width hidden layers before the Weibull output.
+- The survival head maps each patient's latent mean to one Weibull shape/scale
+  pair, with a configurable number of latent-width hidden layers before the
+  Weibull output; survival likelihood and curves are not mixed across clusters.
 - Validation and test metrics include ACC/ARI/NMI only when true cluster labels are
   available; test metrics also report predicted-cluster occupancy diagnostics.
 - `TrailsEstimator.predict()` performs one forward pass and returns a
   `TrailsPrediction`. Its ordinary methods `predict()`, `predict_proba()`,
-  `risk_score()`, and `survival()` derive cluster labels, posterior probabilities,
-  risk scores, and survival curves from the saved latent and Weibull mixture parameters.
+  `risk_score(horizon)`, and `survival()` derive cluster labels, posterior probabilities,
+  fixed-horizon event risks, and survival curves from the saved latent and
+  patient-specific Weibull parameters. `trainer.risk_horizon` supplies the
+  configurable horizon used for training and evaluation C-index calculations.
 - Train and baseline commands recursively discover all sibling `train.pt`/`test.pt`
   directories under `paths.data_root`, infer K from dataset metadata when present,
   and save unified prediction payloads under mirrored run directories plus

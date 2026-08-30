@@ -15,7 +15,7 @@ from .data import Batch
 from .metrics import (
     masked_mse,
     vade_kl_loss,
-    weibull_mixture_negative_log_likelihood,
+    weibull_negative_log_likelihood,
 )
 
 
@@ -30,8 +30,8 @@ class TrailsModelOutput:
         latent: 训练时重参数采样、评价时取均值的潜变量。
         cluster_logits: VaDE 高斯混合后验的未归一化对数分数。
         cluster_probabilities: 归一化后的后验簇概率。
-        weibull_shape: 每位患者、每个簇的 Weibull 形状参数。
-        weibull_scale: 每位患者、每个簇的 Weibull 尺度参数。
+        weibull_shape: 每位患者的 Weibull 形状参数。
+        weibull_scale: 每位患者的 Weibull 尺度参数。
     """
 
     reconstruction: Tensor
@@ -995,10 +995,10 @@ class TransformerDecoder(nn.Module):
 
 
 class TrailsSurvVaderModel(nn.Module):
-    """联合纵向重建、VaDE 聚类和簇特异 Weibull 生存风险的核心模型。
+    """联合纵向重建、VaDE 聚类和患者特异 Weibull 生存风险的核心模型。
 
     编码器把异步纵向序列汇总为患者表示，变分层产生潜变量；高斯混合先验给出
-    后验簇概率，解码器重建纵向输入，生存头为每个簇输出正的 Weibull 形状与
+    后验簇概率，解码器重建纵向输入，生存头由潜均值输出正的 Weibull 形状与
     尺度参数。损失可使用固定权重或可学习同方差不确定性权重。
     """
 
@@ -1164,7 +1164,7 @@ class TrailsSurvVaderModel(nn.Module):
         )
         cluster_logits = self._cluster_logits(latent)
         cluster_probabilities = torch.softmax(cluster_logits, dim=-1)
-        survival_raw = self.survival_head(latent).reshape(-1, self.model_config.n_clusters, 2)
+        survival_raw = self.survival_head(latent_mean)
         weibull_params = F.softplus(survival_raw) + 1e-3
         return TrailsModelOutput(
             reconstruction=reconstruction,
@@ -1231,8 +1231,7 @@ class TrailsSurvVaderModel(nn.Module):
             原始损失、有效权重和总损失组成的 :class:`TrailsLossBreakdown`。
         """
         reconstruction = masked_mse(output.reconstruction, batch["x"], batch["mask"])
-        survival = weibull_mixture_negative_log_likelihood(
-            output.cluster_logits,
+        survival = weibull_negative_log_likelihood(
             output.weibull_shape,
             output.weibull_scale,
             batch["survival_time"],
@@ -1355,14 +1354,13 @@ class TrailsSurvVaderModel(nn.Module):
 
 
 def build_survival_head(model_config: ModelConfig) -> nn.Sequential:
-    """构建输出每簇 Weibull 形状与尺度原始值的生存头。
+    """构建输出患者 Weibull 形状与尺度原始值的生存头。
 
-    可选隐藏层均保持 ``latent_dim`` 宽度并使用 ReLU，最终输出宽度为
-    ``n_clusters * 2``。
+    可选隐藏层均保持 ``latent_dim`` 宽度并使用 ReLU，最终输出宽度为 2。
     """
     layers: list[nn.Module] = []
     for _layer in range(model_config.survival_head_hidden_layers):
         layers.append(nn.Linear(model_config.latent_dim, model_config.latent_dim))
         layers.append(nn.ReLU())
-    layers.append(nn.Linear(model_config.latent_dim, model_config.n_clusters * 2))
+    layers.append(nn.Linear(model_config.latent_dim, 2))
     return nn.Sequential(*layers)

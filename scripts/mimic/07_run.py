@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import hydra
 import pandas as pd
+import swanlab
 import torch
 from omegaconf import DictConfig
 
@@ -16,11 +19,12 @@ from trails import (
     TrailsEstimator,
     resolve_batch_size,
 )
-from trails.artifacts import save_history_csv, save_json
+from trails.artifacts import plot_history, resolve_artifact_names, save_history_csv, save_json
 from trails_case.evaluation import (
     evaluate_case_predictions,
 )
 from trails_simulate.config import resolved_payload
+from trails_simulate.training import log_swanlab_history
 
 from .config import MimicApplicationConfig
 from .data import BASELINE_COVARIATE_COLUMNS
@@ -32,16 +36,17 @@ def _save_split_outputs(
     split_name: str,
     dataset: ClinicalTimeSeriesDataset,
     estimator: TrailsEstimator,
+    risk_horizon: float,
 ) -> dict[str, float]:
     split_dir = run_dir / split_name
     patient_ids = list(dataset.metadata["patient_ids"])
     model_prediction = estimator.predict(dataset)
     pred_cluster = model_prediction.predict()
     probabilities = model_prediction.predict_proba()
-    risk_score = model_prediction.risk_score()
+    risk_score = model_prediction.risk_score(risk_horizon)
     survival_time = torch.stack([dataset[index].survival_time for index in range(len(dataset))])
     event = torch.stack([dataset[index].event for index in range(len(dataset))])
-    metrics = evaluate_case_predictions(dataset, model_prediction)
+    metrics = evaluate_case_predictions(dataset, model_prediction, risk_horizon)
 
     dataset.save(split_dir / "dataset.pt")
     model_prediction.save(split_dir / "model_prediction.pt")
@@ -82,6 +87,7 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
         raise ValueError("K 选择草案位于 scripts/mimic/_unfinished/select_k.py，当前尚未完成")
     run_dir = config.paths.dir
     run_dir.mkdir(parents=True, exist_ok=True)
+    artifacts = resolve_artifact_names(config.artifacts.names)
     split_dir = resolve_input_path(config.split.dir)
     dataset_paths = {
         name: split_dir / name / "dataset.pt" for name in ("train", "validation", "test")
@@ -120,21 +126,64 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
         torch.cuda.set_device(torch.device(device))
         torch.cuda.reset_peak_memory_stats(torch.device(device))
 
-    training_started = time.perf_counter()
-    estimator = TrailsEstimator(trails_config).fit(train, validation_data=validation)
-    training_seconds = time.perf_counter() - training_started
+    if config.swanlab.enabled:
+        experiment_name = config.swanlab.experiment or datetime.now().astimezone().strftime(
+            "trails-mimic-%Y%m%d-%H%M%S"
+        )
+        init_kwargs: dict[str, Any] = {
+            "project": config.swanlab.project,
+            "experiment_name": experiment_name,
+            "config": {
+                "application": config.model_dump(mode="json"),
+                "training": trails_config.model_dump(mode="json"),
+                "artifacts": sorted(artifacts),
+            },
+        }
+        if config.swanlab.mode is not None:
+            init_kwargs["mode"] = config.swanlab.mode
+        swanlab.init(**init_kwargs)
 
-    inference_started = time.perf_counter()
-    split_metrics = {
-        name: _save_split_outputs(run_dir, name, dataset, estimator)
-        for name, dataset in datasets.items()
-    }
-    inference_seconds = time.perf_counter() - inference_started
+    try:
+        training_started = time.perf_counter()
+        estimator = TrailsEstimator(trails_config).fit(
+            train,
+            validation_data=validation,
+            history_callback=log_swanlab_history if config.swanlab.enabled else None,
+        )
+        training_seconds = time.perf_counter() - training_started
+
+        inference_started = time.perf_counter()
+        split_metrics = {
+            name: _save_split_outputs(
+                run_dir,
+                name,
+                dataset,
+                estimator,
+                trails_config.trainer.risk_horizon,
+            )
+            for name, dataset in datasets.items()
+        }
+        inference_seconds = time.perf_counter() - inference_started
+        if config.swanlab.enabled:
+            step = int(estimator.history[-1]["global_epoch"]) if estimator.history else 0
+            swanlab.log(
+                {
+                    f"{split_name}/{metric_name}": value
+                    for split_name, metrics in split_metrics.items()
+                    for metric_name, value in metrics.items()
+                },
+                step=step,
+            )
+    finally:
+        if config.swanlab.enabled:
+            swanlab.finish()
 
     estimator.save(run_dir / "model.pt")
     shutil.copy2(preprocessing_parameters, run_dir / "preprocessing_parameters.csv")
     save_history_csv(run_dir / "training_history.csv", estimator.history)
     save_json(run_dir / "training_history.json", estimator.history)
+    if "plot" in artifacts:
+        plot_history(run_dir / "training_history.png", estimator.history)
     peak_memory = (
         torch.cuda.max_memory_allocated(torch.device(device)) / 1024**3
         if device.startswith("cuda")

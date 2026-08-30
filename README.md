@@ -14,7 +14,7 @@ Subtypes** 的缩写。项目目标是构建面向非同步多变量医学纵向
   per-feature `mtan2` 输入层用于对照。
 - 解码器支持 GRU/LSTM/Transformer，从患者级 latent representation 重构纵向轨迹。
 - 聚类模块使用 VaDE 风格的可学习 Gaussian mixture latent prior。
-- 生存模块使用 cluster-specific Weibull mixture survival head，混合权重来自 VaDE posterior。
+- 生存模块由患者 latent mean 输出一组 Weibull shape/scale，不跨簇混合生存分布。
 
 本阶段不实现 mixed-type likelihood、competing risks 或 recurrent events。
 

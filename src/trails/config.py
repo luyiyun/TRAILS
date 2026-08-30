@@ -204,7 +204,7 @@ class ModelConfig(BaseModel):
         latent_dim: 患者变分表示的宽度。
         n_clusters: 高斯混合分量及患者亚型的数量。
         dropout: 支持该操作的网络层所使用的 dropout 概率。
-        survival_head_hidden_layers: 输出各簇 Weibull 参数前使用的潜空间等宽
+        survival_head_hidden_layers: 输出患者 Weibull 参数前使用的潜空间等宽
             隐藏层数量。
         loss: 多任务损失加权配置。
         encoder: 异步输入和时序映射配置。
@@ -242,7 +242,8 @@ class TrainerConfig(BaseModel):
         early_stop: 监控指标停止改善时是否提前终止训练。
         early_stopping_patience: 达到 ``min_epochs`` 后允许连续无改善的轮数。
         early_stopping_min_delta: 被视为改善所需的最小变化量。
-        early_stopping_monitor: 监控验证或训练损失，或 C-index。
+        early_stopping_monitor: 监控总损失、生存损失或 C-index。
+        risk_horizon: 计算 C-index 风险排序所用的固定结局时间窗。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -260,7 +261,8 @@ class TrainerConfig(BaseModel):
     early_stop: bool = Field(default=True)
     early_stopping_patience: int = Field(default=10, gt=0)
     early_stopping_min_delta: float = Field(default=0.0, ge=0.0)
-    early_stopping_monitor: Literal["loss", "cindex"] = "loss"
+    early_stopping_monitor: Literal["loss", "survival_loss", "cindex"] = "loss"
+    risk_horizon: float = Field(default=1.0, gt=0.0)
 
 
 class TrailsConfig(BaseModel):

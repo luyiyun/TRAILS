@@ -322,10 +322,14 @@ def run(config: CaseApplicationConfig) -> dict[str, Any]:
             dataset,
             patient_ids=list(dataset.metadata["patient_ids"]),
             pred_cluster=model_prediction.predict(),
-            risk_score=model_prediction.risk_score(),
+            risk_score=model_prediction.risk_score(trails_config.trainer.risk_horizon),
             cluster_probabilities=model_prediction.predict_proba(),
         )
-        metrics = evaluate_case_predictions(dataset, model_prediction)
+        metrics = evaluate_case_predictions(
+            dataset,
+            model_prediction,
+            trails_config.trainer.risk_horizon,
+        )
         if config.swanlab.enabled:
             step = int(float(estimator.history[-1]["global_epoch"])) if estimator.history else 0
             swanlab_metrics: dict[str, float | int] = {

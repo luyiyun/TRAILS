@@ -56,6 +56,7 @@ def _group_race(values: pd.Series) -> pd.Series:
 
 def _load_predictions(
     split_dir: Path,
+    risk_horizon: float,
 ) -> tuple[pd.DataFrame, TrailsPrediction, ClinicalTimeSeriesDataset]:
     dataset = ClinicalTimeSeriesDataset.load(split_dir / "dataset.pt")
     prediction = TrailsPrediction.load(split_dir / "model_prediction.pt")
@@ -64,7 +65,7 @@ def _load_predictions(
         raise ValueError(f"数据集缺少 patient_ids：{split_dir}")
     patient_ids = [str(value) for value in raw_patient_ids]
     pred_cluster = prediction.predict().numpy().astype(np.int64, copy=False)
-    risk_score = prediction.risk_score().numpy().astype(np.float64, copy=False)
+    risk_score = prediction.risk_score(risk_horizon).numpy().astype(np.float64, copy=False)
     survival_time = torch.stack(
         [dataset[index].survival_time for index in range(len(dataset))]
     ).numpy()
@@ -860,7 +861,7 @@ def run(config: MimicEvaluationConfig) -> dict[str, Any]:
     ] + [input_dir / "preprocessing_parameters.csv"]
     if missing := [str(path) for path in required if not path.is_file()]:
         raise FileNotFoundError(f"缺少冻结预测：{missing}")
-    loaded = {name: _load_predictions(path) for name, path in split_dirs.items()}
+    loaded = {name: _load_predictions(path, config.tau) for name, path in split_dirs.items()}
     preprocessing = pd.read_csv(input_dir / "preprocessing_parameters.csv")
     cluster_counts = {
         name: int(prediction.predict_proba().shape[1])

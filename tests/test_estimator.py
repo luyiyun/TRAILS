@@ -129,7 +129,11 @@ def test_estimator_fit_predict_test() -> None:
 
     assert predictions.shape == (8,)
     assert probabilities.shape == (8, 2)
-    assert prediction.risk_score().shape == (8,)
+    assert prediction.weibull_shape.shape == (8,)
+    assert prediction.weibull_scale.shape == (8,)
+    risk_score = prediction.risk_score(28.0)
+    assert risk_score.shape == (8,)
+    assert torch.allclose(risk_score, 1.0 - prediction.survival([28.0]).squeeze(1))
     assert torch.allclose(probabilities.sum(dim=-1), torch.ones(8), atol=1e-5)
     assert survival.shape == (8, 3)
     assert torch.allclose(survival[:, 0], torch.ones(8), atol=1e-6)
@@ -183,6 +187,11 @@ def test_fit_with_explicit_validation_data_warns_and_uses_it(
     data = simulate_dataset(seed=47)
     train_data, validation_data = data.split([0.75, 0.25], seed=11)
     config = tiny_config_with_validation(data.n_features)
+    config = config.model_copy(
+        update={
+            "trainer": config.trainer.model_copy(update={"early_stopping_monitor": "survival_loss"})
+        }
+    )
 
     caplog.set_level(logging.WARNING, logger="trails.trainer")
     estimator = TrailsEstimator(config).fit(train_data, validation_data=validation_data)
@@ -190,6 +199,10 @@ def test_fit_with_explicit_validation_data_warns_and_uses_it(
     assert "Explicit validation_data was provided" in caplog.text
     assert "trainer.valid_size=0.25 is ignored" in caplog.text
     assert "valid" in estimator.history[-1]
+    assert estimator.history[-1].get("best_monitor") == "valid/survival_loss"
+    assert estimator.history[-1].get("best_monitor_value") == pytest.approx(
+        estimator.history[-1]["valid"]["survival_loss"]
+    )
 
 
 def test_fit_internal_validation_split_remains_default_behavior() -> None:
@@ -231,4 +244,7 @@ def test_estimator_save_load(tmp_path: Path) -> None:
     loaded_prediction = TrailsPrediction.load(prediction_path)
 
     assert torch.equal(estimator.predict(data).predict(), loaded.predict(data).predict())
-    assert torch.equal(estimator.predict(data).risk_score(), loaded_prediction.risk_score())
+    assert torch.equal(
+        estimator.predict(data).risk_score(28.0),
+        loaded_prediction.risk_score(28.0),
+    )

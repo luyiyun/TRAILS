@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from importlib import import_module
@@ -108,10 +109,10 @@ def save_history_csv(path: str | Path, history: Sequence[HistoryEntry]) -> None:
 
 
 def plot_history(path: str | Path, history: Sequence[HistoryEntry]) -> None:
-    """绘制可用的损失、C-index 和聚类恢复训练曲线。
+    """按指标绘制配对的训练与验证历史曲线。
 
-    面板仅包含历史中实际存在数值的指标，并在 warmup 与正式训练阶段发生变化
-    时标记边界。无数值指标时仍会生成带说明的占位图。
+    每个面板只包含一个指标的 train/valid 曲线，并按接近方形的网格排列。
+    面板仅包含历史中实际存在数值的指标，并标记训练阶段和早停事件。
 
     参数：
         path: 输出图片路径，格式由扩展名决定。
@@ -125,32 +126,45 @@ def plot_history(path: str | Path, history: Sequence[HistoryEntry]) -> None:
     if not panels:
         panels = [("History", [])]
 
+    ncols = math.ceil(math.sqrt(len(panels)))
+    nrows = math.ceil(len(panels) / ncols)
     fig, axes = plt.subplots(
-        len(panels),
-        1,
-        figsize=(10.0, max(3.2, 2.8 * len(panels))),
+        nrows,
+        ncols,
+        figsize=(5.2 * ncols, 3.4 * nrows),
         sharex=True,
+        squeeze=False,
         constrained_layout=True,
     )
-    if len(panels) == 1:
-        axes = [axes]
+    plot_axes = list(axes.flat)
 
     x_values = _x_values(rows)
-    for ax, (title, names) in zip(axes, panels, strict=True):
+    for ax, (title, names) in zip(plot_axes, panels, strict=False):
         if names:
             for name in names:
                 y_values = _metric_values(rows, name)
-                ax.plot(x_values, y_values, marker="o", linewidth=1.8, markersize=3.5, label=name)
-            ax.legend(frameon=False, ncols=min(3, len(names)))
+                label = "valid" if name.startswith("val_") else "train"
+                ax.plot(
+                    x_values,
+                    y_values,
+                    marker="o",
+                    linewidth=1.8,
+                    markersize=3.5,
+                    label=label,
+                )
+            ax.legend(frameon=False, ncols=len(names))
         else:
             ax.text(0.5, 0.5, "No numeric history metrics", ha="center", va="center")
         ax.set_title(title, loc="left", fontsize=11, fontweight="bold")
         ax.grid(True, alpha=0.25)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
-        _mark_stage_boundary(ax, rows, x_values)
+        _mark_history_events(ax, rows, x_values)
 
-    axes[-1].set_xlabel("Global epoch")
+    for ax in plot_axes[len(panels) :]:
+        ax.remove()
+
+    fig.supxlabel("Global epoch")
     fig.suptitle("TRAILS training history", fontsize=13, fontweight="bold")
     fig.savefig(destination, dpi=180)
     plt.close(fig)
@@ -297,6 +311,7 @@ def _history_fieldnames(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         "vade_kl_loss_weight",
         "reconstruction_log_variance",
         "survival_log_variance",
+        "vade_kl_log_variance",
         "cindex",
         "acc",
         "ari",
@@ -310,6 +325,7 @@ def _history_fieldnames(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         "val_vade_kl_loss_weight",
         "val_reconstruction_log_variance",
         "val_survival_log_variance",
+        "val_vade_kl_log_variance",
         "val_cindex",
         "val_ari",
         "val_nmi",
@@ -321,27 +337,34 @@ def _history_fieldnames(rows: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def _available_panels(history: Sequence[Mapping[str, Any]]) -> list[tuple[str, list[str]]]:
-    """返回历史中具有数值的绘图面板及指标。"""
+    """为每个可用指标返回train/valid配对面板。"""
     panel_candidates = [
-        ("Total loss", ["loss", "val_loss"]),
-        (
-            "Loss components",
-            [
-                "reconstruction_loss",
-                "survival_loss",
-                "vade_kl_loss",
-                "val_reconstruction_loss",
-                "val_survival_loss",
-                "val_vade_kl_loss",
-            ],
-        ),
-        ("Concordance", ["cindex", "val_cindex"]),
-        ("Cluster recovery", ["acc", "ari", "nmi", "val_acc", "val_ari", "val_nmi"]),
+        ("Total loss", "loss"),
+        ("Reconstruction loss", "reconstruction_loss"),
+        ("Survival loss", "survival_loss"),
+        ("VaDE KL loss", "vade_kl_loss"),
+        ("Reconstruction loss weight", "reconstruction_loss_weight"),
+        ("Survival loss weight", "survival_loss_weight"),
+        ("VaDE KL loss weight", "vade_kl_loss_weight"),
+        ("Reconstruction log variance", "reconstruction_log_variance"),
+        ("Survival log variance", "survival_log_variance"),
+        ("VaDE KL log variance", "vade_kl_log_variance"),
+        ("Concordance", "cindex"),
+        ("Clustering accuracy", "acc"),
+        ("Adjusted Rand index", "ari"),
+        ("Normalized mutual information", "nmi"),
     ]
     return [
-        (title, [name for name in names if _has_numeric_values(history, name)])
-        for title, names in panel_candidates
-        if any(_has_numeric_values(history, name) for name in names)
+        (
+            title,
+            [
+                name
+                for name in (metric_name, f"val_{metric_name}")
+                if _has_numeric_values(history, name)
+            ],
+        )
+        for title, metric_name in panel_candidates
+        if any(_has_numeric_values(history, name) for name in (metric_name, f"val_{metric_name}"))
     ]
 
 
@@ -366,12 +389,12 @@ def _has_numeric_values(history: Sequence[Mapping[str, Any]], name: str) -> bool
     return any(isinstance(entry.get(name), int | float) for entry in history)
 
 
-def _mark_stage_boundary(
+def _mark_history_events(
     ax: Any,
     history: Sequence[Mapping[str, Any]],
     x_values: Sequence[float],
 ) -> None:
-    """在曲线上标记第一次训练阶段切换的位置。"""
+    """在曲线上标记阶段切换、最佳轮次和早停位置。"""
     stages = [entry.get("stage") for entry in history]
     if not stages or not x_values:
         return
@@ -391,7 +414,39 @@ def _mark_stage_boundary(
                 fontsize=8,
                 color="0.35",
             )
-            return
+            break
+
+    best_epoch = history[-1].get("best_global_epoch")
+    if isinstance(best_epoch, int | float):
+        ax.axvline(float(best_epoch), color="#2a9d8f", linestyle=":", linewidth=1.2)
+        ax.text(
+            float(best_epoch),
+            0.82,
+            "best",
+            transform=ax.get_xaxis_transform(),
+            ha="right",
+            va="top",
+            fontsize=8,
+            color="#2a9d8f",
+        )
+
+    stopped_epochs = [
+        x_value
+        for entry, x_value in zip(history, x_values, strict=True)
+        if entry.get("early_stopped") is True
+    ]
+    if stopped_epochs:
+        ax.axvline(stopped_epochs[-1], color="#e76f51", linestyle=":", linewidth=1.2)
+        ax.text(
+            stopped_epochs[-1],
+            0.66,
+            "early stop",
+            transform=ax.get_xaxis_transform(),
+            ha="right",
+            va="top",
+            fontsize=8,
+            color="#e76f51",
+        )
 
 
 def _pca_projection(z: Tensor) -> Tensor:

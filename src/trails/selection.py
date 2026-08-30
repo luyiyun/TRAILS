@@ -19,7 +19,12 @@ from .artifacts import save_json
 from .config import ClusterNumberSelectorConfig, TrailsConfig
 from .data import ClinicalTimeSeriesDataset
 from .estimator import TrailsEstimator
-from .metrics import cluster_assignment_diagnostics, concordance_index, gaussian_log_prob
+from .metrics import (
+    cluster_assignment_diagnostics,
+    concordance_index,
+    gaussian_log_prob,
+    weibull_event_probability,
+)
 
 
 @dataclass(frozen=True)
@@ -278,7 +283,14 @@ class ClusterNumberSelector:
         return {
             "cindex": float(
                 concordance_index(
-                    estimator.trainer._risk_score(outputs).detach().cpu().float(),
+                    weibull_event_probability(
+                        outputs.weibull_shape,
+                        outputs.weibull_scale,
+                        estimator.config.trainer.risk_horizon,
+                    )
+                    .detach()
+                    .cpu()
+                    .float(),
                     batch["survival_time"].detach().cpu().float(),
                     batch["event"].detach().cpu().float(),
                 )

@@ -19,6 +19,7 @@ from .metrics import (
     Cindex,
     ClusteringAccuracy,
     cluster_assignment_diagnostics,
+    weibull_event_probability,
 )
 from .model import TrailsLossBreakdown, TrailsModelOutput, TrailsSurvVaderModel
 from .progress import ProgressBar
@@ -79,16 +80,16 @@ class LossAccumulator:
 
 
 class EarlyStopper:
-    """监控损失或 C-index，并保存最佳模型状态。
+    """监控总损失、生存损失或 C-index，并保存最佳模型状态。
 
-    损失以减少超过 ``min_delta`` 为改善，C-index 以增加超过该阈值为改善；
+    两类损失以减少超过 ``min_delta`` 为改善，C-index 以增加超过该阈值为改善；
     连续 ``patience`` 轮未改善时请求停止。
     """
 
     def __init__(
         self,
         patience: int,
-        monitor: Literal["loss", "cindex"],
+        monitor: Literal["loss", "survival_loss", "cindex"],
         min_delta: float,
         has_validation: bool = True,
     ) -> None:
@@ -142,9 +143,9 @@ class EarlyStopper:
         """根据监控指标方向和最小变化量判断是否改善。"""
         if best_value is None:
             return True
-        if self.monitor == "loss":
-            return value < best_value - self.min_delta
-        return value > best_value + self.min_delta
+        if self.monitor == "cindex":
+            return value > best_value + self.min_delta
+        return value < best_value - self.min_delta
 
 
 class TrailsTrainer:
@@ -286,14 +287,16 @@ class TrailsTrainer:
                 entry["valid"] = {**losses, **scores}
 
             history.append(entry)
-            if history_callback is not None:
-                history_callback(entry)
-
-            if (
+            should_stop = (
                 (epoch + 1) >= self.config.min_epochs
                 and early_stopper is not None
                 and early_stopper.update(entry, self.model)
-            ):
+            )
+            if should_stop:
+                entry["early_stopped"] = True
+            if history_callback is not None:
+                history_callback(entry)
+            if should_stop:
                 break
 
         if early_stopper is not None and early_stopper.best_state is not None:
@@ -393,7 +396,11 @@ class TrailsTrainer:
                 if survival_metrics is not None:
                     for m in survival_metrics.values():
                         m.update(
-                            self._risk_score(output),
+                            weibull_event_probability(
+                                output.weibull_shape,
+                                output.weibull_scale,
+                                self.config.risk_horizon,
+                            ),
                             device_batch["survival_time"],
                             device_batch["event"],
                         )
@@ -434,11 +441,6 @@ class TrailsTrainer:
     def _move_batch(self, batch: Batch) -> Batch:
         """将批次中的全部张量移动到训练设备。"""
         return {name: value.to(self.config.device) for name, value in batch.items()}
-
-    def _risk_score(self, output: TrailsModelOutput) -> Tensor:
-        """以负后验加权 Weibull 尺度计算风险分数。"""
-        expected_scale = torch.sum(output.cluster_probabilities * output.weibull_scale, dim=-1)
-        return -expected_scale
 
     def _collect_latent_means(self, data: ClinicalTimeSeriesDataset) -> Tensor:
         """在 CPU 上收集整个数据集的确定性潜空间均值。"""

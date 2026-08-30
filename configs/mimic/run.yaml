@@ -15,19 +15,23 @@ outputs:
 model:
   n_clusters: 3
 trainer:
+  risk_horizon: 28.0
   min_epochs: 1
   max_epochs: 1
   batch_size: 256
   warmup_epochs: 1
   gmm_init_iters: 5
-  early_stop: false
+  early_stop: true
+  early_stopping_monitor: loss
 artifacts:
-  names: [history]
+  names: [history, plot]
 diagnostics:
   latent_embeddings:
     enabled: false
 swanlab:
   enabled: false
+  experiment: mimic
+  mode: cloud
 
 paths:
   dir: outputs/mimic_case/mimic_case-${now:%Y%m%d-%H%M%S-%f}

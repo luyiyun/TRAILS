@@ -87,30 +87,26 @@ def gaussian_log_prob(value: Tensor, mean: Tensor, log_variance: Tensor) -> Tens
     return -0.5 * (log_two_pi + clamped_log_variance + (value - mean).pow(2) / variance)
 
 
-def weibull_mixture_negative_log_likelihood(
-    cluster_logits: Tensor,
+def weibull_negative_log_likelihood(
     weibull_shape: Tensor,
     weibull_scale: Tensor,
     survival_time: Tensor,
     event: Tensor,
 ) -> Tensor:
-    """计算由簇后验加权的 Weibull 混合生存负对数似然。
+    """计算患者特异 Weibull 生存负对数似然。
 
-    已发生事件的样本使用密度项，删失样本使用生存函数项，再通过
-    ``cluster_logits`` 对各簇分量进行对数空间混合。
+    已发生事件的样本使用密度项，删失样本使用生存函数项。
 
     参数：
-        cluster_logits: 形状为 ``(batch, n_clusters)`` 的簇 logits。
-        weibull_shape: 各患者、各簇的正 Weibull 形状参数。
-        weibull_scale: 各患者、各簇的正 Weibull 尺度参数。
+        weibull_shape: 各患者的正 Weibull 形状参数。
+        weibull_scale: 各患者的正 Weibull 尺度参数。
         survival_time: 每位患者的随访或事件时间。
         event: 每位患者的事件指示。
 
     返回：
         批次平均的标量负对数似然。
     """
-    time = survival_time.clamp_min(1e-4).unsqueeze(-1)
-    event_indicator = event.unsqueeze(-1)
+    time = survival_time.clamp_min(1e-4)
     log_time = torch.log(time)
     log_shape = torch.log(weibull_shape)
     log_scale = torch.log(weibull_scale)
@@ -119,9 +115,21 @@ def weibull_mixture_negative_log_likelihood(
         log_shape - log_scale + (weibull_shape - 1.0) * (log_time - log_scale) - scaled_time
     )
     log_survival = -scaled_time
-    log_component = event_indicator * log_density + (1.0 - event_indicator) * log_survival
-    log_mixture = torch.logsumexp(torch.log_softmax(cluster_logits, dim=-1) + log_component, dim=-1)
-    return -log_mixture.mean()
+    log_likelihood = event * log_density + (1.0 - event) * log_survival
+    return -log_likelihood.mean()
+
+
+def weibull_event_probability(
+    weibull_shape: Tensor,
+    weibull_scale: Tensor,
+    horizon: float,
+) -> Tensor:
+    """计算固定时间窗内的患者 Weibull 事件概率。"""
+    if not math.isfinite(horizon) or horizon <= 0.0:
+        raise ValueError("horizon must be finite and positive.")
+    time = weibull_scale.new_tensor(horizon)
+    cumulative_hazard = torch.pow(time / weibull_scale, weibull_shape)
+    return -torch.expm1(-cumulative_hazard)
 
 
 def concordance_index(risk_score: Tensor, survival_time: Tensor, event: Tensor) -> float:
