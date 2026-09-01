@@ -7,7 +7,16 @@ from typing import Any, Self
 
 import joblib
 import numpy as np
+from FDApy.preprocessing.dim_reduction.mfpca import MFPCA
+from FDApy.representation.argvals import DenseArgvals, IrregularArgvals
+from FDApy.representation.functional_data import (
+    IrregularFunctionalData,
+    MultivariateFunctionalData,
+)
+from FDApy.representation.values import IrregularValues
 from numpy.typing import NDArray
+from skfda import FDataGrid
+from skfda.preprocessing.dim_reduction import FPCA
 from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
@@ -53,7 +62,6 @@ class UFPCAFeaturePipeline:
 
     def _fit_scores(self, data: ClinicalTimeSeriesDataset) -> NDArray[np.float64]:
         """按变量拟合插补器与FPCA并拼接患者得分。"""
-        fdata_grid_cls, fpca_cls = load_skfda_fpca()
         self.imputers = []
         self.fpca_models = []
         score_blocks: list[NDArray[np.float64]] = []
@@ -61,10 +69,10 @@ class UFPCAFeaturePipeline:
             imputer = SimpleImputer(strategy="mean", keep_empty_features=True)
             imputed = np.asarray(imputer.fit_transform(matrix), dtype=np.float64)
             n_components = min(self.n_components, imputed.shape[0], imputed.shape[1])
-            fpca_model = fpca_cls(n_components=n_components)
+            fpca_model = FPCA(n_components=n_components)
             scores = np.asarray(
                 fpca_model.fit_transform(
-                    fdata_grid_cls(data_matrix=imputed, grid_points=self.reference_grid)
+                    FDataGrid(data_matrix=imputed, grid_points=self.reference_grid)
                 ),
                 dtype=np.float64,
             )
@@ -77,7 +85,6 @@ class UFPCAFeaturePipeline:
         """使用训练集插补器与FPCA转换冻结划分。"""
         if not self.imputers or not self.fpca_models:
             raise RuntimeError("UFPCAFeaturePipeline必须先拟合")
-        fdata_grid_cls, _ = load_skfda_fpca()
         matrices = self._interpolated_matrices(data)
         if len(matrices) != len(self.fpca_models):
             raise ValueError("冻结划分特征数与FPCA训练集不一致")
@@ -88,7 +95,7 @@ class UFPCAFeaturePipeline:
             imputed = np.asarray(imputer.transform(matrix), dtype=np.float64)
             scores = np.asarray(
                 fpca_model.transform(
-                    fdata_grid_cls(data_matrix=imputed, grid_points=self.reference_grid)
+                    FDataGrid(data_matrix=imputed, grid_points=self.reference_grid)
                 ),
                 dtype=np.float64,
             )
@@ -213,15 +220,14 @@ class MFPCAFeaturePipeline:
     def fit_transform(self, data: ClinicalTimeSeriesDataset) -> NDArray[np.float64]:
         """拟合训练集缺失曲线、MFPCA和得分标准化。"""
         functional_data = self._functional_data(data, fit=True)
-        mfpca_cls, dense_argvals_cls, *_ = load_fdapy_mfpca()
         n_components = min(self.n_components, len(data), len(self.reference_grid))
         expansions = [
             {"method": "UFPCA", "n_components": n_components, "method_smoothing": "LP"}
             for _ in range(data.n_features)
         ]
-        model = mfpca_cls(n_components=n_components, univariate_expansions=expansions)
+        model = MFPCA(n_components=n_components, univariate_expansions=expansions)
         points = [
-            dense_argvals_cls({"input_dim_0": self.reference_grid}) for _ in range(data.n_features)
+            DenseArgvals({"input_dim_0": self.reference_grid}) for _ in range(data.n_features)
         ]
         model.fit(functional_data, points=points, method_smoothing="LP")
         self.model = model
@@ -248,8 +254,6 @@ class MFPCAFeaturePipeline:
 
     def _functional_data(self, data: ClinicalTimeSeriesDataset, *, fit: bool) -> Any:
         """保留患者实际观测格点，仅为整条缺失曲线使用train均值曲线。"""
-        dense_argvals_cls, irregular_argvals_cls, irregular_values_cls = load_fdapy_mfpca()[1:4]
-        irregular_data_cls, multivariate_data_cls = load_fdapy_mfpca()[4:]
         aligned = data.with_return_kind("aligned")
         grid_size = len(self.reference_grid)
         argvals: list[dict[int, Any]] = [dict() for _ in range(aligned.n_features)]
@@ -281,7 +285,7 @@ class MFPCAFeaturePipeline:
                     ],
                     dtype=np.float64,
                 )
-                argvals[feature_index][patient_index] = dense_argvals_cls(
+                argvals[feature_index][patient_index] = DenseArgvals(
                     {"input_dim_0": self.reference_grid[unique_bins]}
                 )
                 values[feature_index][patient_index] = binned
@@ -304,19 +308,19 @@ class MFPCAFeaturePipeline:
         if self.empty_curves is None or self.empty_curves.shape[0] != aligned.n_features:
             raise ValueError("冻结划分特征数与MFPCA训练集不一致")
         for feature_index, patient_index in missing:
-            argvals[feature_index][patient_index] = dense_argvals_cls(
+            argvals[feature_index][patient_index] = DenseArgvals(
                 {"input_dim_0": self.reference_grid}
             )
             values[feature_index][patient_index] = self.empty_curves[feature_index].copy()
 
-        components = [
-            irregular_data_cls(
-                irregular_argvals_cls(dict(sorted(component_argvals.items()))),
-                irregular_values_cls(dict(sorted(component_values.items()))),
+        components: list[Any] = [
+            IrregularFunctionalData(
+                IrregularArgvals(dict(sorted(component_argvals.items()))),
+                IrregularValues(dict(sorted(component_values.items()))),
             )
             for component_argvals, component_values in zip(argvals, values, strict=True)
         ]
-        return multivariate_data_cls(components)
+        return MultivariateFunctionalData(components)
 
 
 class MFPCAKMeansBaseline(MFPCAFeaturePipeline):
@@ -382,31 +386,3 @@ class MFPCAKMeansBaseline(MFPCAFeaturePipeline):
             raise RuntimeError("MFPCAKMeansBaseline必须先拟合")
         path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(self, path)
-
-
-def load_skfda_fpca() -> tuple[Any, Any]:
-    """延迟导入scikit-fda对象，避免共享模块加载时产生额外开销。"""
-    from skfda import FDataGrid
-    from skfda.preprocessing.dim_reduction import FPCA
-
-    return FDataGrid, FPCA
-
-
-def load_fdapy_mfpca() -> tuple[Any, Any, Any, Any, Any, Any]:
-    """延迟导入FDApy对象，避免未运行MFPCA时加载该依赖。"""
-    from FDApy.preprocessing.dim_reduction.mfpca import MFPCA
-    from FDApy.representation.argvals import DenseArgvals, IrregularArgvals
-    from FDApy.representation.functional_data import (
-        IrregularFunctionalData,
-        MultivariateFunctionalData,
-    )
-    from FDApy.representation.values import IrregularValues
-
-    return (
-        MFPCA,
-        DenseArgvals,
-        IrregularArgvals,
-        IrregularValues,
-        IrregularFunctionalData,
-        MultivariateFunctionalData,
-    )
