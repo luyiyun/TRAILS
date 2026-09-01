@@ -16,6 +16,8 @@ items.
 - `scripts/`: one Hydra CLI entrypoint per command. Top-level commands use
   `uv run python scripts/<command>.py ...`; numbered MIMIC commands use
   `uv run python -m scripts.mimic.<numbered_command> ...`.
+- `scripts/utils/`: reusable command-layer methods and artifact contracts shared
+  by MIMIC and future workflow packages such as `scripts/simulation/`.
 - `configs/`: Hydra command roots plus shared simulation, training, baseline, optimization, summary, and case configuration.
 - `src/trails/`: reusable core code: data, model, trainer, estimator, metrics.
 - `src/trails_simulate/`: synthetic clinical data generation; imports `trails`.
@@ -31,6 +33,8 @@ Allowed dependencies:
 - `scripts/* -> trails_simulate`
 - `scripts/* -> trails_case`
 - `scripts.mimic command modules -> scripts.mimic` non-command support modules
+- workflow packages under `scripts/ -> scripts.utils`
+- `scripts.utils -> trails`
 - `trails_simulate -> trails`
 - `trails_case -> trails`
 - `trails_case -> trails_simulate.config` for shared command config models only
@@ -41,6 +45,7 @@ Forbidden dependencies:
 - `trails -> trails_case`
 - `trails -> scripts`
 - `trails_case -> trails_simulate` runtime modules outside `trails_simulate.config`
+- `scripts.utils -> scripts.mimic` or another dataset-specific workflow package
 - MIMIC command modules importing another numbered command module
 
 Keep command orchestration out of `src/trails`; the main package should remain a
@@ -55,7 +60,9 @@ clean reusable method library.
 - Run real-data case modeling: `uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv`
 - Generate MIMIC patient splits and tensor datasets: `uv run python -m scripts.mimic.06_split`
 - Run fixed-K MIMIC modeling: `uv run python -m scripts.mimic.07_run`
-- Evaluate frozen MIMIC test predictions: `uv run python -m scripts.mimic.08_evaluate input_dir=outputs/mimic_case/<run>`
+- Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines input_dir=outputs/mimic_case/<run>`
+- Evaluate frozen MIMIC clusters: `uv run python -m scripts.mimic.09_eval_cluster input_dir=outputs/mimic_case/<run> 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
+- Evaluate frozen MIMIC survival predictions: `uv run python -m scripts.mimic.09_eval_survival input_dir=outputs/mimic_case/<run> 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
 - Run lightweight baselines on existing splits: `uv run python scripts/baseline.py paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run python scripts/optim.py paths.data_root=data/simulated/base`
 - Summarize train and baseline results: `uv run python scripts/summary.py 'train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'baseline_roots=[outputs/baseline/base-...]' 'train_labels=[base,mtan]' 'baseline_labels=[kmeans]'`
@@ -97,6 +104,10 @@ clean reusable method library.
 ## Current Decisions
 
 - Package name: `trails`.
+- Reusable baseline implementations and command-layer artifact contracts live in
+  `scripts/utils`; dataset-specific workflow packages own only configuration,
+  orchestration, and adapters. `src/trails_simulate` and `src/trails_case` are
+  legacy workflow modules to migrate into `scripts/` or remove incrementally.
 - CLI lives in command-specific Hydra scripts under `scripts/`; no package console script is configured.
 - Non-MIMIC command scripts use root configs at `configs/<command>.yaml`; Hydra
   configs for `scripts/mimic/` live under `configs/mimic/`. `scripts/simulate.py`
@@ -246,17 +257,27 @@ clean reusable method library.
   `feature_order: []`, which preserves the observed CSV order by default and can
   be overridden directly through Hydra.
   K selection is currently excluded as unfinished.
-- `scripts/mimic/08_evaluate.py` evaluates the saved validation and test
-  predictions separately, always estimates censoring from train, and writes
-  split-specific artifacts under `evaluation/validation/` and `evaluation/test/`.
-  It consumes each frozen split's `dataset.pt` and `model_prediction.pt` without
-  retraining or a case-specific payload, and reports Harrell and IPCW C-index,
-  cumulative/dynamic AUC, daily Brier scores and IBS, quantile-group Kaplan-Meier
-  calibration, global log-rank, and cluster-level survival summaries. Its local
-  `SurvivalCalibration` class owns calibration calculation and plotting; each
-  evaluated split saves calibration panels, predicted-cluster Kaplan-Meier curves,
-  and a dynamic-AUC/Brier/calibration-error time-metrics panel as PNG/PDF.
-- `AdjustedCoxAnalysis` uses the train split's lowest-mean-risk cluster as the
+- `scripts/mimic/08_baselines.py` fits each method/seed only on frozen train
+  (validation may control early stopping), saves models and three-split predictions,
+  and records source/artifact SHA256 hashes in an atomic manifest. It directly uses
+  `TrailsEstimator` for no-survival ablation, copying 07's complete training config
+  and changing only survival loss weight and the configured seed. Shared baselines
+  write `BaselinePrediction` NPZ; R exchange files and checkpoints stay remote.
+  Failed methods are recorded, other methods may finish, but the batch exits nonzero
+  and is not accepted as a complete comparison. New run directories are required.
+- `09_eval_cluster.py` and `09_eval_survival.py` replace the old `08_evaluate.py`.
+  They accept any number of completed `baseline_dirs`, verify frozen-source hashes,
+  branch between `TrailsPrediction` and baseline NPZ readers, and write method/seed/
+  split artifacts below `evaluation/cluster` and `evaluation/survival` respectively.
+  `evaluation.py` retains shared plotting/calculation classes. Cluster evaluation
+  reports occupancy, entropy, KM/log-rank, adjusted Cox, clinical characteristics,
+  trajectories and label agreement; it never generates cluster-only survival
+  predictions or predictive C-index/AUC/IBS/calibration from cluster KM curves.
+  Survival evaluation reports Harrell/IPCW C-index, cumulative/dynamic AUC, daily
+  Brier/IBS and quantile-group KM calibration, always estimating censoring from train.
+  Both write unified comparison tables. Degenerate clusters and unestimable Cox
+  effects remain explicit diagnostics, not silently relabeled successes.
+- `AdjustedCoxAnalysis` uses the train split's lowest observed KM mortality cluster as the
   shared validation/test reference and reports cluster hazard ratios adjusted for
   age, gender, grouped race, and sepsis-onset SOFA with lifelines' default Efron
   ties handling; forest plots show only the adjusted cluster effects. Each split

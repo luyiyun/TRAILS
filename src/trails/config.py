@@ -174,8 +174,9 @@ class LossConfig(BaseModel):
         survival_weight: 生存损失的初始权重或固定权重。
         cluster_weight: VaDE 聚类损失的初始权重或固定权重。
 
-    不确定性加权要求所有初始权重严格为正；固定加权允许通过零权重关闭某个
-    损失分量。
+    不确定性加权要求重建和聚类初始权重严格为正；生存初始权重可设为零，
+    表示从总损失和可学习不确定性参数中移除生存任务。固定加权允许通过零
+    权重关闭任意损失分量。
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -187,13 +188,13 @@ class LossConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_uncertainty_initial_weights(self) -> LossConfig:
-        """要求不确定性加权使用正的初始权重。"""
+        """要求不确定性加权的重建和聚类初始权重为正。"""
         if self.weighting == "uncertainty" and (
-            self.reconstruction_weight <= 0.0
-            or self.survival_weight <= 0.0
-            or self.cluster_weight <= 0.0
+            self.reconstruction_weight <= 0.0 or self.cluster_weight <= 0.0
         ):
-            raise ValueError("Uncertainty loss weighting requires all initial weights > 0.")
+            raise ValueError(
+                "Uncertainty loss weighting requires reconstruction and cluster weights > 0."
+            )
         return self
 
 

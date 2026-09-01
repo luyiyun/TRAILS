@@ -16,6 +16,13 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
 ]
 
+[manifest]
+
+[[manifest.dependency-metadata]]
+name = "auton-survival"
+version = "0.1.0"
+requires-dist = ["lifelines>=0.30,<0.31", "matplotlib>=3.8.0", "numpy>=2.4.4", "pandas>=3.0.3", "scikit-learn>=1.8.0", "scikit-survival>=0.28.0,<0.29", "scipy>=1.17.1", "torch>=2.12.0", "tqdm>=4.67.3"]
+
 [[package]]
 name = "alembic"
 version = "1.18.4"
@@ -84,6 +91,26 @@ dependencies = [
     { name = "scipy" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/85/ae/7f2031ea76140444b2453fa139041e5afd4a09fc5300cfefeb1103291f80/autograd-gamma-0.5.0.tar.gz", hash = "sha256:f27abb7b8bb9cffc8badcbf59f3fe44a9db39e124ecacf1992b6d952934ac9c4", size = 3952, upload-time = "2020-10-15T16:51:06.785Z" }
+
+[[package]]
+name = "auton-survival"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "lifelines" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "scikit-learn" },
+    { name = "scikit-survival" },
+    { name = "scipy" },
+    { name = "torch" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/82/4d/cf4c83b895cb859eb9fccc60f7e5c867785da1c44d3b67816525f0d5b17a/auton_survival-0.1.0.tar.gz", hash = "sha256:1c55cde97b03475605a8168dc4522716fcff86cef348276f793e063deb7b7474", size = 2757035, upload-time = "2023-10-16T17:17:17.442Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/b3/5852ae07da622bc6ca3ce957504d94e0d9a72171f9cc86c424c28df8df8f/auton_survival-0.1.0-py3-none-any.whl", hash = "sha256:ad6ff49a531c86a6c06ba27e4932ce01b4f5a752fe06c59b7c08c64718ad9501", size = 2840921, upload-time = "2023-10-16T17:17:15.54Z" },
+]
 
 [[package]]
 name = "captum"
@@ -2537,18 +2564,13 @@ name = "trails"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "duckdb" },
-    { name = "hydra-core" },
-    { name = "lifelines" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "pydantic" },
-    { name = "scikit-fda" },
     { name = "scikit-learn" },
     { name = "scikit-survival" },
     { name = "scipy" },
-    { name = "swanlab" },
     { name = "torch" },
     { name = "torchmetrics" },
     { name = "tqdm" },
@@ -2557,29 +2579,30 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "auton-survival" },
     { name = "captum" },
+    { name = "duckdb" },
+    { name = "hydra-core" },
     { name = "ipdb" },
+    { name = "lifelines" },
     { name = "optuna" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "scikit-fda" },
     { name = "seaborn" },
+    { name = "swanlab" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "duckdb", specifier = ">=1.4,<1.5" },
-    { name = "hydra-core", specifier = ">=1.3.2" },
-    { name = "lifelines", specifier = ">=0.30,<0.31" },
     { name = "matplotlib", specifier = ">=3.8.0" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "pandas", specifier = ">=3.0.3" },
     { name = "pydantic", specifier = ">=2.13.4" },
-    { name = "scikit-fda", specifier = ">=0.10.1" },
     { name = "scikit-learn", specifier = ">=1.8.0" },
     { name = "scikit-survival", specifier = ">=0.28.0,<0.29" },
     { name = "scipy", specifier = ">=1.17.1" },
-    { name = "swanlab", specifier = ">=0.7.18" },
     { name = "torch", specifier = ">=2.12.0" },
     { name = "torchmetrics", specifier = ">=1.9.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
@@ -2588,13 +2611,19 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "auton-survival", specifier = "==0.1.0" },
     { name = "captum", specifier = ">=0.9.0" },
+    { name = "duckdb", specifier = ">=1.4,<1.5" },
+    { name = "hydra-core", specifier = ">=1.3.2" },
     { name = "ipdb", specifier = ">=0.13.13" },
+    { name = "lifelines", specifier = ">=0.30,<0.31" },
     { name = "optuna", specifier = ">=4.8.0" },
     { name = "pyright", specifier = ">=1.1.409" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "ruff", specifier = ">=0.15.13" },
+    { name = "scikit-fda", specifier = ">=0.10.1" },
     { name = "seaborn", specifier = ">=0.13.2" },
+    { name = "swanlab", specifier = ">=0.7.18" },
 ]
 
 [[package]]

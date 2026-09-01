@@ -1058,6 +1058,8 @@ class TrailsSurvVaderModel(nn.Module):
                 "survival": model_config.loss.survival_weight,
                 "vade_kl": model_config.loss.cluster_weight,
             }.items():
+                if initial_weight == 0.0:
+                    continue
                 initial_log_variance = -math.log(2.0 * initial_weight)
                 self.loss_log_variances[name] = nn.Parameter(
                     torch.tensor(initial_log_variance, dtype=torch.float32)
@@ -1309,13 +1311,19 @@ class TrailsSurvVaderModel(nn.Module):
         """使用可学习对数方差组合启用的多任务损失。"""
         # 多任务不确定性加权：s=log(sigma^2)，用可学习噪声自动调节各 loss 贡献。
         reconstruction_term = self._uncertainty_weighted_loss("reconstruction", reconstruction)
-        survival_term = self._uncertainty_weighted_loss("survival", survival)
-        total = reconstruction_term + survival_term
+        total = reconstruction_term
+        survival_enabled = self.model_config.loss.survival_weight > 0.0
+        if survival_enabled:
+            total = total + self._uncertainty_weighted_loss("survival", survival)
         if include_vade_kl:
             total = total + self._uncertainty_weighted_loss("vade_kl", vade_kl)
 
         reconstruction_weight = 0.5 * torch.exp(-self.loss_log_variances["reconstruction"])
-        survival_weight = 0.5 * torch.exp(-self.loss_log_variances["survival"])
+        survival_weight = (
+            0.5 * torch.exp(-self.loss_log_variances["survival"])
+            if survival_enabled
+            else reconstruction.new_zeros(())
+        )
         vade_kl_weight = 0.5 * torch.exp(-self.loss_log_variances["vade_kl"])
         return TrailsLossBreakdown(
             loss=total,
@@ -1326,7 +1334,9 @@ class TrailsSurvVaderModel(nn.Module):
             survival_loss_weight=survival_weight,
             vade_kl_loss_weight=vade_kl_weight,
             reconstruction_log_variance=self.loss_log_variances["reconstruction"],
-            survival_log_variance=self.loss_log_variances["survival"],
+            survival_log_variance=(
+                self.loss_log_variances["survival"] if survival_enabled else None
+            ),
             vade_kl_log_variance=(self.loss_log_variances["vade_kl"] if include_vade_kl else None),
         )
 

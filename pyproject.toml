@@ -8,22 +8,33 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "duckdb>=1.4,<1.5",
-    "hydra-core>=1.3.2",
     "matplotlib>=3.8.0",
     "numpy>=2.4.4",
     "pandas>=3.0.3",
     "pydantic>=2.13.4",
     "scipy>=1.17.1",
-    "scikit-fda>=0.10.1",
     "scikit-learn>=1.8.0",
     "scikit-survival>=0.28.0,<0.29",
-    "swanlab>=0.7.18",
     "torch>=2.12.0",
     "torchmetrics>=1.9.0",
     "tqdm>=4.67.3",
     "umap-learn>=0.5.12",
+]
+
+# 官方0.1.0的依赖上限停留在2023年；DCM已在本项目现代科学栈上完成运行探针。
+[[tool.uv.dependency-metadata]]
+name = "auton-survival"
+version = "0.1.0"
+requires-dist = [
     "lifelines>=0.30,<0.31",
+    "matplotlib>=3.8.0",
+    "numpy>=2.4.4",
+    "pandas>=3.0.3",
+    "scikit-learn>=1.8.0",
+    "scikit-survival>=0.28.0,<0.29",
+    "scipy>=1.17.1",
+    "torch>=2.12.0",
+    "tqdm>=4.67.3",
 ]
 
 [build-system]
@@ -32,13 +43,19 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "auton-survival==0.1.0",
     "captum>=0.9.0",
+    "duckdb>=1.4,<1.5",
+    "hydra-core>=1.3.2",
     "ipdb>=0.13.13",
+    "lifelines>=0.30,<0.31",
     "optuna>=4.8.0",
     "pyright>=1.1.409",
     "pytest>=9.0.3",
     "ruff>=0.15.13",
+    "scikit-fda>=0.10.1",
     "seaborn>=0.13.2",
+    "swanlab>=0.7.18",
 ]
 
 [tool.ruff]

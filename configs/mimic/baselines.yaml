@@ -1,0 +1,78 @@
+# @package _global_
+input_dir: outputs/mimic_case/mimic_case-run
+n_clusters: null
+risk_horizon: 28.0
+prediction_times: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0]
+methods:
+  - kind: summary_kmeans
+    name: summary_kmeans
+    seeds: [20260517]
+  - kind: fpca_kmeans
+    name: fpca_kmeans
+    seeds: [20260517]
+  - kind: cox_risk_kmeans
+    name: cox_risk_kmeans
+    seeds: [20260517]
+  - kind: trails_no_survival
+    name: trails_no_survival
+    seeds: [20260517]
+  - kind: cox_ph
+    name: cox_ph
+    seeds: [20260517]
+  - kind: random_survival_forest
+    name: random_survival_forest
+    seeds: [20260517]
+  - kind: mpjlcmm
+    name: mpjlcmm
+    seeds: [20260517]
+    max_iterations: 100
+    grid_repetitions: 20
+    grid_iterations: 15
+    n_processes: 1
+  - kind: jmbayes2
+    name: jmbayes2
+    seeds: [20260517]
+    n_chains: 3
+    n_iter: 3500
+    n_burnin: 500
+    n_thin: 5
+    n_cores: 1
+    parallel: snow
+    lme_max_iterations: 100
+    n_samples: 200
+    n_mcmc: 100
+    patient_batch_size: 32
+  - kind: deep_cox_mixtures
+    name: deep_cox_mixtures
+    seeds: [20260517]
+    n_components: 3
+    grid_size: 16
+    hidden_dims: [50, 100]
+    gamma: 10.0
+    smoothing_factor: 0.0001
+    use_activation: false
+    max_epochs: 300
+    learning_rate: 0.001
+    batch_size: 256
+  - kind: vadesc
+    name: vadesc
+    seeds: [20260517]
+    n_components: 3
+    grid_size: 16
+    hidden_dims: [50, 100]
+    latent_dim: 16
+    weibull_shape: 2.0
+    max_epochs: 300
+    patience: 30
+    learning_rate: 0.001
+    batch_size: 256
+    device: cuda
+
+paths:
+  dir: outputs/mimic_case/mimic-baselines-${now:%Y%m%d-%H%M%S}
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.dir}

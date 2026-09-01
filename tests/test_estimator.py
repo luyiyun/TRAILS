@@ -153,6 +153,25 @@ def test_estimator_fit_predict_test() -> None:
     assert 0.0 <= metrics["cluster_entropy"] <= 1.0
 
 
+def test_estimator_uncertainty_weighting_can_disable_survival_loss() -> None:
+    data = simulate_dataset(seed=19)
+    config = tiny_config(data.n_features)
+    config = config.model_copy(
+        update={
+            "model": config.model.model_copy(
+                update={"loss": config.model.loss.model_copy(update={"survival_weight": 0.0})}
+            )
+        }
+    )
+    estimator = TrailsEstimator(config).fit(data)
+
+    assert "survival" not in estimator.model.loss_log_variances
+    assert estimator.history[-1]["train"]["survival_loss_weight"] == 0.0
+    assert "survival_log_variance" not in estimator.history[-1]["train"]
+    assert estimator.history[-1]["train"]["reconstruction_loss_weight"] > 0.0
+    assert estimator.history[-1]["train"]["vade_kl_loss_weight"] > 0.0
+
+
 @pytest.mark.parametrize("kind", ["mtan", "mtan2"])
 def test_mtan_estimator_fit_and_predict(kind: Literal["mtan", "mtan2"]) -> None:
     data = simulate_dataset(seed=37)

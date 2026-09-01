@@ -34,6 +34,20 @@ Dataset 的 `metadata` 会保留 `latent_z`、`cluster_means`、`cluster_covaria
 
 ## 命令
 
+MIMIC 固定划分的比较流程为 `06_split` → `07_run` → `08_baselines` → 双 `09_eval_*`：
+
+```bash
+uv run python -m scripts.mimic.08_baselines input_dir=outputs/mimic_case/<trails-run> paths.dir=outputs/mimic_case/<baseline-run>
+uv run python -m scripts.mimic.09_eval_cluster input_dir=outputs/mimic_case/<trails-run> 'baseline_dirs=[outputs/mimic_case/<baseline-run>]'
+uv run python -m scripts.mimic.09_eval_survival input_dir=outputs/mimic_case/<trails-run> 'baseline_dirs=[outputs/mimic_case/<baseline-run>]'
+```
+
+08 复用07保存的三划分和训练配置，不重新划分患者；所有方法只使用train拟合，
+validation可用于早停，test仅用于冻结预测后的评价。`methods`可选择子集或配置多个seed。
+R方法需要远端 `lcmm`、`JMbayes2`、`data.table`、`jsonlite`、`R.utils`、`nlme`和`survival`。
+09支持多个已完成的基线目录，输出方法×seed×split结果及统一比较表；
+聚类方法不通过簇KM构造预测C-index、AUC、IBS或校准。真实数据与患者级产物留在远端。
+
 实验入口使用 Hydra 配置。每个任务都有独立脚本；生成模拟 train/test split：
 
 ```bash
