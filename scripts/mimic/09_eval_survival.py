@@ -25,8 +25,13 @@ from trails_simulate.config import resolved_payload
 
 from ..utils.baselines import BaselinePrediction
 from .config import MimicEvaluationConfig
-from .evaluation import SurvivalCalibration, plt
-from .evaluation_inputs import evaluation_methods, load_prediction, prediction_frame
+from .evaluation import (
+    SurvivalCalibration,
+    evaluation_methods,
+    load_prediction,
+    plt,
+    prediction_frame,
+)
 from .frozen import load_frozen_datasets
 from .paths import resolve_input_path
 

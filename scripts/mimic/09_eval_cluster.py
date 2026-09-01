@@ -26,9 +26,11 @@ from .evaluation import (
     AdjustedCoxAnalysis,
     ClusterClinicalCharacteristics,
     ClusterTrajectoryAnalysis,
+    evaluation_methods,
+    load_prediction,
     plt,
+    prediction_frame,
 )
-from .evaluation_inputs import evaluation_methods, load_prediction, prediction_frame
 from .frozen import load_frozen_datasets
 from .paths import resolve_input_path
 
