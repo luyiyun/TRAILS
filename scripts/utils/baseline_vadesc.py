@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from trails import ClinicalTimeSeriesDataset
 
 from .baseline_features import dataset_patient_ids, dataset_survival_arrays
-from .baseline_fpca import FPCAFeaturePipeline
+from .baseline_fpca import UFPCAFeaturePipeline
 from .baselines import BaselineCapability, BaselinePrediction
 
 
@@ -132,7 +132,7 @@ class VaDeSCBaseline:
         self.weibull_shape, self.max_epochs = weibull_shape, max_epochs
         self.patience, self.learning_rate, self.batch_size = patience, learning_rate, batch_size
         self.device = device
-        self.features = FPCAFeaturePipeline(n_components, grid_size, time_start, time_end)
+        self.features = UFPCAFeaturePipeline(n_components, grid_size, time_start, time_end)
         self.time_scale: float | None = None
         self.model: VaDeSCNetwork | None = None
         self.best_epoch: int | None = None

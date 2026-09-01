@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ..utils.baseline_cox_risk import CoxRiskKMeansBaseline
 from ..utils.baseline_dcm import DeepCoxMixturesBaseline
-from ..utils.baseline_fpca import FPCAKMeansBaseline
+from ..utils.baseline_fpca import MFPCAKMeansBaseline, UFPCAKMeansBaseline
 from ..utils.baseline_jmbayes2 import JMbayes2Baseline
 from ..utils.baseline_mpjlcmm import MPJLCMMBaseline
 from ..utils.baseline_summary import (
@@ -22,12 +22,13 @@ from .config import (
     CoxPHMethodConfig,
     CoxRiskKMeansMethodConfig,
     DeepCoxMixturesMethodConfig,
-    FPCAKMeansMethodConfig,
     JMbayes2MethodConfig,
+    MFPCAKMeansMethodConfig,
     MimicBaselineMethodConfig,
     MPJLCMMMethodConfig,
     RandomSurvivalForestMethodConfig,
     SummaryKMeansMethodConfig,
+    UFPCAKMeansMethodConfig,
     VaDeSCMethodConfig,
 )
 
@@ -84,18 +85,41 @@ def build_summary_kmeans(
     )
 
 
-@register_baseline("fpca_kmeans", ("cluster",))
-def build_fpca_kmeans(
+@register_baseline("ufpca_kmeans", ("cluster",))
+def build_ufpca_kmeans(
     config: MimicBaselineMethodConfig,
     n_clusters: int,
     seed: int,
     work_dir: Path,
-) -> FPCAKMeansBaseline:
+) -> UFPCAKMeansBaseline:
     """构造固定0–48小时绝对时间网格的FPCA-KMeans。"""
     del work_dir
-    if not isinstance(config, FPCAKMeansMethodConfig):
-        raise TypeError("fpca_kmeans注册器收到不匹配的配置")
-    return FPCAKMeansBaseline(
+    if not isinstance(config, UFPCAKMeansMethodConfig):
+        raise TypeError("ufpca_kmeans注册器收到不匹配的配置")
+    return UFPCAKMeansBaseline(
+        config.name,
+        n_clusters,
+        seed,
+        config.kmeans_iters,
+        config.n_components,
+        config.grid_size,
+        0.0,
+        48.0,
+    )
+
+
+@register_baseline("mfpca_kmeans", ("cluster",))
+def build_mfpca_kmeans(
+    config: MimicBaselineMethodConfig,
+    n_clusters: int,
+    seed: int,
+    work_dir: Path,
+) -> MFPCAKMeansBaseline:
+    """构造固定0–48小时绝对时间网格的FDApy MFPCA-KMeans。"""
+    del work_dir
+    if not isinstance(config, MFPCAKMeansMethodConfig):
+        raise TypeError("mfpca_kmeans注册器收到不匹配的配置")
+    return MFPCAKMeansBaseline(
         config.name,
         n_clusters,
         seed,

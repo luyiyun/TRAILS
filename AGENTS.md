@@ -262,7 +262,9 @@ clean reusable method library.
   and records source/artifact SHA256 hashes in an atomic manifest. It directly uses
   `TrailsEstimator` for no-survival ablation, copying 07's complete training config
   and changing only survival loss weight and the configured seed. Shared baselines
-  write `BaselinePrediction` NPZ; R exchange files and checkpoints stay remote.
+  write `BaselinePrediction` NPZ; `ufpca_kmeans` concatenates per-variable UFPCA
+  scores, while `mfpca_kmeans` uses FDApy joint MFPCA and DCM/VaDeSC remain
+  UFPCA-based. R exchange files and checkpoints stay remote.
   Failed methods are recorded, other methods may finish, but the batch exits nonzero
   and is not accepted as a complete comparison. New run directories are required.
 - `09_eval_cluster.py` and `09_eval_survival.py` replace the old `08_evaluate.py`.
@@ -314,12 +316,13 @@ If any step fails, fix it before considering the change complete.
 <!-- pair-programming:active:start -->
 ## 结对编程（已启用）
 
-本项目默认使用已安装的全局 `$pair-programming` skill。除非用户在当前请求中明确指定不用，否则所有编码任务开始前都必须自动调用该 skill，并读取和维护 `.pair/PAIR.md` 及其当前任务文件。Codex 担任 driver，用户担任 navigator。
+本项目默认使用已安装的全局 `$pair-programming` skill。除非用户在当前请求中明确指定不用，否则编码任务开始前自动调用该 skill。Codex 担任 driver，用户担任 navigator。
 
-- `.pair/` 默认由项目根 `.gitignore` 排除；`.pair/PAIR.md` 只保存任务索引，每个任务的计划树和过程保存在 `.pair/tasks/` 的独立 Markdown 文件中。
-- 每批手写代码、测试和配置的新增与修改不得超过 navigator 确认的行数（默认 200 行），而且必须形成语法完整、逻辑完整、可审查的最小单元；纯删除不限行数，同一重构中尽量先删除已确认废弃的内容，再添加替代代码。
-- 每批完成后进行必要的最小验证，向 navigator 汇报改动和验证结果，然后停止并等待审查；未经通过不得开始下一批。
-- 优先采用简单务实的实现、中文解释性注释和静态类型；不添加当前需求之外的抽象、工具函数、测试或校验。
-- navigator 明确说明、暂存或提交的代码改动视为已确认决定，后续不得回退；未说明且未暂存的意外差异应先询问确认。
-- 每次编码前同步索引和当前任务树；并行任务、暂停点、风险、决定、交接和完成记忆均按 skill 约定记录。
+- 明确继续已有受管任务时直接恢复；新任务若未明确是否受管，先询问用户。只有用户确认后才创建 `.pair` 任务；不受管任务不得修改或切换既有 pair 状态。
+- `.pair/` 由项目根 `.gitignore` 排除；`.pair/PAIR.md` 只保存任务索引，每个任务以 `.pair/tasks/<task-id>/task.json` 与 `nodes.jsonl` 保存元数据和 DAG。
+- 每轮先运行管理脚本的 `summary`，再按需使用 `show/search/list`；不要直接读取完整 `nodes.jsonl`。Markdown 和 SVG 只是按需生成的派生视图。
+- SVG 依赖 Graphviz `dot`，缺失时提醒用户安装；只生成 SVG，不生成 PNG。
+- 每批手写代码、测试和配置的新增与修改不超过 navigator 确认的行数（默认 200）；纯删除不限。每批必须是完整、可运行、可审查的最小单元。
+- 每批完成后做最小必要验证，更新任务 DAG 和摘要，向 navigator 汇报并等待审查；未经通过不开始下一批。
+- 保护既有 WIP 和 navigator 已确认、暂存或提交的改动；不添加需求外抽象、测试或校验。
 <!-- pair-programming:active:end -->

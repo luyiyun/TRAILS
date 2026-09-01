@@ -7,8 +7,11 @@ methods:
   - kind: summary_kmeans
     name: summary_kmeans
     seeds: [20260517]
-  - kind: fpca_kmeans
-    name: fpca_kmeans
+  - kind: ufpca_kmeans
+    name: ufpca_kmeans
+    seeds: [20260517]
+  - kind: mfpca_kmeans
+    name: mfpca_kmeans
     seeds: [20260517]
   - kind: cox_risk_kmeans
     name: cox_risk_kmeans

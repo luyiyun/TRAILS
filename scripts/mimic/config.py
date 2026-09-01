@@ -53,10 +53,18 @@ class SummaryKMeansMethodConfig(MimicKMeansMethodConfig):
     kind: Literal["summary_kmeans"] = "summary_kmeans"
 
 
-class FPCAKMeansMethodConfig(MimicKMeansMethodConfig):
-    """固定0–48小时网格的FPCA-KMeans配置。"""
+class UFPCAKMeansMethodConfig(MimicKMeansMethodConfig):
+    """固定0–48小时网格的逐变量UFPCA-KMeans配置。"""
 
-    kind: Literal["fpca_kmeans"] = "fpca_kmeans"
+    kind: Literal["ufpca_kmeans"] = "ufpca_kmeans"
+    n_components: int = Field(default=3, ge=1)
+    grid_size: int = Field(default=16, ge=2)
+
+
+class MFPCAKMeansMethodConfig(MimicKMeansMethodConfig):
+    """固定0–48小时网格的FDApy多变量FPCA-KMeans配置。"""
+
+    kind: Literal["mfpca_kmeans"] = "mfpca_kmeans"
     n_components: int = Field(default=3, ge=1)
     grid_size: int = Field(default=16, ge=2)
 
@@ -171,7 +179,8 @@ class VaDeSCMethodConfig(MimicBaselineMethodBaseConfig):
 
 MimicBaselineMethodConfig = Annotated[
     SummaryKMeansMethodConfig
-    | FPCAKMeansMethodConfig
+    | UFPCAKMeansMethodConfig
+    | MFPCAKMeansMethodConfig
     | CoxRiskKMeansMethodConfig
     | TrailsNoSurvivalMethodConfig
     | CoxPHMethodConfig

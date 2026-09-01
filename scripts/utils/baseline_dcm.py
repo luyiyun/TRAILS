@@ -10,7 +10,7 @@ from numpy.typing import NDArray
 from trails import ClinicalTimeSeriesDataset
 
 from .baseline_features import dataset_patient_ids, dataset_survival_arrays
-from .baseline_fpca import FPCAFeaturePipeline
+from .baseline_fpca import UFPCAFeaturePipeline
 from .baselines import BaselineCapability, BaselinePrediction
 
 
@@ -46,7 +46,7 @@ class DeepCoxMixturesBaseline:
         self.max_epochs = max_epochs
         self.learning_rate = learning_rate
         self.batch_size = batch_size
-        self.features = FPCAFeaturePipeline(n_components, grid_size, time_start, time_end)
+        self.features = UFPCAFeaturePipeline(n_components, grid_size, time_start, time_end)
         self.model: Any | None = None
 
     def fit(
