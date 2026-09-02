@@ -34,12 +34,11 @@ Dataset 的 `metadata` 会保留 `latent_z`、`cluster_means`、`cluster_covaria
 
 ## 命令
 
-MIMIC 固定划分的比较流程为 `06_split` → `07_run` → `08_baselines` → 双 `09_eval_*`：
+MIMIC 固定划分的比较流程为 `06_split` → `07_run` → `08_baselines` → `09_evaluation`：
 
 ```bash
 uv run python -m scripts.mimic.08_baselines input_dir=outputs/mimic_case/<trails-run> paths.dir=outputs/mimic_case/<baseline-run>
-uv run python -m scripts.mimic.09_eval_cluster input_dir=outputs/mimic_case/<trails-run> 'baseline_dirs=[outputs/mimic_case/<baseline-run>]'
-uv run python -m scripts.mimic.09_eval_survival input_dir=outputs/mimic_case/<trails-run> 'baseline_dirs=[outputs/mimic_case/<baseline-run>]'
+uv run python -m scripts.mimic.09_evaluation input_dir=outputs/mimic_case/<trails-run> 'baseline_dirs=[outputs/mimic_case/<baseline-run>]'
 ```
 
 08 复用07保存的三划分和训练配置，不重新划分患者；所有方法只使用train拟合，

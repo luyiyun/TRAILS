@@ -61,8 +61,7 @@ clean reusable method library.
 - Generate MIMIC patient splits and tensor datasets: `uv run python -m scripts.mimic.06_split`
 - Run fixed-K MIMIC modeling: `uv run python -m scripts.mimic.07_run`
 - Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines input_dir=outputs/mimic_case/<run>`
-- Evaluate frozen MIMIC clusters: `uv run python -m scripts.mimic.09_eval_cluster input_dir=outputs/mimic_case/<run> 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
-- Evaluate frozen MIMIC survival predictions: `uv run python -m scripts.mimic.09_eval_survival input_dir=outputs/mimic_case/<run> 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
+- Evaluate frozen MIMIC predictions: `uv run python -m scripts.mimic.09_evaluation input_dir=outputs/mimic_case/<run> 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
 - Run lightweight baselines on existing splits: `uv run python scripts/baseline.py paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run python scripts/optim.py paths.data_root=data/simulated/base`
 - Summarize train and baseline results: `uv run python scripts/summary.py 'train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'baseline_roots=[outputs/baseline/base-...]' 'train_labels=[base,mtan]' 'baseline_labels=[kmeans]'`
@@ -267,17 +266,17 @@ clean reusable method library.
   UFPCA-based. R exchange files and checkpoints stay remote.
   Failed methods are recorded, other methods may finish, but the batch exits nonzero
   and is not accepted as a complete comparison. New run directories are required.
-- `09_eval_cluster.py` and `09_eval_survival.py` replace the old `08_evaluate.py`.
-  They accept any number of completed `baseline_dirs`, verify frozen-source hashes,
-  branch between `TrailsPrediction` and baseline NPZ readers, and write method/seed/
-  split artifacts below `evaluation/cluster` and `evaluation/survival` respectively.
-  `evaluation.py` retains shared plotting/calculation classes. Cluster evaluation
+- `09_evaluation.py` accepts any number of completed `baseline_dirs`, verifies
+  frozen-source hashes, branches between `TrailsPrediction` and baseline NPZ readers,
+  and evaluates each method/seed/split once according to its cluster and survival
+  capabilities. `evaluation.py` retains shared plotting/calculation classes. Cluster evaluation
   reports occupancy, entropy, KM/log-rank, adjusted Cox, clinical characteristics,
   trajectories and label agreement; it never generates cluster-only survival
   predictions or predictive C-index/AUC/IBS/calibration from cluster KM curves.
   Survival evaluation reports Harrell/IPCW C-index, cumulative/dynamic AUC, daily
   Brier/IBS and quantile-group KM calibration, always estimating censoring from train.
-  Both write unified comparison tables. Degenerate clusters and unestimable Cox
+  One unified comparison table retains unavailable capability fields as missing values.
+  Degenerate clusters and unestimable Cox
   effects remain explicit diagnostics, not silently relabeled successes.
 - `AdjustedCoxAnalysis` uses the train split's lowest observed KM mortality cluster as the
   shared validation/test reference and reports cluster hazard ratios adjusted for
@@ -285,8 +284,10 @@ clean reusable method library.
   ties handling; forest plots show only the adjusted cluster effects. Each split
   also saves a descriptive clinical-characteristics table with Overall and every
   configured cluster column; it reports age as mean (SD), SOFA as median [IQR],
-  and gender, grouped race, and numeric missingness as n (%) without hypothesis
-  tests. `ClusterTrajectoryAnalysis` restores longitudinal values to clinical
+  and gender, grouped race, and numeric missingness as n (%). Overall group
+  differences use distribution-aware continuous tests and expected-count-aware
+  categorical tests; violin/box and categorical proportion panels accompany the table.
+  `ClusterTrajectoryAnalysis` restores longitudinal values to clinical
   units using the train-fitted preprocessing parameters, bins the 0–48 hour
   window at configurable four-hour intervals, first takes each patient's median
   within a feature-bin, and then saves cluster median/IQR tables and PNG/PDF

@@ -1,4 +1,4 @@
-"""双09评价共享的输入读取、校准、调整Cox、临床描述与轨迹图表。"""
+"""统一09评价共享的输入读取、校准、调整Cox、临床描述与轨迹图表。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 from lifelines import CoxPHFitter
+from scipy import stats
 from sksurv.nonparametric import kaplan_meier_estimator
 
 from trails import TrailsPrediction
@@ -25,6 +26,7 @@ from .frozen import sha256_file
 from .paths import resolve_input_path
 
 matplotlib.use("Agg")
+import seaborn as sns  # noqa: E402
 from matplotlib import pyplot as plt  # noqa: E402
 
 RACE_GROUPS = ("WHITE", "BLACK", "ASIAN", "HISPANIC_OR_LATINO", "OTHER_OR_UNKNOWN")
@@ -400,11 +402,69 @@ class AdjustedCoxAnalysis:
 
 
 class ClusterClinicalCharacteristics:
-    """生成 Overall 与各预测簇的临床特征描述表。"""
+    """生成各预测簇的临床特征描述、总体检验和比较图。"""
 
     def __init__(self, frame: pd.DataFrame, n_clusters: int) -> None:
         self.frame = frame
         self.n_clusters = n_clusters
+        self._tests: dict[str, tuple[str, float | None, float | None]] = {}
+
+    def _prepared_data(self) -> pd.DataFrame:
+        data = self.frame.loc[:, ["pred_cluster", *BASELINE_COVARIATE_COLUMNS]].copy()
+        data["gender"] = data["gender"].fillna("UNKNOWN").astype(str).str.upper()
+        data["race_group"] = _group_race(cast(pd.Series, data["race"]))
+        return data
+
+    def _continuous_test(
+        self, data: pd.DataFrame, column: str
+    ) -> tuple[str, float | None, float | None]:
+        """按正态性和方差齐性选择ANOVA、Welch ANOVA或Kruskal-Wallis。"""
+        groups = [
+            cast(pd.Series, pd.to_numeric(group[column], errors="coerce"))
+            .dropna()
+            .to_numpy(dtype=np.float64)
+            for _, group in data.groupby("pred_cluster", observed=True)
+        ]
+        groups = [group for group in groups if len(group)]
+        if len(groups) < 2 or np.unique(np.concatenate(groups)).size < 2:
+            return "Unavailable", None, None
+        normal = all(
+            len(group) >= 8
+            and np.isfinite(result := stats.normaltest(group).pvalue)
+            and result >= 0.05
+            for group in groups
+        )
+        if not normal:
+            result = stats.kruskal(*groups)
+            return "Kruskal-Wallis", float(result.statistic), float(result.pvalue)
+        equal_variance = bool(stats.levene(*groups, center="median").pvalue >= 0.05)
+        result = stats.f_oneway(*groups, equal_var=equal_variance)
+        name = "One-way ANOVA" if equal_variance else "Welch ANOVA"
+        return name, float(result.statistic), float(result.pvalue)
+
+    def _categorical_test(
+        self, data: pd.DataFrame, column: str
+    ) -> tuple[str, float | None, float | None]:
+        """按期望频数选择Pearson卡方、Fisher或Monte Carlo卡方检验。"""
+        table = pd.crosstab(data["pred_cluster"], data[column]).to_numpy(dtype=np.int64)
+        table = table[table.sum(axis=1) > 0][:, table.sum(axis=0) > 0]
+        if min(table.shape, default=0) < 2:
+            return "Unavailable", None, None
+        statistic, p_value, _, expected = cast(
+            tuple[float, float, float, np.ndarray],
+            stats.chi2_contingency(table, correction=False),
+        )
+        if np.all(expected >= 5):
+            return "Pearson chi-square", statistic, p_value
+        if table.shape == (2, 2):
+            statistic, p_value = cast(tuple[float, float], stats.fisher_exact(table))
+            return "Fisher exact", statistic, p_value
+        method = stats.MonteCarloMethod(n_resamples=9999, rng=np.random.default_rng(20260517))
+        statistic, p_value, _, _ = cast(
+            tuple[float, float, float, np.ndarray],
+            stats.chi2_contingency(table, correction=False, method=method),
+        )
+        return "Pearson chi-square (Monte Carlo)", statistic, p_value
 
     @staticmethod
     def _mean_sd(values: pd.Series) -> str:
@@ -431,32 +491,62 @@ class ClusterClinicalCharacteristics:
         return "0 (NA)" if denominator == 0 else f"{count} ({100.0 * count / denominator:.1f}%)"
 
     def calculate(self) -> pd.DataFrame:
-        """返回适合直接审阅的临床特征宽表。"""
-        data = self.frame.loc[:, ["pred_cluster", *BASELINE_COVARIATE_COLUMNS]].copy()
-        data["gender"] = data["gender"].fillna("UNKNOWN").astype(str).str.upper()
-        data["race_group"] = _group_race(cast(pd.Series, data["race"]))
+        """返回含总体组间检验的临床特征宽表。"""
+        data = self._prepared_data()
         groups = [("overall", data)] + [
             (f"cluster_{cluster}", data.loc[data["pred_cluster"] == cluster])
             for cluster in range(self.n_clusters)
         ]
 
-        rows: list[dict[str, str]] = []
+        self._tests = {
+            "age": self._continuous_test(data, "age"),
+            "age_missing": self._categorical_test(
+                data.assign(age_missing=data["age"].isna()), "age_missing"
+            ),
+            "gender": self._categorical_test(data, "gender"),
+            "race": self._categorical_test(data, "race_group"),
+            "sofa": self._continuous_test(data, "sofa_score"),
+            "sofa_missing": self._categorical_test(
+                data.assign(sofa_missing=data["sofa_score"].isna()), "sofa_missing"
+            ),
+        }
+        rows: list[dict[str, Any]] = []
 
-        def append_row(characteristic: str, level: str, values: dict[str, str]) -> None:
-            rows.append({"characteristic": characteristic, "level": level, **values})
+        def append_row(
+            characteristic: str,
+            level: str,
+            values: dict[str, str],
+            test_key: str | None = None,
+        ) -> None:
+            test = self._tests.get(test_key or "", ("", None, None))
+            rows.append(
+                {
+                    "characteristic": characteristic,
+                    "level": level,
+                    **values,
+                    "test": test[0],
+                    "statistic": test[1],
+                    "p_value": test[2],
+                }
+            )
 
         append_row("Patients", "n", {name: str(len(group)) for name, group in groups})
         append_row(
             "Age, years",
             "mean (SD)",
             {name: self._mean_sd(cast(pd.Series, group["age"])) for name, group in groups},
+            "age",
         )
         append_row(
             "Age missing",
             "n (%)",
-            {name: self._count_percent(group["age"].isna(), len(group)) for name, group in groups},
+            {
+                name: self._count_percent(cast(pd.Series, group["age"]).isna(), len(group))
+                for name, group in groups
+            },
+            "age_missing",
         )
-        for level in ("F", "M", "UNKNOWN"):
+        for index, level in enumerate(("F", "M", "UNKNOWN")):
             append_row(
                 "Gender",
                 level,
@@ -464,8 +554,9 @@ class ClusterClinicalCharacteristics:
                     name: self._count_percent(group["gender"] == level, len(group))
                     for name, group in groups
                 },
+                "gender" if index == 0 else None,
             )
-        for level in RACE_GROUPS:
+        for index, level in enumerate(RACE_GROUPS):
             append_row(
                 "Race",
                 level,
@@ -473,6 +564,7 @@ class ClusterClinicalCharacteristics:
                     name: self._count_percent(group["race_group"] == level, len(group))
                     for name, group in groups
                 },
+                "race" if index == 0 else None,
             )
         append_row(
             "SOFA at sepsis onset",
@@ -481,16 +573,79 @@ class ClusterClinicalCharacteristics:
                 name: self._median_iqr(cast(pd.Series, group["sofa_score"]))
                 for name, group in groups
             },
+            "sofa",
         )
         append_row(
             "SOFA missing",
             "n (%)",
             {
-                name: self._count_percent(group["sofa_score"].isna(), len(group))
+                name: self._count_percent(cast(pd.Series, group["sofa_score"]).isna(), len(group))
                 for name, group in groups
             },
+            "sofa_missing",
         )
         return pd.DataFrame(rows)
+
+    def plot(self, output_stem: Path) -> dict[str, str]:
+        """绘制数值变量violin+box图和分类变量簇内比例图。"""
+        data = self._prepared_data()
+        self.calculate()
+        figure, axes = plt.subplots(2, 2, figsize=(12.0, 8.0), layout="constrained")
+        order = list(range(self.n_clusters))
+
+        for axis, column, label, test_key in (
+            (axes[0, 0], "age", "Age, years", "age"),
+            (axes[0, 1], "sofa_score", "SOFA at sepsis onset", "sofa"),
+        ):
+            sns.violinplot(
+                data=data, x="pred_cluster", y=column, order=order, inner=None, cut=0, ax=axis
+            )
+            sns.boxplot(
+                data=data,
+                x="pred_cluster",
+                y=column,
+                order=order,
+                width=0.18,
+                showfliers=False,
+                boxprops={"facecolor": "white", "alpha": 0.75},
+                ax=axis,
+            )
+            test, _, p_value = self._tests[test_key]
+            title = (
+                f"{label}\n{test}, p={p_value:.3g}" if p_value is not None else f"{label}\n{test}"
+            )
+            axis.set(title=title)
+
+        for axis, column, levels, label, test_key in (
+            (axes[1, 0], "gender", ("F", "M", "UNKNOWN"), "Gender", "gender"),
+            (axes[1, 1], "race_group", RACE_GROUPS, "Race", "race"),
+        ):
+            proportions = pd.crosstab(
+                data["pred_cluster"], data[column], normalize="index"
+            ).reindex(index=order, columns=levels, fill_value=0.0)
+            proportions.plot(kind="bar", stacked=True, ax=axis, width=0.8)
+            test, _, p_value = self._tests[test_key]
+            title = (
+                f"{label}\n{test}, p={p_value:.3g}" if p_value is not None else f"{label}\n{test}"
+            )
+            axis.set(
+                title=title,
+                xlabel="Predicted cluster",
+                ylabel="Within-cluster proportion",
+                ylim=(0.0, 1.0),
+            )
+            axis.legend(frameon=False, fontsize=8)
+        for axis in axes.flat:
+            axis.grid(axis="y", alpha=0.2)
+        png_path = output_stem.with_suffix(".png")
+        pdf_path = output_stem.with_suffix(".pdf")
+        figure.savefig(png_path, dpi=220)
+        figure.savefig(pdf_path)
+        plt.close(figure)
+        return {
+            "clinical_characteristics_plot_png": str(png_path),
+            "clinical_characteristics_plot_pdf": str(pdf_path),
+        }
 
 
 class ClusterTrajectoryAnalysis:
