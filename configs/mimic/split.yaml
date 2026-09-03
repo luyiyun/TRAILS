@@ -7,10 +7,16 @@ paths:
 description: "MIMIC-IV v3.1 early Sepsis-3 TRAILS analysis"
 feature_order: []
 split:
+  strategy: random
   seeds: [20260517]
-  train_fraction: 0.64
-  validation_fraction: 0.16
-  test_fraction: 0.20
+  random:
+    train_fraction: 0.64
+    validation_fraction: 0.16
+    test_fraction: 0.20
+  temporal:
+    test_start_year: 2017
+    # 从测试年代之前的开发队列中，随机抽取该比例作为验证集。
+    validation_fraction: 0.20
 
 hydra:
   job:

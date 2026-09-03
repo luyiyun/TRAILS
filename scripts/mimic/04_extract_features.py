@@ -41,7 +41,9 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     connection = duckdb.connect(str(database), read_only=True)
 
-    required = {"trails_cohort_primary"} | {f"mimiciv_derived.{table}" for table in FEATURE_SOURCES}
+    required = {"trails_cohort_primary", "mimiciv_hosp.patients"} | {
+        f"mimiciv_derived.{table}" for table in FEATURE_SOURCES
+    }
     available = {
         table if schema == "main" else f"{schema}.{table}"
         for schema, table in connection.execute(
@@ -52,9 +54,13 @@ def main() -> None:
         raise ValueError(f"DuckDB 缺少必要表：{missing}")
 
     patients = connection.execute(
-        "SELECT stay_id AS patient_id, age, gender, race, sofa_score, survival_time, event, "
-        "CAST(outtime < landmark_time AS INTEGER) AS left_icu_before_48h "
-        "FROM trails_cohort_primary ORDER BY stay_id"
+        "SELECT c.stay_id AS patient_id, c.age, c.gender, c.race, c.sofa_score, "
+        "c.survival_time, c.event, "
+        "CAST(c.outtime < c.landmark_time AS INTEGER) AS left_icu_before_48h, "
+        "p.anchor_year_group "
+        "FROM trails_cohort_primary AS c "
+        "INNER JOIN mimiciv_hosp.patients AS p ON c.subject_id = p.subject_id "
+        "ORDER BY c.stay_id"
     ).df()
     long_frames: list[pd.DataFrame] = []
     for table, (key, features) in FEATURE_SOURCES.items():

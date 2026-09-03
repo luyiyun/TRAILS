@@ -244,6 +244,9 @@ clean reusable method library.
   train/validation/test tensor datasets and preprocessing parameters. Later commands
   consume these frozen datasets; command modules import only non-command support
   modules from the workflow package and do not import one another.
+- MIMIC `06_split.py` supports `random` and `temporal` strategies. Temporal splitting
+  assigns `anchor_year_group` values starting at the configured cutoff to test, then
+  randomly stratifies validation from the earlier development cohort.
 - MIMIC patient inputs and each frozen split preserve baseline `age`, `gender`,
   `race`, and sepsis-onset `sofa_score` covariates for adjusted descriptive Cox
   analysis; these variables are not added to the longitudinal clustering inputs.
