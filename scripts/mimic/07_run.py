@@ -84,7 +84,7 @@ def _save_split_outputs(
 
 def run(config: MimicApplicationConfig) -> dict[str, object]:
     if config.k_selection.enabled:
-        raise ValueError("K 选择草案位于 scripts/mimic/_unfinished/select_k.py，当前尚未完成")
+        raise ValueError("MIMIC K选择与分析由独立任务管理，07_run仅执行固定K训练")
     run_dir = config.paths.dir
     run_dir.mkdir(parents=True, exist_ok=True)
     artifacts = resolve_artifact_names(config.artifacts.names)

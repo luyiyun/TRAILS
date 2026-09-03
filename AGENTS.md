@@ -255,7 +255,7 @@ clean reusable method library.
   command configs live under `configs/mimic/`; `split.yaml` declares
   `feature_order: []`, which preserves the observed CSV order by default and can
   be overridden directly through Hydra.
-  K selection is currently excluded as unfinished.
+  K selection is excluded from `07_run` and managed as a separate analysis task.
 - `scripts/mimic/08_baselines.py` fits each method/seed only on frozen train
   (validation may control early stopping), saves models and three-split predictions,
   and records source/artifact SHA256 hashes in an atomic manifest. It directly uses
