@@ -33,19 +33,46 @@ RACE_GROUPS = ("WHITE", "BLACK", "ASIAN", "HISPANIC_OR_LATINO", "OTHER_OR_UNKNOW
 
 
 def evaluation_methods(config: MimicEvaluationConfig) -> list[dict[str, Any]]:
-    """读取完成manifest，并验证08确实使用了当前07的冻结输入。"""
-    source = resolve_input_path(config.input_dir)
-    original = json.loads((source / "run_manifest.json").read_text())
-    methods: list[dict[str, Any]] = [
-        {
-            "name": "trails",
-            "seed": original["training"]["seed"],
-            "directory": source,
-            "key": "trails",
-            "capabilities": ["cluster", "survival"],
-            "prediction_format": "trails",
-        }
+    """读取TRAILS和基线manifest，并验证它们共享同一冻结输入。"""
+    trails_roots = [resolve_input_path(path) for path in config.trails_dirs]
+    if len(set(trails_roots)) != len(trails_roots):
+        raise ValueError("TRAILS评价目录重复")
+    trails_runs = [
+        (root, root.name, json.loads((root / "run_manifest.json").read_text()))
+        for root in trails_roots
     ]
+    labels = [label for _, label, _ in trails_runs]
+    if len(set(labels)) != len(labels):
+        raise ValueError("TRAILS评价目录末级名称重复，无法生成唯一输出目录")
+    primary_root, _, primary_manifest = trails_runs[0]
+    reference_signature = {
+        key: primary_manifest["data"][key]
+        for key in ("split_dir", "split_seed", "split_sizes", "n_features")
+    }
+    reference_preprocessing = sha256_file(primary_root / "preprocessing_parameters.csv")
+    multiple_trails = len(trails_runs) > 1
+    methods: list[dict[str, Any]] = []
+    for root, label, manifest in trails_runs:
+        signature = {
+            key: manifest["data"][key]
+            for key in ("split_dir", "split_seed", "split_sizes", "n_features")
+        }
+        if signature != reference_signature:
+            raise ValueError(f"TRAILS运行未使用同一冻结划分：{root}")
+        if sha256_file(root / "preprocessing_parameters.csv") != reference_preprocessing:
+            raise ValueError(f"TRAILS运行预处理参数不一致：{root}")
+        name = f"trails:{label}" if multiple_trails else "trails"
+        methods.append(
+            {
+                "name": name,
+                "seed": manifest["training"]["seed"],
+                "directory": root,
+                "key": f"trails/{label}" if multiple_trails else "trails",
+                "source_run": label,
+                "capabilities": ["cluster", "survival"],
+                "prediction_format": "trails",
+            }
+        )
     for root in config.baseline_dirs:
         root = resolve_input_path(root)
         manifest = json.loads((root / "baselines_manifest.json").read_text())
@@ -54,7 +81,7 @@ def evaluation_methods(config: MimicEvaluationConfig) -> list[dict[str, Any]]:
         if manifest["risk_horizon"] != config.tau:
             raise ValueError("08和09风险时间窗不一致")
         for relative, expected in manifest["source_sha256"].items():
-            if sha256_file(source / relative) != expected:
+            if sha256_file(primary_root / relative) != expected:
                 raise ValueError(f"08来源与当前07不一致：{relative}")
         for record in manifest["methods"]:
             method = dict(record)
@@ -65,6 +92,7 @@ def evaluation_methods(config: MimicEvaluationConfig) -> list[dict[str, Any]]:
                 if sha256_file(method["directory"] / relative) != expected:
                     raise ValueError(f"基线冻结产物指纹不符：{method['name']}/{relative}")
             method["key"] = f"{method['name']}/seed-{method['seed']}"
+            method["source_run"] = None
             methods.append(method)
     keys = [method["key"] for method in methods]
     if len(set(keys)) != len(keys):

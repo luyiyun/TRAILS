@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pandas as pd
 import pytest
 import torch
+from matplotlib import pyplot as plt
 from pydantic import ValidationError
 
 import trails.selection as selection_module
@@ -69,6 +70,37 @@ def test_selection_result_exposes_estimators_for_selected_k() -> None:
     )
 
     assert result.selected_estimators == {11: estimators[(11, 3)], 12: estimators[(12, 3)]}
+
+
+def test_selection_result_plots_metrics_by_k(tmp_path: Path) -> None:
+    run_metrics = pd.DataFrame(
+        {
+            "seed": [11, 12, 11, 12],
+            "n_clusters": [2, 2, 3, 3],
+            "cindex": [0.70, 0.72, 0.68, 0.69],
+            "latent_mixture_bic": [120.0, 122.0, 110.0, 112.0],
+        }
+    )
+    result = ClusterNumberSelectionResult(
+        config=ClusterNumberSelectorConfig(candidates=(2, 3), seeds=(11, 12)),
+        selected_k=3,
+        run_metrics=run_metrics,
+        stability_pairs=pd.DataFrame(),
+        k_summary=pd.DataFrame({"n_clusters": [2, 3], "mean_pairwise_ari": [0.81, 0.76]}),
+        seed_winners={11: 2, 12: 2},
+        estimators={},
+    )
+    path = tmp_path / "selection_metrics.png"
+
+    figure = result.plot_metrics(("cindex", "latent_mixture_bic", "mean_pairwise_ari"), path=path)
+
+    assert path.is_file()
+    assert len(figure.axes) == 3
+    assert [tick.get_text() for tick in figure.axes[0].get_xticklabels()] == ["2", "3"]
+    plt.close(figure)
+
+    with pytest.raises(ValueError, match="选择结果缺少绘图指标"):
+        result.plot_metrics(("unknown_metric",))
 
 
 def test_selector_runs_shared_split_and_selects_across_seeds(

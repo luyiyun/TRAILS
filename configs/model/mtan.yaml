@@ -1,0 +1,30 @@
+# 除异步输入层外与base保持一致，用于隔离GRU-D与mTAN的影响。
+latent_dim: 32
+n_clusters: 4
+dropout: 0.0
+survival_head_hidden_layers: 1
+loss:
+  weighting: uncertainty
+  reconstruction_weight: 1.0
+  survival_weight: 0.2
+  cluster_weight: 0.1
+encoder:
+  input:
+    kind: mtan
+    hidden_dim: 64
+    n_heads: 2
+    num_ref_points: 16
+    learn_time_embedding: true
+    time_embedding_kind: projection
+    value_projection_dim: 1
+  mapping:
+    kind: transformer
+    hidden_dim: 64
+    n_layers: 2
+    n_heads: 2
+decoder:
+  kind: transformer
+  conditioning: concat_time
+  hidden_dim: 64
+  n_layers: 2
+  n_heads: 2

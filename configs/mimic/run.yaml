@@ -1,6 +1,7 @@
 # @package _global_
 defaults:
-  - /training: case
+  - /model: base
+  - /trainer: full
   - _self_
 
 observations_csv: data/real/mimic-iv-3.1/derived/trails_case/observations.csv
@@ -11,18 +12,22 @@ split:
   dir: data/real/mimic-iv-3.1/derived/trails_splits/seed-${split.seed}
 outputs:
   summary: run_manifest.json
-# 默认只做资源与流程检查；正式分析仍从本入口通过 Hydra overrides 调整。
-model:
-  n_clusters: 3
+# 固定K、模型比较与K-selection共用充分训练的trainer协议。
+# 整数表示固定K；null表示使用train/validation自动选择，test只在锁定K后评估。
+n_clusters: null
+k_selection:
+  enabled: true
+  candidate_clusters: [2, 3, 4, 5]
+  # 当前只运行一个seed；后续可直接扩展列表以计算seed间稳定性。
+  seeds:
+    - ${trainer.seed}
+  selection_rule: one_standard_error
+  require_non_empty: true
+  min_cluster_fraction: 0.05
+  min_mean_pairwise_ari: null
+  result_dir: k_selection
 trainer:
   risk_horizon: 28.0
-  min_epochs: 1
-  max_epochs: 1
-  batch_size: 256
-  warmup_epochs: 1
-  gmm_init_iters: 5
-  early_stop: true
-  early_stopping_monitor: loss
 artifacts:
   names: [history, plot]
 diagnostics:

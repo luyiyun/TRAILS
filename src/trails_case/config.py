@@ -77,8 +77,13 @@ class CaseKSelectionConfig(BaseModel):
 
     enabled: bool = False
     candidate_clusters: tuple[int, ...] = ()
+    seeds: tuple[int, ...] = ()
     valid_size: float | None = Field(default=None, gt=0.0, lt=1.0)
     result_dir: Path = Path("k_selection")
+    selection_rule: Literal["best_mean", "one_standard_error"] = "best_mean"
+    require_non_empty: bool = False
+    min_cluster_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
+    min_mean_pairwise_ari: float | None = Field(default=None, ge=-1.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_candidate_clusters(self) -> CaseKSelectionConfig:
@@ -86,6 +91,10 @@ class CaseKSelectionConfig(BaseModel):
             raise ValueError("k_selection.candidate_clusters values must be greater than 1.")
         if len(set(self.candidate_clusters)) != len(self.candidate_clusters):
             raise ValueError("k_selection.candidate_clusters values must be unique.")
+        if len(set(self.seeds)) != len(self.seeds):
+            raise ValueError("k_selection.seeds values must be unique.")
+        if self.min_mean_pairwise_ari is not None and len(self.seeds) < 2:
+            raise ValueError("k_selection.min_mean_pairwise_ari requires at least two seeds.")
         return self
 
 

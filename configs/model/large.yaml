@@ -1,0 +1,28 @@
+# 保持base的结构类型，按约2倍宽度和更深主干扩大容量。
+latent_dim: 64
+n_clusters: 4
+dropout: 0.1
+survival_head_hidden_layers: 2
+loss:
+  weighting: uncertainty
+  reconstruction_weight: 1.0
+  survival_weight: 0.2
+  cluster_weight: 0.1
+encoder:
+  input:
+    kind: grud
+    hidden_dim: 128
+    n_heads: 4
+    time_embedding_kind: projection
+    value_projection_dim: 1
+  mapping:
+    kind: transformer
+    hidden_dim: 128
+    n_layers: 3
+    n_heads: 4
+decoder:
+  kind: transformer
+  conditioning: concat_time
+  hidden_dim: 128
+  n_layers: 3
+  n_heads: 4

@@ -21,7 +21,22 @@ class MimicSplitConfig(BaseModel):
 class MimicApplicationConfig(CaseApplicationConfig):
     """增加外部患者划分配置的 MIMIC 训练命令配置。"""
 
+    n_clusters: int | None = Field(default=None, ge=2)
     split: MimicSplitConfig = Field(default_factory=MimicSplitConfig)
+
+    @model_validator(mode="after")
+    def validate_k_resolution(self) -> Self:
+        """未指定固定K时要求启用选择并显式提供候选集合。"""
+        if self.n_clusters is None:
+            if not self.k_selection.enabled:
+                raise ValueError("n_clusters未指定时必须启用k_selection")
+            if not self.k_selection.candidate_clusters:
+                raise ValueError("自动K选择要求k_selection.candidate_clusters非空")
+            if not self.k_selection.seeds:
+                raise ValueError("自动K选择要求k_selection.seeds非空")
+            if self.trainer.seed not in self.k_selection.seeds:
+                raise ValueError("trainer.seed必须包含在k_selection.seeds中以锁定最终模型")
+        return self
 
 
 class MimicBaselinePathsConfig(BaseModel):
@@ -234,7 +249,7 @@ class MimicEvaluationConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    input_dir: Path
+    trails_dirs: tuple[Path, ...] = Field(min_length=1)
     baseline_dirs: tuple[Path, ...] = ()
     auc_times: tuple[float, ...] = (7.0, 14.0, 21.0)
     probability_times: tuple[float, ...] = tuple(float(day) for day in range(1, 28))

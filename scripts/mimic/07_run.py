@@ -14,6 +14,8 @@ from omegaconf import DictConfig
 
 from trails import (
     ClinicalTimeSeriesDataset,
+    ClusterNumberSelectionResult,
+    ClusterNumberSelector,
     DataConfig,
     TrailsConfig,
     TrailsEstimator,
@@ -83,8 +85,6 @@ def _save_split_outputs(
 
 
 def run(config: MimicApplicationConfig) -> dict[str, object]:
-    if config.k_selection.enabled:
-        raise ValueError("MIMIC K选择与分析由独立任务管理，07_run仅执行固定K训练")
     run_dir = config.paths.dir
     run_dir.mkdir(parents=True, exist_ok=True)
     artifacts = resolve_artifact_names(config.artifacts.names)
@@ -101,7 +101,10 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
         raise RuntimeError("MIMIC TRAILS 分析要求可用 CUDA GPU")
 
     load_started = time.perf_counter()
-    datasets = {name: ClinicalTimeSeriesDataset.load(path) for name, path in dataset_paths.items()}
+    datasets = {
+        name: ClinicalTimeSeriesDataset.load(dataset_paths[name])
+        for name in ("train", "validation")
+    }
     for name, dataset in datasets.items():
         if (
             dataset.metadata.get("split_name") != name
@@ -111,9 +114,10 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
     train = datasets["train"]
     validation = datasets["validation"]
     load_seconds = time.perf_counter() - load_started
+    initial_k = config.n_clusters or config.k_selection.candidate_clusters[0]
     trails_config = TrailsConfig(
         data=DataConfig(n_features=train.n_features),
-        model=config.model,
+        model=config.model.model_copy(update={"n_clusters": initial_k}),
         trainer=config.trainer.model_copy(
             update={
                 "batch_size": resolve_batch_size(len(train), config.trainer.batch_size),
@@ -126,6 +130,33 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
         torch.cuda.set_device(torch.device(device))
         torch.cuda.reset_peak_memory_stats(torch.device(device))
 
+    k_selection_result: ClusterNumberSelectionResult | None = None
+    k_selection_result_dir: Path | None = None
+    selection_seconds = 0.0
+    estimator: TrailsEstimator
+    if config.n_clusters is None:
+        selection_started = time.perf_counter()
+        k_selection_result_dir = resolve_output_path(config.k_selection.result_dir, run_dir)
+        selector = ClusterNumberSelector(
+            config.k_selection.candidate_clusters,
+            seeds=config.k_selection.seeds,
+            selection_rule=config.k_selection.selection_rule,
+            require_non_empty=config.k_selection.require_non_empty,
+            min_cluster_fraction=config.k_selection.min_cluster_fraction,
+            min_mean_pairwise_ari=config.k_selection.min_mean_pairwise_ari,
+            estimator_config=trails_config,
+        )
+        k_selection_result = selector.select(train, validation_data=validation)
+        selection_seconds = time.perf_counter() - selection_started
+        k_selection_result.save(k_selection_result_dir)
+        if k_selection_result.selected_k is None:
+            raise RuntimeError("没有候选K通过配置的选择门槛；test尚未评估")
+        estimator = k_selection_result.selected_estimators[config.trainer.seed]
+        trails_config = estimator.config
+    else:
+        estimator = TrailsEstimator(trails_config)
+
+    resolved_application = config.model_copy(update={"model": trails_config.model})
     if config.swanlab.enabled:
         experiment_name = config.swanlab.experiment or datetime.now().astimezone().strftime(
             "trails-mimic-%Y%m%d-%H%M%S"
@@ -134,7 +165,7 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
             "project": config.swanlab.project,
             "experiment_name": experiment_name,
             "config": {
-                "application": config.model_dump(mode="json"),
+                "application": resolved_application.model_dump(mode="json"),
                 "training": trails_config.model_dump(mode="json"),
                 "artifacts": sorted(artifacts),
             },
@@ -145,12 +176,29 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
 
     try:
         training_started = time.perf_counter()
-        estimator = TrailsEstimator(trails_config).fit(
-            train,
-            validation_data=validation,
-            history_callback=log_swanlab_history if config.swanlab.enabled else None,
-        )
-        training_seconds = time.perf_counter() - training_started
+        if k_selection_result is None:
+            estimator.fit(
+                train,
+                validation_data=validation,
+                history_callback=log_swanlab_history if config.swanlab.enabled else None,
+            )
+            training_seconds = time.perf_counter() - training_started
+        else:
+            if config.swanlab.enabled:
+                for entry in estimator.history:
+                    log_swanlab_history(entry)
+            training_seconds = selection_seconds
+
+        # K与最终模型锁定后才读取封存测试集，避免选择失败时接触test。
+        test_load_started = time.perf_counter()
+        test = ClinicalTimeSeriesDataset.load(dataset_paths["test"])
+        if (
+            test.metadata.get("split_name") != "test"
+            or test.metadata.get("split_seed") != config.split.seed
+        ):
+            raise ValueError(f"{dataset_paths['test']} 的split元数据与当前配置不一致")
+        datasets["test"] = test
+        load_seconds += time.perf_counter() - test_load_started
 
         inference_started = time.perf_counter()
         split_metrics = {
@@ -203,11 +251,28 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
             "load_seconds": load_seconds,
             "training_seconds": training_seconds,
             "inference_seconds": inference_seconds,
+            "k_selection_seconds": selection_seconds,
             "peak_gpu_memory_gib": peak_memory,
         },
-        "application": config.model_dump(mode="json"),
+        "application": resolved_application.model_dump(mode="json"),
         "training": trails_config.model_dump(mode="json"),
-        "k_selection": None,
+        "k_resolution": {
+            "mode": "automatic" if k_selection_result is not None else "fixed",
+            "requested_n_clusters": config.n_clusters,
+            "effective_n_clusters": trails_config.model.n_clusters,
+            "selection_seeds": (
+                list(config.k_selection.seeds) if k_selection_result is not None else []
+            ),
+            "final_model_seed": config.trainer.seed,
+        },
+        "k_selection": (
+            None
+            if k_selection_result is None
+            else {
+                **k_selection_result.to_payload(),
+                "result_dir": str(k_selection_result_dir),
+            }
+        ),
     }
     save_json(resolve_output_path(config.outputs.summary, run_dir), summary)
     return summary

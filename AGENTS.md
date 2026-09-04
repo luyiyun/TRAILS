@@ -59,9 +59,9 @@ clean reusable method library.
 - Train with mTAN-style input: `uv run python scripts/train.py training=mtan paths.data_root=data/simulated/base`
 - Run real-data case modeling: `uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv`
 - Generate MIMIC patient splits and tensor datasets: `uv run python -m scripts.mimic.06_split`
-- Run fixed-K MIMIC modeling: `uv run python -m scripts.mimic.07_run`
+- Run MIMIC modeling with configured or automatically selected K: `uv run python -m scripts.mimic.07_run`
 - Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines input_dir=outputs/mimic_case/<run>`
-- Evaluate frozen MIMIC predictions: `uv run python -m scripts.mimic.09_evaluation input_dir=outputs/mimic_case/<run> 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
+- Evaluate frozen MIMIC predictions: `uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<primary-run>,outputs/mimic_case/<other-runs>]' 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
 - Run lightweight baselines on existing splits: `uv run python scripts/baseline.py paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run python scripts/optim.py paths.data_root=data/simulated/base`
 - Summarize train and baseline results: `uv run python scripts/summary.py 'train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'baseline_roots=[outputs/baseline/base-...]' 'train_labels=[base,mtan]' 'baseline_labels=[kmeans]'`
@@ -252,13 +252,20 @@ clean reusable method library.
   analysis; these variables are not added to the longitudinal clustering inputs.
 - `scripts/mimic/01_build_sepsis.py` through `07_run.py` form the current ordered
   MIMIC analysis workflow. `06_split.py` saves ID-only train/validation/test
-  partitions and their tensor datasets, and `07_run.py` trains on one fixed-K split and exports per-split
-  datasets, complete `TrailsPrediction` objects, patient-level tables, metrics,
-  the model, preprocessing parameters, history, and a run manifest. Their Hydra
-  command configs live under `configs/mimic/`; `split.yaml` declares
+  partitions and their tensor datasets. In `07_run.py`, a non-null top-level
+  `n_clusters` runs that fixed K, while `n_clusters: null` selects K from the
+  configured candidates and seeds using train plus validation only. The configured
+  `trainer.seed` must be among the selection seeds and identifies the predeclared
+  candidate estimator used for downstream predictions; test is loaded only after K
+  and that final estimator are locked. Single-seed selection leaves stability pairs
+  empty, while multiple seeds enable pairwise ARI summaries and the optional
+  `min_mean_pairwise_ari` gate. Selection artifacts use the public
+  `ClusterNumberSelectionResult` contract under `k_selection.result_dir`.
+  `07_run.py` then exports per-split datasets, complete `TrailsPrediction` objects,
+  patient-level tables, metrics, the model, preprocessing parameters, history, and
+  a run manifest. Their Hydra command configs live under `configs/mimic/`; `split.yaml` declares
   `feature_order: []`, which preserves the observed CSV order by default and can
   be overridden directly through Hydra.
-  K selection is excluded from `07_run` and managed as a separate analysis task.
 - `scripts/mimic/08_baselines.py` fits each method/seed only on frozen train
   (validation may control early stopping), saves models and three-split predictions,
   and records source/artifact SHA256 hashes in an atomic manifest. It directly uses
@@ -281,6 +288,9 @@ clean reusable method library.
   One unified comparison table retains unavailable capability fields as missing values.
   Degenerate clusters and unestimable Cox
   effects remain explicit diagnostics, not silently relabeled successes.
+  Its non-empty `trails_dirs` places the primary TRAILS run first; that run provides
+  frozen datasets and preprocessing parameters. Every later run must match those
+  inputs, receives a unique comparison key, and participates in cross-run ARI/NMI.
 - `AdjustedCoxAnalysis` uses the train split's lowest observed KM mortality cluster as the
   shared validation/test reference and reports cluster hazard ratios adjusted for
   age, gender, grouped race, and sepsis-onset SOFA with lifelines' default Efron
@@ -299,8 +309,11 @@ clean reusable method library.
   final case training. Empty `k_selection.candidate_clusters` means
   `2..model.n_clusters`; candidates are scored by validation C-index and
   latent MoG BIC using `sqrt(CI^2 + (1 - BIC_norm)^2)`. Candidate training and
-  selection metrics share the same holdout validation split. Case runs inherit
-  the best candidate estimator instead of retraining on all patients, and
+  selection metrics share the same holdout validation split. Empty
+  `k_selection.seeds` uses `trainer.seed`; an explicit list supports multi-seed
+  stability and must include `trainer.seed`, which identifies the downstream
+  estimator. Case runs inherit the selected candidate estimator instead of
+  retraining on all patients, and
   candidate models, histories, metrics, configs, and aggregate selection tables
   are saved under `k_selection.result_dir`.
 - `configs/case.yaml` composes the `training=case` preset, which defaults to SwanLab

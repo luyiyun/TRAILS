@@ -254,14 +254,21 @@ def run(config: CaseApplicationConfig) -> dict[str, Any]:
     k_selection_result_dir: Path | None = None
     estimator = TrailsEstimator(trails_config)
     if config.k_selection.enabled:
+        selection_seeds = config.k_selection.seeds or (seed,)
+        if seed not in selection_seeds:
+            raise ValueError("trainer.seed must be included in k_selection.seeds.")
         k_selection_result_dir = resolve_output_path(
             config.k_selection.result_dir,
             run_dir,
         )
         selector = ClusterNumberSelector(
             case_k_selection_candidates(config),
-            seeds=seed,
+            seeds=selection_seeds,
             valid_fraction=case_k_selection_valid_fraction(config),
+            selection_rule=config.k_selection.selection_rule,
+            require_non_empty=config.k_selection.require_non_empty,
+            min_cluster_fraction=config.k_selection.min_cluster_fraction,
+            min_mean_pairwise_ari=config.k_selection.min_mean_pairwise_ari,
             estimator_config=trails_config,
         )
         k_selection_result = selector.select(dataset)

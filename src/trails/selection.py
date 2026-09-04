@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -24,6 +24,28 @@ from .metrics import (
     concordance_index,
     gaussian_log_prob,
     weibull_event_probability,
+)
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
+
+
+_PLOT_METRIC_LABELS = {
+    "cindex": "Validation C-index",
+    "latent_mixture_bic": "Latent-mixture BIC",
+    "latent_mixture_mean_nll": "Latent-mixture mean NLL",
+    "selection_score": "Selection score",
+    "cluster_min_fraction": "Minimum cluster fraction",
+    "cluster_max_fraction": "Maximum cluster fraction",
+    "cluster_entropy": "Normalized cluster entropy",
+    "mean_pairwise_ari": "Mean pairwise ARI",
+}
+_DEFAULT_PLOT_METRICS = (
+    "cindex",
+    "latent_mixture_bic",
+    "selection_score",
+    "cluster_min_fraction",
+    "cluster_entropy",
 )
 
 
@@ -112,6 +134,106 @@ class ClusterNumberSelectionResult:
             assert serialized is not None
             save_json(candidate_dir / "metrics.json", json.loads(serialized))
             save_json(candidate_dir / "config.json", estimator.config.model_dump(mode="json"))
+
+    def plot_metrics(
+        self,
+        metrics: Sequence[str] | None = None,
+        *,
+        path: str | Path | None = None,
+    ) -> Figure:
+        """绘制候选 K 变化时的选择指标，并可保存为静态图片。
+
+        每个指标独占一个面板。多 seed 结果显示跨 seed 均值及标准误阴影；
+        单 seed 只显示折线。若已选出 K，则在所有面板中用竖直虚线标记。
+
+        参数：
+            metrics: ``run_metrics`` 或 ``k_summary`` 中需要绘制的数值列。
+                默认绘制 C-index、latent-mixture BIC、综合选择分、最小簇比例
+                和簇熵；多 seed 有稳定性结果时还会绘制平均成对 ARI。
+            path: 可选输出路径，图片格式由扩展名决定。
+
+        返回：
+            未关闭的 Matplotlib Figure，调用方可继续调整或自行关闭。
+        """
+        from matplotlib import pyplot as plt
+
+        selected_metrics: list[str]
+        if metrics is None:
+            selected_metrics = list(_DEFAULT_PLOT_METRICS)
+            if "mean_pairwise_ari" in self.k_summary and bool(
+                np.asarray(self.k_summary["mean_pairwise_ari"].notna()).any()
+            ):
+                selected_metrics.append("mean_pairwise_ari")
+        else:
+            selected_metrics = list(metrics)
+        if not selected_metrics:
+            raise ValueError("At least one metric is required for plotting.")
+        missing = [
+            metric
+            for metric in selected_metrics
+            if metric not in self.run_metrics and metric not in self.k_summary
+        ]
+        if missing:
+            raise ValueError(f"选择结果缺少绘图指标：{missing}")
+        non_numeric = [
+            metric
+            for metric in selected_metrics
+            if not pd.api.types.is_numeric_dtype(
+                self.run_metrics[metric] if metric in self.run_metrics else self.k_summary[metric]
+            )
+        ]
+        if non_numeric:
+            raise ValueError(f"绘图指标必须是数值列：{non_numeric}")
+
+        grouped = self.run_metrics.groupby("n_clusters", sort=True)
+        ncols = min(2, len(selected_metrics))
+        nrows = math.ceil(len(selected_metrics) / ncols)
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(6.0 * ncols, 3.8 * nrows),
+            squeeze=False,
+            constrained_layout=True,
+        )
+        plot_axes = list(axes.flat)
+        n_seeds = self.run_metrics["seed"].nunique()
+        color = "#2F6B9A"
+
+        for ax, metric in zip(plot_axes, selected_metrics, strict=False):
+            has_uncertainty = metric in self.run_metrics and n_seeds > 1
+            if metric in self.run_metrics:
+                mean = cast(pd.Series, grouped[metric].mean())
+                standard_error = cast(pd.Series, grouped[metric].sem()).fillna(0.0)
+            else:
+                summary = self.k_summary.sort_values("n_clusters").set_index("n_clusters")
+                mean = summary[metric]
+                standard_error = pd.Series(0.0, index=mean.index)
+            x_values = np.asarray(mean.index.tolist(), dtype=np.int64)
+            y_values = mean.to_numpy().astype(np.float64, copy=False)
+            ax.plot(x_values, y_values, color=color, marker="o", linewidth=2.0)
+            if has_uncertainty:
+                error = standard_error.to_numpy().astype(np.float64, copy=False)
+                ax.fill_between(
+                    x_values, y_values - error, y_values + error, color=color, alpha=0.18
+                )
+            if self.selected_k is not None and self.selected_k in x_values:
+                ax.axvline(self.selected_k, color="#333333", linestyle="--", linewidth=1.2)
+            ax.set_title(_PLOT_METRIC_LABELS.get(metric, metric), loc="left", fontsize=11)
+            ax.set_xticks(x_values)
+            ax.grid(axis="y", color="#D9DEE3", linewidth=0.8, alpha=0.8)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+        for ax in plot_axes[len(selected_metrics) :]:
+            ax.remove()
+        fig.supxlabel("Number of clusters (K)")
+        uncertainty = "mean ± SE" if n_seeds > 1 else "single seed"
+        fig.suptitle(f"Cluster-number selection metrics ({uncertainty})", fontsize=13)
+        if path is not None:
+            destination = Path(path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(destination, dpi=180)
+        return fig
 
 
 class ClusterNumberSelector:
