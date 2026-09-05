@@ -94,6 +94,8 @@ clean reusable method library.
 - 对于较为复杂的基础设施逻辑（例如多进程进度条），优先使用内聚的面向对象
   封装，避免将状态、上下文和协调逻辑分散在多个松散 helper 中。
 - Avoid `try/except` unless the code can recover or add useful diagnostics.
+- 未经用户明确要求，不执行 `git add`、`git commit` 或其他会改变 Git 索引、分支、
+  提交历史的命令；代码的暂存和版本管理由用户手动完成。Git 状态与 diff 等只读检查不受此限。
 - 仅测试 `src/trails/__init__.py` 中 `__all__` 导出的用户 API 及其公开方法。
   不为辅助函数、内部实现、`src/` 下其他包或 `scripts/` 下的命令脚本添加测试；
   发现这类既有测试时删除，而不是继续维护。

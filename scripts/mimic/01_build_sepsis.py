@@ -10,11 +10,12 @@ DATA_ROOT = Path("data/real/mimic-iv-3.1")
 MIMIC_CODE_ROOT = Path(".remote-run/vendor/mimic-code")
 DATABASE = DATA_ROOT / "derived" / "mimiciv.duckdb"
 MIMIC_CODE_COMMIT = "d20b49a71ebb8cafc6febb0821432778592192d5"
-TARGET_CONCEPT = "sepsis/sepsis3.sql"
+# NED位于固定concept清单末端；以它为终点会保留Sepsis-3并追加剂量依赖表。
+TARGET_CONCEPT = "medication/norepinephrine_equivalent_dose.sql"
 
 
-class MimicSepsisBuilder:
-    """Import raw MIMIC-IV CSVs and build official concepts through Sepsis-3."""
+class MimicConceptBuilder:
+    """导入MIMIC-IV原始表，并构建至去甲肾上腺素等效剂量的官方concept。"""
 
     def __init__(self) -> None:
         self.data_root = DATA_ROOT.resolve()
@@ -60,7 +61,7 @@ class MimicSepsisBuilder:
             sql = (self.concepts_root / relative_path).read_text(encoding="utf-8")
             self._run_step(connection, f"concept:{relative_path}", sql)
         connection.close()
-        print(f"Sepsis-3 concepts 已构建至 {self.database}")
+        print(f"MIMIC官方concepts已构建至 {self.database}")
 
     def _validate_inputs(self) -> None:
         for directory in (self.data_root / "hosp", self.data_root / "icu"):
@@ -124,7 +125,7 @@ class MimicSepsisBuilder:
 
 
 def main() -> None:
-    MimicSepsisBuilder().build()
+    MimicConceptBuilder().build()
 
 
 if __name__ == "__main__":
