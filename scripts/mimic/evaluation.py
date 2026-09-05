@@ -32,8 +32,20 @@ from matplotlib import pyplot as plt  # noqa: E402
 RACE_GROUPS = ("WHITE", "BLACK", "ASIAN", "HISPANIC_OR_LATINO", "OTHER_OR_UNKNOWN")
 
 
-def evaluation_methods(config: MimicEvaluationConfig) -> list[dict[str, Any]]:
-    """读取TRAILS和基线manifest，并验证它们共享同一冻结输入。"""
+def _data_reference(manifest: dict[str, Any], root: Path) -> tuple[Path, dict[str, Any]]:
+    """提取运行直接记录的06冻结划分引用。"""
+    if "data" not in manifest:
+        raise ValueError(f"运行manifest缺少data冻结划分引用：{root}")
+    data = manifest["data"]
+    split_root = resolve_input_path(Path(data["split_dir"])).resolve()
+    signature = {key: data[key] for key in ("split_seed", "split_sizes", "n_features")}
+    return split_root, signature
+
+
+def evaluation_methods(
+    config: MimicEvaluationConfig,
+) -> tuple[Path, list[dict[str, Any]]]:
+    """读取TRAILS和基线manifest，并返回它们共同的06冻结划分。"""
     trails_roots = [resolve_input_path(path) for path in config.trails_dirs]
     if len(set(trails_roots)) != len(trails_roots):
         raise ValueError("TRAILS评价目录重复")
@@ -44,23 +56,13 @@ def evaluation_methods(config: MimicEvaluationConfig) -> list[dict[str, Any]]:
     labels = [label for _, label, _ in trails_runs]
     if len(set(labels)) != len(labels):
         raise ValueError("TRAILS评价目录末级名称重复，无法生成唯一输出目录")
-    primary_root, _, primary_manifest = trails_runs[0]
-    reference_signature = {
-        key: primary_manifest["data"][key]
-        for key in ("split_dir", "split_seed", "split_sizes", "n_features")
-    }
-    reference_preprocessing = sha256_file(primary_root / "preprocessing_parameters.csv")
+    reference_root, reference_signature = _data_reference(trails_runs[0][2], trails_runs[0][0])
     multiple_trails = len(trails_runs) > 1
     methods: list[dict[str, Any]] = []
     for root, label, manifest in trails_runs:
-        signature = {
-            key: manifest["data"][key]
-            for key in ("split_dir", "split_seed", "split_sizes", "n_features")
-        }
-        if signature != reference_signature:
+        split_root, signature = _data_reference(manifest, root)
+        if split_root != reference_root or signature != reference_signature:
             raise ValueError(f"TRAILS运行未使用同一冻结划分：{root}")
-        if sha256_file(root / "preprocessing_parameters.csv") != reference_preprocessing:
-            raise ValueError(f"TRAILS运行预处理参数不一致：{root}")
         name = f"trails:{label}" if multiple_trails else "trails"
         methods.append(
             {
@@ -80,9 +82,9 @@ def evaluation_methods(config: MimicEvaluationConfig) -> list[dict[str, Any]]:
             raise ValueError(f"拒绝把未完整成功的08运行纳入评价：{root}")
         if manifest["risk_horizon"] != config.tau:
             raise ValueError("08和09风险时间窗不一致")
-        for relative, expected in manifest["source_sha256"].items():
-            if sha256_file(primary_root / relative) != expected:
-                raise ValueError(f"08来源与当前07不一致：{relative}")
+        split_root, signature = _data_reference(manifest, root)
+        if split_root != reference_root or signature != reference_signature:
+            raise ValueError(f"08未使用同一冻结划分：{root}")
         for record in manifest["methods"]:
             method = dict(record)
             if method["status"] != "completed":
@@ -97,7 +99,20 @@ def evaluation_methods(config: MimicEvaluationConfig) -> list[dict[str, Any]]:
     keys = [method["key"] for method in methods]
     if len(set(keys)) != len(keys):
         raise ValueError("评价方法×seed重复")
-    return methods
+    split_manifest_path = reference_root / "split_manifest.json"
+    preprocessing_path = reference_root / "preprocessing_parameters.csv"
+    if missing := [
+        str(path) for path in (split_manifest_path, preprocessing_path) if not path.is_file()
+    ]:
+        raise FileNotFoundError(f"缺少06冻结划分产物：{missing}")
+    split_manifest = json.loads(split_manifest_path.read_text())
+    if (
+        split_manifest["split_seed"] != reference_signature["split_seed"]
+        or split_manifest["split_counts"] != reference_signature["split_sizes"]
+        or len(split_manifest["feature_order"]) != reference_signature["n_features"]
+    ):
+        raise ValueError("06 split manifest与运行记录的冻结划分不一致")
+    return reference_root, methods
 
 
 def load_prediction(

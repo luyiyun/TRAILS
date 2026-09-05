@@ -1,4 +1,4 @@
-"""在07冻结划分上训练基线，保存模型与三划分预测，不在此选择测试结果。"""
+"""在06冻结划分上训练基线，保存模型与三划分预测，不在此选择测试结果。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from trails import TrailsConfig, TrailsEstimator
+from trails import DataConfig, TrailsConfig, TrailsEstimator, resolve_batch_size
 from trails.artifacts import plot_history, save_history_csv, save_json
 from trails_simulate.config import resolved_payload
 
@@ -29,36 +29,32 @@ LOGGER = logging.getLogger(__name__)
 
 def run(config: MimicBaselinesConfig) -> dict[str, Any]:
     """逐method×seed拟合，失败保留状态并继续其他方法，整批不伪报成功。"""
-    source = resolve_input_path(config.input_dir)
+    source = resolve_input_path(config.split_dir)
     output = config.paths.dir.resolve()
     manifest_path = output / "baselines_manifest.json"
     pending = manifest_path.with_suffix(".tmp")
     if manifest_path.exists():
         raise FileExistsError(f"拒绝覆盖既有基线运行：{output}")
-    source_manifest = json.loads((source / "run_manifest.json").read_text())
-    original = TrailsConfig.model_validate(source_manifest["training"])
-    n_clusters = config.n_clusters or original.model.n_clusters
-    if n_clusters != original.model.n_clusters:
-        raise ValueError("对比基线必须使用与07一致的K")
-    if config.risk_horizon != original.trainer.risk_horizon:
-        raise ValueError("对比基线必须使用与07一致的risk_horizon")
+    split_manifest = json.loads((source / "split_manifest.json").read_text())
     datasets = load_frozen_datasets(source)
+    n_clusters = config.n_clusters
     output.mkdir(parents=True, exist_ok=True)
-    input_hashes = {
-        name: sha256_file(source / name)
-        for name in ["run_manifest.json", "preprocessing_parameters.csv"]
-        + [f"{split}/dataset.pt" for split in datasets]
-    }
+    split_sizes = {name: len(data) for name, data in datasets.items()}
+    if split_manifest["split_counts"] != split_sizes:
+        raise ValueError("06 split manifest的划分大小与dataset不一致")
     records: list[dict[str, Any]] = []
     manifest: dict[str, Any] = {
         "format_version": 1,
         "status": "running",
-        "input_dir": str(source),
-        "source_sha256": input_hashes,
+        "data": {
+            "split_dir": str(source),
+            "split_seed": split_manifest["split_seed"],
+            "split_sizes": split_sizes,
+            "n_features": datasets["train"].n_features,
+        },
         "n_clusters": n_clusters,
-        "risk_horizon": config.risk_horizon,
+        "risk_horizon": config.trainer.risk_horizon,
         "prediction_times": config.prediction_times,
-        "split_sizes": {name: len(data) for name, data in datasets.items()},
         "config": config.model_dump(mode="json"),
         "methods": records,
     }
@@ -93,11 +89,27 @@ def run(config: MimicBaselinesConfig) -> dict[str, Any]:
             method_started = time.perf_counter()
             try:
                 if method.kind == "trails_no_survival":
-                    payload = original.model_dump(mode="json")
-                    payload["model"]["loss"]["survival_weight"] = 0.0
-                    payload["trainer"]["seed"] = seed
-                    payload["seed"] = seed
-                    training = TrailsConfig.model_validate(payload)
+                    model = config.model.model_copy(
+                        update={
+                            "n_clusters": n_clusters,
+                            "loss": config.model.loss.model_copy(update={"survival_weight": 0.0}),
+                        }
+                    )
+                    trainer = config.trainer.model_copy(
+                        update={
+                            "batch_size": resolve_batch_size(
+                                len(datasets["train"]), config.trainer.batch_size
+                            ),
+                            "seed": seed,
+                            "valid_size": 0.0,
+                        }
+                    )
+                    training = TrailsConfig(
+                        data=DataConfig(n_features=datasets["train"].n_features),
+                        model=model,
+                        trainer=trainer,
+                        seed=seed,
+                    )
                     record["training"] = training.model_dump(mode="json")
                     estimator = TrailsEstimator(training).fit(
                         datasets["train"], validation_data=datasets["validation"]
@@ -121,7 +133,7 @@ def run(config: MimicBaselinesConfig) -> dict[str, Any]:
                         prediction = baseline.predict(
                             data,
                             prediction_times=prediction_times,
-                            risk_horizon=config.risk_horizon,
+                            risk_horizon=config.trainer.risk_horizon,
                         )
                         if prediction.patient_ids != dataset_patient_ids(data):
                             raise ValueError("基线预测患者顺序与冻结数据不一致")

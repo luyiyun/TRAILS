@@ -92,6 +92,13 @@ def run(config: DictConfig) -> None:
             for group, count in patients["anchor_year_group"].value_counts().sort_index().items()
         }
     input_sha256 = hashlib.sha256(patients_csv.read_bytes()).hexdigest()
+    strategy_root = (
+        output_root if strategy == "random" else output_root / f"temporal-{test_start_year}"
+    )
+    seed_roots = {seed: strategy_root / f"seed-{seed}" for seed in split_seeds}
+    if existing := [str(path) for path in seed_roots.values() if path.exists()]:
+        raise FileExistsError(f"拒绝覆盖既有冻结划分：{existing}")
+
     for seed in split_seeds:
         if strategy == "random":
             assert fractions is not None
@@ -134,11 +141,8 @@ def run(config: DictConfig) -> None:
         ):
             raise RuntimeError("train、validation 和 test patient_id 存在重叠")
 
-        strategy_root = (
-            output_root if strategy == "random" else output_root / f"temporal-{test_start_year}"
-        )
-        seed_root = strategy_root / f"seed-{seed}"
-        seed_root.mkdir(parents=True, exist_ok=True)
+        seed_root = seed_roots[seed]
+        seed_root.mkdir(parents=True, exist_ok=False)
         for name, frame in splits.items():
             frame.loc[:, ["patient_id"]].sort_values(by=["patient_id"]).to_csv(
                 seed_root / f"{name}_ids.csv",

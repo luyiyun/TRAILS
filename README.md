@@ -34,7 +34,9 @@ Dataset 的 `metadata` 会保留 `latent_z`、`cluster_means`、`cluster_covaria
 
 ## 命令
 
-MIMIC 固定划分的比较流程为 `06_split` → `07_run` → `08_baselines` → `09_evaluation`：
+MIMIC 比较流程以 `06_split` 生成的冻结划分为共同输入：`07_run` 和
+`08_baselines` 分别读取该划分，`09_evaluation` 再联合读取两类预测结果。
+06 会拒绝覆盖已经存在的 seed 目录，需要新划分时应使用新的输出目录或 seed。
 
 ```bash
 # 默认n_clusters=null：按配置的候选K和seeds在train/validation上选择K
@@ -43,20 +45,24 @@ uv run python -m scripts.mimic.07_run
 uv run python -m scripts.mimic.07_run n_clusters=3
 # 扩展seeds列表后启用跨seed稳定性汇总；trainer.seed必须包含在列表中
 uv run python -m scripts.mimic.07_run 'k_selection.seeds=[20260517,20260518,20260519]'
-uv run python -m scripts.mimic.08_baselines input_dir=outputs/mimic_case/<trails-run> paths.dir=outputs/mimic_case/<baseline-run>
+uv run python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517 n_clusters=3 paths.dir=outputs/mimic_case/<baseline-run>
 uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<trails-run>]' 'baseline_dirs=[outputs/mimic_case/<baseline-run>]'
 # 在一次09运行中比较多个TRAILS实验，并直接计算模型间ARI/NMI
 uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<primary-trails-run>,outputs/mimic_case/<other-trails-run>]'
 ```
 
-`trails_dirs`不能为空；其中第一个目录是主TRAILS运行，为整次评价提供冻结数据和预处理参数。
+`trails_dirs`不能为空；其中第一个目录仅作为主TRAILS方法。09会从所有07/08 manifest
+推导共同的06冻结划分；任一结果引用不同划分时会直接报错。
 
 07自动选择K时不会使用test；只有K及`trainer.seed`对应的最终模型锁定后才加载test。
 选择结果保存在运行目录的`k_selection/`，包括逐运行指标、跨seed稳定性、K汇总和候选模型。
-08 复用07保存的三划分和最终训练配置，不重新划分患者；所有方法只使用train拟合，
-validation可用于早停，test仅用于冻结预测后的评价。`methods`可选择子集或配置多个seed。
+08 通过`split_dir`直接读取06保存的三划分，并通过`n_clusters`明确指定K；它与07之间没有
+输入依赖。所有方法只使用train拟合，validation可用于早停，test仅用于冻结预测后的评价。
+`methods`可选择子集或配置多个seed。
 R方法需要远端 `lcmm`、`JMbayes2`、`data.table`、`jsonlite`、`R.utils`、`nlme`和`survival`。
-09支持一个主TRAILS目录、任意多个同冻结划分的额外TRAILS目录和多个已完成的基线目录，
+09支持一个主TRAILS目录、任意多个同冻结划分的额外TRAILS目录和多个已完成的基线目录；
+每个07/08 manifest都必须直接记录其06划分引用，旧08 manifest不再兼容。09确认这些引用
+一致后，从共同的06目录加载数据集和预处理参数，
 输出方法×seed×split结果、统一比较表及所有有聚类能力方法之间的ARI/NMI；
 聚类方法不通过簇KM构造预测C-index、AUC、IBS或校准。真实数据与患者级产物留在远端。
 

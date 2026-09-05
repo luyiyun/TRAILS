@@ -6,6 +6,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from trails import ModelConfig, TrainerConfig
 from trails_case.config import CaseApplicationConfig
 
 
@@ -209,13 +210,14 @@ MimicBaselineMethodConfig = Annotated[
 
 
 class MimicBaselinesConfig(BaseModel):
-    """在07冻结数据上训练全部聚类与患者级生存基线。"""
+    """在06冻结数据上训练全部聚类与患者级生存基线。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    input_dir: Path
-    n_clusters: int | None = Field(default=None, ge=2)
-    risk_horizon: float = Field(default=28.0, gt=0.0)
+    split_dir: Path
+    n_clusters: int = Field(ge=2)
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    trainer: TrainerConfig = Field(default_factory=TrainerConfig)
     prediction_times: tuple[float, ...] = Field(min_length=1)
     methods: tuple[MimicBaselineMethodConfig, ...] = Field(min_length=1)
     paths: MimicBaselinePathsConfig
@@ -231,7 +233,10 @@ class MimicBaselinesConfig(BaseModel):
                 raise ValueError(f"{method.name}的seeds不能重复")
         if any(right <= left for left, right in pairwise(self.prediction_times)):
             raise ValueError("prediction_times必须严格递增")
-        if self.prediction_times[0] <= 0.0 or self.prediction_times[-1] >= self.risk_horizon:
+        if (
+            self.prediction_times[0] <= 0.0
+            or self.prediction_times[-1] >= self.trainer.risk_horizon
+        ):
             raise ValueError("prediction_times必须位于(0, risk_horizon)内")
         return self
 

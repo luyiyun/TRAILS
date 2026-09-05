@@ -1,5 +1,5 @@
 # @package _global_
-# 第一个目录是主TRAILS运行，同时提供冻结数据和预处理参数。
+# 第一个目录是主TRAILS运行；09从全部运行manifest推导共同的06冻结划分。
 trails_dirs: [outputs/mimic_case/mimic_case-run]
 baseline_dirs: []
 auc_times: [7.0, 14.0, 21.0]

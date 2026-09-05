@@ -478,15 +478,16 @@ def evaluate_split(
 def run(config: MimicEvaluationConfig) -> dict[str, Any]:
     """按方法实际能力统一评价聚类与患者级生存预测。"""
     primary_root = resolve_input_path(config.trails_dirs[0])
-    datasets = load_frozen_datasets(primary_root)
-    preprocessing = pd.read_csv(primary_root / "preprocessing_parameters.csv")
+    split_root, methods = evaluation_methods(config)
+    datasets = load_frozen_datasets(split_root)
+    preprocessing = pd.read_csv(split_root / "preprocessing_parameters.csv")
     output = config.paths.dir.resolve()
     if (output / "evaluation_summary.json").exists():
         raise FileExistsError(f"拒绝覆盖既有评价：{output}")
     summaries: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
     assignments: dict[str, dict[str, np.ndarray]] = {"validation": {}, "test": {}}
-    for method in evaluation_methods(config):
+    for method in methods:
         capabilities = frozenset(method["capabilities"])
         for capability in sorted({"cluster", "survival"} - capabilities):
             LOGGER.info(
@@ -576,6 +577,7 @@ def run(config: MimicEvaluationConfig) -> dict[str, Any]:
     )
     summary = {
         "primary_trails_dir": str(primary_root),
+        "split_dir": str(split_root),
         "trails_dirs": [str(resolve_input_path(path)) for path in config.trails_dirs],
         "baseline_dirs": [str(path) for path in config.baseline_dirs],
         "censoring_reference_set": "train",

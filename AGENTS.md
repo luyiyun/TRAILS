@@ -60,7 +60,7 @@ clean reusable method library.
 - Run real-data case modeling: `uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv`
 - Generate MIMIC patient splits and tensor datasets: `uv run python -m scripts.mimic.06_split`
 - Run MIMIC modeling with configured or automatically selected K: `uv run python -m scripts.mimic.07_run`
-- Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines input_dir=outputs/mimic_case/<run>`
+- Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517 n_clusters=<K>`
 - Evaluate frozen MIMIC predictions: `uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<primary-run>,outputs/mimic_case/<other-runs>]' 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
 - Run lightweight baselines on existing splits: `uv run python scripts/baseline.py paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run python scripts/optim.py paths.data_root=data/simulated/base`
@@ -243,7 +243,9 @@ clean reusable method library.
 - MIMIC `06_split.py` saves the ID-only external split plus train-fitted
   train/validation/test tensor datasets and preprocessing parameters. Later commands
   consume these frozen datasets; command modules import only non-command support
-  modules from the workflow package and do not import one another.
+  modules from the workflow package and do not import one another. It refuses to
+  overwrite any existing target seed directory and preflights every configured seed
+  before writing, so each seed directory is an immutable split bundle.
 - MIMIC `06_split.py` supports `random` and `temporal` strategies. Temporal splitting
   assigns `anchor_year_group` values starting at the configured cutoff to test, then
   randomly stratifies validation from the earlier development cohort.
@@ -268,16 +270,17 @@ clean reusable method library.
   be overridden directly through Hydra.
 - `scripts/mimic/08_baselines.py` fits each method/seed only on frozen train
   (validation may control early stopping), saves models and three-split predictions,
-  and records source/artifact SHA256 hashes in an atomic manifest. It directly uses
-  `TrailsEstimator` for no-survival ablation, copying 07's complete training config
-  and changing only survival loss weight and the configured seed. Shared baselines
+  and records its direct 06 split reference plus artifact SHA256 hashes in an atomic
+  manifest. `split_dir` is its sole dataset input, `n_clusters` explicitly sets K,
+  and shared model/trainer presets configure its no-survival `TrailsEstimator`
+  ablation without depending on a 07 run. Shared baselines
   write `BaselinePrediction` NPZ; `ufpca_kmeans` concatenates per-variable UFPCA
   scores, while `mfpca_kmeans` uses FDApy joint MFPCA and DCM/VaDeSC remain
   UFPCA-based. R exchange files and checkpoints stay remote.
   Failed methods are recorded, other methods may finish, but the batch exits nonzero
   and is not accepted as a complete comparison. New run directories are required.
-- `09_evaluation.py` accepts any number of completed `baseline_dirs`, verifies
-  frozen-source hashes, branches between `TrailsPrediction` and baseline NPZ readers,
+- `09_evaluation.py` accepts any number of completed `baseline_dirs`, branches
+  between `TrailsPrediction` and baseline NPZ readers,
   and evaluates each method/seed/split once according to its cluster and survival
   capabilities. `evaluation.py` retains shared plotting/calculation classes. Cluster evaluation
   reports occupancy, entropy, KM/log-rank, adjusted Cox, clinical characteristics,
@@ -288,9 +291,10 @@ clean reusable method library.
   One unified comparison table retains unavailable capability fields as missing values.
   Degenerate clusters and unestimable Cox
   effects remain explicit diagnostics, not silently relabeled successes.
-  Its non-empty `trails_dirs` places the primary TRAILS run first; that run provides
-  frozen datasets and preprocessing parameters. Every later run must match those
-  inputs, receives a unique comparison key, and participates in cross-run ARI/NMI.
+  Its non-empty `trails_dirs` places the primary TRAILS method first. Every 07/08
+  manifest must directly reference the same 06 split; 09 rejects old manifests or
+  mismatched references, then loads datasets and preprocessing from that common split.
+  Each run receives a unique comparison key and participates in cross-run ARI/NMI.
 - `AdjustedCoxAnalysis` uses the train split's lowest observed KM mortality cluster as the
   shared validation/test reference and reports cluster hazard ratios adjusted for
   age, gender, grouped race, and sepsis-onset SOFA with lifelines' default Efron
