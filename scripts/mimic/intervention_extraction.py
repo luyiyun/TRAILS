@@ -1,4 +1,4 @@
-"""从MIMIC事件表提取患者级器官支持与治疗措施。"""
+"""从mimic-code生成的官方concept表汇总患者级器官支持与治疗措施。"""
 
 from __future__ import annotations
 
@@ -8,26 +8,11 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-VASOPRESSOR_DRUGS: dict[str, tuple[int, str, str]] = {
-    "norepinephrine": (221906, "norepinephrine", "1.0"),
-    "epinephrine": (221289, "epinephrine", "1.0"),
-    "dopamine": (221662, "dopamine", "1.0 / 100.0"),
-    "phenylephrine": (221749, "phenylephrine", "1.0 / 10.0"),
-    "vasopressin": (222315, "vasopressin", "2.5 / 60.0"),
-}
-VASOPRESSOR_ITEM_IDS = tuple(specification[0] for specification in VASOPRESSOR_DRUGS.values())
-VASOPRESSOR_METRICS = {
-    "any": "any_flag",
-    "hours": "hours",
-    "fraction": "fraction",
-    "ned_peak": "ned_peak",
-    "ned_twa": "ned_twa",
-}
 INTERVENTION_BINARY_COLUMNS = (
     "invasive_ventilation_any",
     "noninvasive_ventilation_any",
     "hfnc_any",
-    *(f"{drug}_any" for drug in VASOPRESSOR_DRUGS),
+    "vasopressor_any",
     "rrt_any",
     "crrt_any",
     "antibiotic_any",
@@ -40,11 +25,10 @@ INTERVENTION_CONTINUOUS_COLUMNS = (
     "noninvasive_ventilation_fraction",
     "hfnc_hours",
     "hfnc_fraction",
-    *(
-        f"{drug}_{metric}"
-        for drug in VASOPRESSOR_DRUGS
-        for metric in tuple(VASOPRESSOR_METRICS)[1:]
-    ),
+    "vasopressor_hours",
+    "vasopressor_fraction",
+    "vasopressor_ned_peak",
+    "vasopressor_ned_twa",
     "antibiotic_agent_count",
     "antibiotic_first_start_hours",
 )
@@ -54,7 +38,6 @@ INTERVENTION_TABLES = {
     "rrt",
     "crrt",
     "antibiotic",
-    "vasoactive_agent",
     "norepinephrine_equivalent_dose",
 }
 INTERVENTION_SOURCES = {
@@ -68,17 +51,11 @@ INTERVENTION_SOURCES = {
     "hfnc_any": "ventilation: HFNC",
     "hfnc_hours": "ventilation: merged HFNC intervals",
     "hfnc_fraction": "hours divided by observed window",
-    **{
-        f"{drug}_{metric}": {
-            "any": f"inputevents: documented {drug}",
-            "hours": f"inputevents: merged positive-duration {drug} intervals",
-            "fraction": "hours divided by observed window",
-            "ned_peak": f"{drug} norepinephrine-equivalent peak (mcg/kg/min)",
-            "ned_twa": f"duration-weighted {drug} NED during positive-dose intervals",
-        }[metric]
-        for drug in VASOPRESSOR_DRUGS
-        for metric in VASOPRESSOR_METRICS
-    },
+    "vasopressor_any": "norepinephrine_equivalent_dose: positive total NED interval",
+    "vasopressor_hours": "norepinephrine_equivalent_dose: merged positive total NED intervals",
+    "vasopressor_fraction": "hours divided by observed window",
+    "vasopressor_ned_peak": "norepinephrine_equivalent_dose: total NED peak (mcg/kg/min)",
+    "vasopressor_ned_twa": "norepinephrine_equivalent_dose: duration-weighted positive total NED",
     "rrt_any": "rrt: dialysis_active or active CRRT",
     "crrt_any": "rrt dialysis type or crrt system_active",
     "antibiotic_any": "antibiotic prescription",
@@ -86,32 +63,8 @@ INTERVENTION_SOURCES = {
     "antibiotic_first_start_hours": "first overlapping antibiotic prescription",
 }
 
-VASOPRESSOR_DRUG_CASE_SQL = (
-    "CASE itemid "
-    + " ".join(
-        f"WHEN {item_id} THEN '{drug}'" for drug, (item_id, _, _) in VASOPRESSOR_DRUGS.items()
-    )
-    + " END"
-)
-VASOPRESSOR_DRUG_VALUES_SQL = ", ".join(f"('{drug}')" for drug in VASOPRESSOR_DRUGS)
-VASOPRESSOR_DOSE_EVENTS_SQL = "\nUNION ALL\n".join(
-    "SELECT stay_id, starttime, endtime, "
-    f"'{drug}' AS drug, {column} * ({factor}) AS ned_rate "
-    "FROM mimiciv_derived.vasoactive_agent "
-    f"WHERE {column} IS NOT NULL"
-    for drug, (_, column, factor) in VASOPRESSOR_DRUGS.items()
-)
-VASOPRESSOR_PIVOT_SQL = ",\n        ".join(
-    f"MAX(CASE WHEN drug = '{drug}' THEN {value} END) AS {drug}_{metric}"
-    for drug in VASOPRESSOR_DRUGS
-    for metric, value in VASOPRESSOR_METRICS.items()
-)
-VASOPRESSOR_OUTPUT_SQL = ",\n    ".join(
-    f"p.{drug}_{metric}" for drug in VASOPRESSOR_DRUGS for metric in VASOPRESSOR_METRICS
-)
-
 # 可靠区间先合并重叠记录；RRT/CRRT因来源混合而只保留存在性。
-INTERVENTIONS_SQL = f"""
+INTERVENTIONS_SQL = """
 WITH cohort AS (
     SELECT
         subject_id,
@@ -175,41 +128,25 @@ WITH cohort AS (
     FROM cohort AS c
     LEFT JOIN ventilation_merged AS v ON c.stay_id = v.stay_id
     GROUP BY c.stay_id
-), vasopressor_events AS (
-    SELECT
-        stay_id,
-        {VASOPRESSOR_DRUG_CASE_SQL} AS drug,
-        starttime,
-        endtime
-    FROM mimiciv_icu.inputevents
-    WHERE itemid IN ({", ".join(map(str, VASOPRESSOR_ITEM_IDS))})
-        AND COALESCE(statusdescription, '') <> 'Rewritten'
-        AND (COALESCE(amount, 0) > 0 OR COALESCE(rate, 0) > 0)
-), vasopressor_presence AS (
-    SELECT c.stay_id, v.drug, 1 AS any_flag
-    FROM cohort AS c
-    INNER JOIN vasopressor_events AS v
-        ON c.stay_id = v.stay_id
-        AND v.starttime < c.window_end
-        AND COALESCE(v.endtime, v.starttime) > c.intime
-    GROUP BY c.stay_id, v.drug
 ), vasopressor_clipped AS (
+    -- 直接复用官方总NED，暴露、时长与剂量统一来自正剂量区间。
     SELECT
         c.stay_id,
-        v.drug,
+        v.norepinephrine_equivalent_dose AS ned_rate,
         GREATEST(v.starttime, c.intime) AS starttime,
         LEAST(v.endtime, c.window_end) AS endtime
     FROM cohort AS c
-    INNER JOIN vasopressor_events AS v
+    INNER JOIN mimiciv_derived.norepinephrine_equivalent_dose AS v
         ON c.stay_id = v.stay_id
         AND v.starttime < c.window_end
         AND v.endtime > c.intime
         AND v.endtime > v.starttime
+        AND v.norepinephrine_equivalent_dose > 0
 ), vasopressor_prepared AS (
     SELECT
         *,
         MAX(endtime) OVER (
-            PARTITION BY stay_id, drug
+            PARTITION BY stay_id
             ORDER BY starttime, endtime
             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
         ) AS prior_endtime
@@ -218,72 +155,37 @@ WITH cohort AS (
     SELECT
         *,
         SUM(CAST(prior_endtime IS NULL OR starttime > prior_endtime AS INTEGER))
-            OVER (PARTITION BY stay_id, drug ORDER BY starttime, endtime) AS interval_group
+            OVER (PARTITION BY stay_id ORDER BY starttime, endtime) AS interval_group
     FROM vasopressor_prepared
 ), vasopressor_merged AS (
-    SELECT stay_id, drug, MIN(starttime) AS starttime, MAX(endtime) AS endtime
+    SELECT stay_id, MIN(starttime) AS starttime, MAX(endtime) AS endtime
     FROM vasopressor_grouped
-    GROUP BY stay_id, drug, interval_group
+    GROUP BY stay_id, interval_group
 ), vasopressor_duration AS (
     SELECT
         stay_id,
-        drug,
         SUM(DATE_DIFF('second', starttime, endtime)) / 3600.0 AS hours
     FROM vasopressor_merged
-    GROUP BY stay_id, drug
-), vasopressor_dose_events AS (
-    {VASOPRESSOR_DOSE_EVENTS_SQL}
+    GROUP BY stay_id
 ), vasopressor_dose AS (
     SELECT
-        c.stay_id,
-        n.drug,
-        MAX(n.ned_rate) AS ned_peak,
-        SUM(
-            n.ned_rate
-            * DATE_DIFF(
-                'second',
-                GREATEST(n.starttime, c.intime),
-                LEAST(n.endtime, c.window_end)
-            )
-        ) / NULLIF(
-            SUM(DATE_DIFF(
-                'second',
-                GREATEST(n.starttime, c.intime),
-                LEAST(n.endtime, c.window_end)
-            )),
-            0
-        ) AS ned_twa
-    FROM cohort AS c
-    INNER JOIN vasopressor_dose_events AS n
-        ON c.stay_id = n.stay_id
-        AND n.starttime < c.window_end
-        AND n.endtime > c.intime
-        AND n.endtime > n.starttime
-        AND n.ned_rate > 0
-    GROUP BY c.stay_id, n.drug
-), vasopressor_long AS (
-    SELECT
-        c.stay_id,
-        g.drug,
-        COALESCE(p.any_flag, 0) AS any_flag,
-        COALESCE(h.hours, 0) AS hours,
-        COALESCE(h.hours, 0) / c.observed_window_hours AS fraction,
-        CASE WHEN COALESCE(p.any_flag, 0) = 0 THEN 0 ELSE n.ned_peak END AS ned_peak,
-        CASE WHEN COALESCE(p.any_flag, 0) = 0 THEN 0 ELSE n.ned_twa END AS ned_twa
-    FROM cohort AS c
-    CROSS JOIN (VALUES {VASOPRESSOR_DRUG_VALUES_SQL}) AS g(drug)
-    LEFT JOIN vasopressor_presence AS p
-        ON c.stay_id = p.stay_id AND g.drug = p.drug
-    LEFT JOIN vasopressor_duration AS h
-        ON c.stay_id = h.stay_id AND g.drug = h.drug
-    LEFT JOIN vasopressor_dose AS n
-        ON c.stay_id = n.stay_id AND g.drug = n.drug
+        stay_id,
+        MAX(ned_rate) AS ned_peak,
+        SUM(ned_rate * DATE_DIFF('second', starttime, endtime))
+            / SUM(DATE_DIFF('second', starttime, endtime)) AS ned_twa
+    FROM vasopressor_clipped
+    GROUP BY stay_id
 ), vasopressor AS (
     SELECT
-        stay_id,
-        {VASOPRESSOR_PIVOT_SQL}
-    FROM vasopressor_long
-    GROUP BY stay_id
+        c.stay_id,
+        CAST(COALESCE(h.hours, 0) > 0 AS INTEGER) AS any_flag,
+        COALESCE(h.hours, 0) AS hours,
+        COALESCE(h.hours, 0) / c.observed_window_hours AS fraction,
+        COALESCE(n.ned_peak, 0) AS ned_peak,
+        COALESCE(n.ned_twa, 0) AS ned_twa
+    FROM cohort AS c
+    LEFT JOIN vasopressor_duration AS h ON c.stay_id = h.stay_id
+    LEFT JOIN vasopressor_dose AS n ON c.stay_id = n.stay_id
 ), renal_replacement AS (
     SELECT
         c.stay_id,
@@ -344,7 +246,11 @@ SELECT
     CAST(v.hfnc_hours > 0 AS INTEGER) AS hfnc_any,
     v.hfnc_hours,
     v.hfnc_hours / c.observed_window_hours AS hfnc_fraction,
-    {VASOPRESSOR_OUTPUT_SQL},
+    p.any_flag AS vasopressor_any,
+    p.hours AS vasopressor_hours,
+    p.fraction AS vasopressor_fraction,
+    p.ned_peak AS vasopressor_ned_peak,
+    p.ned_twa AS vasopressor_ned_twa,
     GREATEST(r.rrt, x.crrt) AS rrt_any,
     GREATEST(r.crrt, x.crrt) AS crrt_any,
     a.antibiotic AS antibiotic_any,
@@ -393,21 +299,12 @@ def validate_interventions(
     fractions = interventions.filter(regex=r"_fraction$")
     if not fractions.apply(lambda column: column.between(0.0, 1.0)).to_numpy().all():
         raise ValueError("治疗措施时间比例必须位于0到1之间")
-    ned_peaks = interventions.loc[:, [f"{drug}_ned_peak" for drug in VASOPRESSOR_DRUGS]].to_numpy(
-        dtype=float
-    )
-    ned_twas = interventions.loc[:, [f"{drug}_ned_twa" for drug in VASOPRESSOR_DRUGS]].to_numpy(
-        dtype=float
-    )
-    drug_flags = interventions.loc[:, [f"{drug}_any" for drug in VASOPRESSOR_DRUGS]].to_numpy(
-        dtype=np.int64
-    )
+    ned_peaks = interventions["vasopressor_ned_peak"].to_numpy(dtype=float)
+    ned_twas = interventions["vasopressor_ned_twa"].to_numpy(dtype=float)
     if (ned_twas > ned_peaks + 1e-12).any():
         raise ValueError("血管活性药NED时间加权均值不能超过峰值")
-    if (np.isnan(ned_peaks) != np.isnan(ned_twas)).any():
-        raise ValueError("血管活性药NED峰值和时间加权均值必须同时缺失")
-    if (np.isnan(ned_peaks) & (drug_flags == 0)).any():
-        raise ValueError("未使用血管活性药的患者NED应记为0而不是缺失")
+    if not (np.isfinite(ned_peaks).all() and np.isfinite(ned_twas).all()):
+        raise ValueError("官方总NED峰值和时间加权均值必须为有限数值")
 
     antibiotic_time = interventions["antibiotic_first_start_hours"]
     expected_missing = interventions["antibiotic_any"].eq(0)

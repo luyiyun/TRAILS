@@ -256,6 +256,7 @@ class MimicEvaluationConfig(BaseModel):
 
     trails_dirs: tuple[Path, ...] = Field(min_length=1)
     baseline_dirs: tuple[Path, ...] = ()
+    interventions_csv: Path
     auc_times: tuple[float, ...] = (7.0, 14.0, 21.0)
     probability_times: tuple[float, ...] = tuple(float(day) for day in range(1, 28))
     calibration_bins: int = Field(default=10, ge=2)

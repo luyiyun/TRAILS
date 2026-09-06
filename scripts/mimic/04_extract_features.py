@@ -143,10 +143,15 @@ def _save_extraction_summary(
         "intervention_definition": "documented exposure within the 0-48 hour ICU window",
         "intervention_value_type": "binary exposure plus reliable duration/dose/count summaries",
         "intervention_zero_meaning": "no qualifying record found in the selected source tables",
-        "intervention_missing_rule": (
-            "per-drug NED is missing when that drug is documented but no positive "
-            "official dose interval is available"
-        ),
+        "intervention_vasopressor_definition": {
+            "source": "mimiciv_derived.norepinephrine_equivalent_dose",
+            "exposure": "positive total NED interval overlapping the observation window",
+            "hours": "union of clipped positive total NED intervals",
+            "ned_unit": "mcg/kg/min",
+            "ned_twa_denominator": "summed duration of clipped positive total NED records",
+            "zero_meaning": "no positive total NED interval found within the observation window",
+            "outlier_rule": "none; preserve official total NED values",
+        },
         "feature_order": list(FEATURE_ORDER),
         "n_features": len(FEATURE_ORDER),
         "time_window": "ICU intime to min(outtime, intime + 48 hours)",
@@ -174,7 +179,7 @@ def main() -> None:
     connection = duckdb.connect(str(database), read_only=True)
 
     required = (
-        {"trails_cohort_primary", "mimiciv_hosp.patients", "mimiciv_icu.inputevents"}
+        {"trails_cohort_primary", "mimiciv_hosp.patients"}
         | {f"mimiciv_derived.{table}" for table in FEATURE_SOURCES}
         | {f"mimiciv_derived.{table}" for table in INTERVENTION_TABLES}
     )
@@ -218,7 +223,12 @@ def main() -> None:
     # 四、分别保存分析数据与summary，避免两类职责交织。
     # ==================================================================================
     _save_case_data(output_root, patients, observations, interventions)
-    _save_extraction_summary(output_root, patients, observations, feature_summary)
+    _save_extraction_summary(
+        output_root,
+        patients,
+        observations,
+        feature_summary,
+    )
     print(
         f"TRAILS case 输入已保存至 {output_root}: "
         f"{len(patients)} patients, {len(observations)} observations, {len(FEATURE_ORDER)} features"

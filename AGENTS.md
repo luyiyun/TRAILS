@@ -242,6 +242,15 @@ clean reusable method library.
   only for internal early stopping, and saves the converted dataset, model,
   history, predictions, patient-level clusters, cluster summaries, feature
   summaries, and `case_summary.json` under `paths.dir`.
+- MIMIC concept preprocessing is executed directly from the pinned external
+  mimic-code SQL files by `01_build_sepsis.py`; downstream extraction reads the
+  resulting official tables and adds study-specific cohort/window aggregation.
+  Do not copy or reimplement available official concept SQL in project scripts.
+  `04_extract_features.py` uses official total `norepinephrine_equivalent_dose`
+  intervals for vasopressor presence, merged duration, observation fraction,
+  peak and positive-dose duration-weighted mean; it does not export per-drug
+  indicators or recalculate NED conversion factors. Total NED retains official
+  values without applying the historical per-drug outlier threshold.
 - MIMIC `06_split.py` saves the ID-only external split plus train-fitted
   train/validation/test tensor datasets and preprocessing parameters. Later commands
   consume these frozen datasets; command modules import only non-command support
@@ -286,7 +295,11 @@ clean reusable method library.
   and evaluates each method/seed/split once according to its cluster and survival
   capabilities. `evaluation.py` retains shared plotting/calculation classes. Cluster evaluation
   reports occupancy, entropy, KM/log-rank, adjusted Cox, clinical characteristics,
-  trajectories and label agreement; it never generates cluster-only survival
+  trajectories, organ support/treatment differences and label agreement. Treatment
+  evaluation reads the 04-generated `interventions.csv`, compares seven binary
+  exposures in all patients and twelve continuous endpoints among corresponding
+  exposed patients, and saves descriptive/test tables plus PNG/PDF panels per split;
+  it never generates cluster-only survival
   predictions or predictive C-index/AUC/IBS/calibration from cluster KM curves.
   Survival evaluation reports Harrell/IPCW C-index, cumulative/dynamic AUC, daily
   Brier/IBS and quantile-group KM calibration, always estimating censoring from train.

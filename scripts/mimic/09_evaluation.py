@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Collection
 from itertools import combinations
@@ -42,6 +43,7 @@ from .evaluation import (
     prediction_frame,
 )
 from .frozen import load_frozen_datasets
+from .intervention_evaluation import ClusterInterventionAnalysis
 from .paths import resolve_input_path
 
 LOGGER = logging.getLogger(__name__)
@@ -52,6 +54,7 @@ EvaluationMetricName = Literal[
     "adjusted_cox",
     "clinical_characteristics",
     "cluster_trajectories",
+    "organ_support_treatment",
     "harrell_cindex",
     "ipcw_cindex",
     "dynamic_auc",
@@ -65,6 +68,7 @@ EvaluationPlotName = Literal[
     "adjusted_cox",
     "clinical_characteristics",
     "cluster_trajectories",
+    "organ_support_treatment",
     "survival_calibration",
     "dynamic_auc",
     "brier_score",
@@ -77,10 +81,17 @@ CLUSTER_METRICS = frozenset(
         "adjusted_cox",
         "clinical_characteristics",
         "cluster_trajectories",
+        "organ_support_treatment",
     }
 )
 CLUSTER_PLOTS = frozenset(
-    {"cluster_survival", "adjusted_cox", "clinical_characteristics", "cluster_trajectories"}
+    {
+        "cluster_survival",
+        "adjusted_cox",
+        "clinical_characteristics",
+        "cluster_trajectories",
+        "organ_support_treatment",
+    }
 )
 SURVIVAL_PLOTS = frozenset(
     {"survival_calibration", "dynamic_auc", "brier_score", "calibration_error"}
@@ -122,6 +133,7 @@ def evaluate_split(
     dataset: ClinicalTimeSeriesDataset,
     n_clusters: int | None,
     preprocessing: pd.DataFrame,
+    interventions: pd.DataFrame,
     config: MimicEvaluationConfig,
     output: Path,
     reference: int | None,
@@ -155,6 +167,7 @@ def evaluate_split(
         "adjusted_cox": {"adjusted_cox"},
         "clinical_characteristics": {"clinical_characteristics"},
         "cluster_trajectories": {"cluster_trajectories"},
+        "organ_support_treatment": {"organ_support_treatment"},
         "survival_calibration": {"survival_calibration"},
         "dynamic_auc": {"dynamic_auc"},
         "brier_score": {"brier_score", "integrated_brier_score"},
@@ -272,6 +285,19 @@ def evaluate_split(
         trajectories.calculate().to_csv(output / "cluster_trajectories.csv", index=False)
         if "cluster_trajectories" in selected_plots:
             trajectories.plot(output / "cluster_trajectories")
+
+    # 6. 器官支持与治疗：暴露率用全体患者，连续强度仅比较对应暴露者。
+    if "organ_support_treatment" in selected_metrics:
+        intervention_analysis = ClusterInterventionAnalysis(target, interventions, cluster_count)
+        intervention_outputs = intervention_analysis.save(
+            output, include_plots="organ_support_treatment" in selected_plots
+        )
+        summary["organ_support_treatment"] = {
+            "binary_population": "all evaluated patients",
+            "continuous_population": "patients with the corresponding exposure",
+            "multiple_testing": "Benjamini-Hochberg across 19 endpoints within method/split",
+            "outputs": intervention_outputs,
+        }
 
     # *. 患者级生存指标：删失分布始终由训练集估计，冻结曲线不外插。
     calibration_analysis: SurvivalCalibration | None = None
@@ -481,6 +507,10 @@ def run(config: MimicEvaluationConfig) -> dict[str, Any]:
     split_root, methods = evaluation_methods(config)
     datasets = load_frozen_datasets(split_root)
     preprocessing = pd.read_csv(split_root / "preprocessing_parameters.csv")
+    interventions_path = resolve_input_path(config.interventions_csv)
+    if not interventions_path.is_file():
+        raise FileNotFoundError(f"缺少治疗评价输入：{interventions_path}")
+    interventions = pd.read_csv(interventions_path, dtype={"patient_id": str})
     output = config.paths.dir.resolve()
     if (output / "evaluation_summary.json").exists():
         raise FileExistsError(f"拒绝覆盖既有评价：{output}")
@@ -524,6 +554,7 @@ def run(config: MimicEvaluationConfig) -> dict[str, Any]:
                 datasets[split],
                 prediction.n_clusters,
                 preprocessing,
+                interventions,
                 config,
                 output / method["key"] / split,
                 reference,
@@ -578,6 +609,8 @@ def run(config: MimicEvaluationConfig) -> dict[str, Any]:
     summary = {
         "primary_trails_dir": str(primary_root),
         "split_dir": str(split_root),
+        "interventions_csv": str(interventions_path),
+        "interventions_sha256": hashlib.sha256(interventions_path.read_bytes()).hexdigest(),
         "trails_dirs": [str(resolve_input_path(path)) for path in config.trails_dirs],
         "baseline_dirs": [str(path) for path in config.baseline_dirs],
         "censoring_reference_set": "train",
