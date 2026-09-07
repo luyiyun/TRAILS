@@ -8,10 +8,12 @@ from typing import Any, Literal, Protocol, Self
 
 import numpy as np
 from numpy.typing import NDArray
+from sklearn.metrics import silhouette_score
 
 from trails import ClinicalTimeSeriesDataset
 
 BaselineCapability = Literal["cluster", "survival"]
+BaselineKSelectionRule = Literal["silhouette", "bic", "ibs", "bic_cindex"]
 
 
 @dataclass(frozen=True)
@@ -136,6 +138,26 @@ class BaselinePrediction:
             )
 
 
+def kmeans_silhouette_metrics(
+    features: NDArray[np.float64],
+    labels: NDArray[np.int64],
+    *,
+    sample_size: int | None,
+    seed: int,
+) -> dict[str, float]:
+    """以可复现抽样限制大样本silhouette的距离计算量。"""
+    effective_size = None if sample_size is None else min(sample_size, len(features))
+    if effective_size is not None and effective_size <= len(np.unique(labels)):
+        raise ValueError("silhouette_sample_size必须大于实际簇数")
+    score = silhouette_score(
+        features,
+        labels,
+        sample_size=effective_size,
+        random_state=seed,
+    )
+    return {"silhouette": float(score)}
+
+
 class BaselineMethod(Protocol):
     """工作流编排器调用不同基线实现时依赖的最小接口。"""
 
@@ -156,3 +178,16 @@ class BaselineMethod(Protocol):
     ) -> BaselinePrediction: ...
 
     def save_model(self, path: Path) -> None: ...
+
+
+class KSelectableBaselineMethod(BaselineMethod, Protocol):
+    """由各baseline实现原始指标，共享选择器负责跨K决策。"""
+
+    def k_selection_metrics(
+        self,
+        train: ClinicalTimeSeriesDataset,
+        validation: ClinicalTimeSeriesDataset,
+        *,
+        prediction_times: NDArray[np.float64],
+        risk_horizon: float,
+    ) -> dict[str, float]: ...

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from ..utils.baseline_cox_risk import CoxRiskKMeansBaseline
 from ..utils.baseline_dcm import DeepCoxMixturesBaseline
@@ -16,8 +17,9 @@ from ..utils.baseline_summary import (
     RandomSurvivalForestBaseline,
     SummaryKMeansBaseline,
 )
+from ..utils.baseline_trails import TrailsNoSurvivalBaseline
 from ..utils.baseline_vadesc import VaDeSCBaseline
-from ..utils.baselines import BaselineCapability, BaselineMethod
+from ..utils.baselines import BaselineCapability, BaselineKSelectionRule, BaselineMethod
 from .config import (
     CoxPHMethodConfig,
     CoxRiskKMeansMethodConfig,
@@ -28,21 +30,25 @@ from .config import (
     MPJLCMMMethodConfig,
     RandomSurvivalForestMethodConfig,
     SummaryKMeansMethodConfig,
+    TrailsNoSurvivalMethodConfig,
     UFPCAKMeansMethodConfig,
     VaDeSCMethodConfig,
 )
 
 # 这其实就是那个进行数据分析的函数，其作为一个RegisterBaseline的一个数据被记录。然后注册修饰器会将
 # 包含这个函数的RegisterBaseline注册到BASELINE_REGISTRY中。
-BaselineFactory = Callable[[MimicBaselineMethodConfig, int, int, Path], BaselineMethod]
+BaselineFactory = Callable[[MimicBaselineMethodConfig, int | None, int, Path], BaselineMethod]
 
 
 @dataclass(frozen=True)
 class RegisteredBaseline:
-    """一项MIMIC基线的构造器与评价能力。"""
+    """一项MIMIC基线的构造器、评价能力与落盘格式。"""
 
     capabilities: frozenset[BaselineCapability]
     factory: BaselineFactory
+    k_selection_rule: BaselineKSelectionRule | None
+    prediction_format: Literal["baseline", "trails"]
+    model_suffix: Literal["joblib", "rds", "pt"]
 
 
 BASELINE_REGISTRY: dict[str, RegisteredBaseline] = {}
@@ -51,6 +57,10 @@ BASELINE_REGISTRY: dict[str, RegisteredBaseline] = {}
 def register_baseline(
     kind: str,
     capabilities: Iterable[BaselineCapability],
+    k_selection_rule: BaselineKSelectionRule | None = None,
+    *,
+    prediction_format: Literal["baseline", "trails"] = "baseline",
+    model_suffix: Literal["joblib", "rds", "pt"] = "joblib",
 ) -> Callable[[BaselineFactory], BaselineFactory]:
     """注册MIMIC配置适配器，并拒绝重复名称或空能力声明。"""
     normalized = frozenset(capabilities)
@@ -60,16 +70,28 @@ def register_baseline(
     def decorator(factory: BaselineFactory) -> BaselineFactory:
         if kind in BASELINE_REGISTRY:
             raise ValueError(f"基线方法重复注册：{kind}")
-        BASELINE_REGISTRY[kind] = RegisteredBaseline(normalized, factory)
+        BASELINE_REGISTRY[kind] = RegisteredBaseline(
+            normalized,
+            factory,
+            k_selection_rule,
+            prediction_format,
+            model_suffix,
+        )
         return factory
 
     return decorator
 
 
-@register_baseline("summary_kmeans", ("cluster",))
+def _require_n_clusters(n_clusters: int | None) -> int:
+    if n_clusters is None:
+        raise ValueError("聚类baseline必须先解析出effective K")
+    return n_clusters
+
+
+@register_baseline("summary_kmeans", ("cluster",), "silhouette")
 def build_summary_kmeans(
     config: MimicBaselineMethodConfig,
-    n_clusters: int,
+    n_clusters: int | None,
     seed: int,
     work_dir: Path,
 ) -> SummaryKMeansBaseline:
@@ -79,16 +101,18 @@ def build_summary_kmeans(
         raise TypeError("summary_kmeans注册器收到不匹配的配置")
     return SummaryKMeansBaseline(
         config.name,
-        n_clusters,
+        _require_n_clusters(n_clusters),
         seed,
         config.kmeans_iters,
+        config.kmeans_n_init,
+        config.silhouette_sample_size,
     )
 
 
-@register_baseline("ufpca_kmeans", ("cluster",))
+@register_baseline("ufpca_kmeans", ("cluster",), "silhouette")
 def build_ufpca_kmeans(
     config: MimicBaselineMethodConfig,
-    n_clusters: int,
+    n_clusters: int | None,
     seed: int,
     work_dir: Path,
 ) -> UFPCAKMeansBaseline:
@@ -98,9 +122,11 @@ def build_ufpca_kmeans(
         raise TypeError("ufpca_kmeans注册器收到不匹配的配置")
     return UFPCAKMeansBaseline(
         config.name,
-        n_clusters,
+        _require_n_clusters(n_clusters),
         seed,
         config.kmeans_iters,
+        config.kmeans_n_init,
+        config.silhouette_sample_size,
         config.n_components,
         config.grid_size,
         0.0,
@@ -108,10 +134,10 @@ def build_ufpca_kmeans(
     )
 
 
-@register_baseline("mfpca_kmeans", ("cluster",))
+@register_baseline("mfpca_kmeans", ("cluster",), "silhouette")
 def build_mfpca_kmeans(
     config: MimicBaselineMethodConfig,
-    n_clusters: int,
+    n_clusters: int | None,
     seed: int,
     work_dir: Path,
 ) -> MFPCAKMeansBaseline:
@@ -121,9 +147,11 @@ def build_mfpca_kmeans(
         raise TypeError("mfpca_kmeans注册器收到不匹配的配置")
     return MFPCAKMeansBaseline(
         config.name,
-        n_clusters,
+        _require_n_clusters(n_clusters),
         seed,
         config.kmeans_iters,
+        config.kmeans_n_init,
+        config.silhouette_sample_size,
         config.n_components,
         config.grid_size,
         0.0,
@@ -131,10 +159,10 @@ def build_mfpca_kmeans(
     )
 
 
-@register_baseline("cox_risk_kmeans", ("cluster",))
+@register_baseline("cox_risk_kmeans", ("cluster",), "silhouette")
 def build_cox_risk_kmeans(
     config: MimicBaselineMethodConfig,
-    n_clusters: int,
+    n_clusters: int | None,
     seed: int,
     work_dir: Path,
 ) -> CoxRiskKMeansBaseline:
@@ -144,9 +172,11 @@ def build_cox_risk_kmeans(
         raise TypeError("cox_risk_kmeans注册器收到不匹配的配置")
     return CoxRiskKMeansBaseline(
         config.name,
-        n_clusters,
+        _require_n_clusters(n_clusters),
         seed,
         config.kmeans_iters,
+        config.kmeans_n_init,
+        config.silhouette_sample_size,
         config.cox_alpha,
         config.risk_feature_weight,
     )
@@ -155,7 +185,7 @@ def build_cox_risk_kmeans(
 @register_baseline("cox_ph", ("survival",))
 def build_cox_ph(
     config: MimicBaselineMethodConfig,
-    n_clusters: int,
+    n_clusters: int | None,
     seed: int,
     work_dir: Path,
 ) -> CoxPHBaseline:
@@ -169,7 +199,7 @@ def build_cox_ph(
 @register_baseline("random_survival_forest", ("survival",))
 def build_random_survival_forest(
     config: MimicBaselineMethodConfig,
-    n_clusters: int,
+    n_clusters: int | None,
     seed: int,
     work_dir: Path,
 ) -> RandomSurvivalForestBaseline:
@@ -188,10 +218,10 @@ def build_random_survival_forest(
     )
 
 
-@register_baseline("mpjlcmm", ("cluster", "survival"))
+@register_baseline("mpjlcmm", ("cluster", "survival"), "bic", model_suffix="rds")
 def build_mpjlcmm(
     config: MimicBaselineMethodConfig,
-    n_clusters: int,
+    n_clusters: int | None,
     seed: int,
     work_dir: Path,
 ) -> MPJLCMMBaseline:
@@ -200,7 +230,7 @@ def build_mpjlcmm(
         raise TypeError("mpjlcmm注册器收到不匹配的配置")
     return MPJLCMMBaseline(
         config.name,
-        n_clusters,
+        _require_n_clusters(n_clusters),
         seed,
         work_dir / "r",
         landmark_time=config.landmark_time,
@@ -215,10 +245,10 @@ def build_mpjlcmm(
     )
 
 
-@register_baseline("jmbayes2", ("survival",))
+@register_baseline("jmbayes2", ("survival",), model_suffix="rds")
 def build_jmbayes2(
     config: MimicBaselineMethodConfig,
-    n_clusters: int,
+    n_clusters: int | None,
     seed: int,
     work_dir: Path,
 ) -> JMbayes2Baseline:
@@ -253,10 +283,10 @@ def build_jmbayes2(
     )
 
 
-@register_baseline("deep_cox_mixtures", ("cluster", "survival"))
+@register_baseline("deep_cox_mixtures", ("cluster", "survival"), "ibs")
 def build_deep_cox_mixtures(
     config: MimicBaselineMethodConfig,
-    n_clusters: int,
+    n_clusters: int | None,
     seed: int,
     work_dir: Path,
 ) -> DeepCoxMixturesBaseline:
@@ -266,7 +296,7 @@ def build_deep_cox_mixtures(
         raise TypeError("deep_cox_mixtures注册器收到不匹配的配置")
     return DeepCoxMixturesBaseline(
         config.name,
-        n_clusters,
+        _require_n_clusters(n_clusters),
         seed,
         config.n_components,
         config.grid_size,
@@ -282,10 +312,10 @@ def build_deep_cox_mixtures(
     )
 
 
-@register_baseline("vadesc", ("cluster", "survival"))
+@register_baseline("vadesc", ("cluster", "survival"), "bic_cindex")
 def build_vadesc(
     config: MimicBaselineMethodConfig,
-    n_clusters: int,
+    n_clusters: int | None,
     seed: int,
     work_dir: Path,
 ) -> VaDeSCBaseline:
@@ -295,7 +325,7 @@ def build_vadesc(
         raise TypeError("vadesc注册器收到不匹配的配置")
     return VaDeSCBaseline(
         config.name,
-        n_clusters,
+        _require_n_clusters(n_clusters),
         seed,
         config.n_components,
         config.grid_size,
@@ -309,4 +339,30 @@ def build_vadesc(
         config.learning_rate,
         config.batch_size,
         config.device,
+    )
+
+
+@register_baseline(
+    "trails_no_survival",
+    ("cluster",),
+    "bic",
+    prediction_format="trails",
+    model_suffix="pt",
+)
+def build_trails_no_survival(
+    config: MimicBaselineMethodConfig,
+    n_clusters: int | None,
+    seed: int,
+    work_dir: Path,
+) -> TrailsNoSurvivalBaseline:
+    """构造共享model/trainer配置下的TRAILS无生存损失消融。"""
+    del work_dir
+    if not isinstance(config, TrailsNoSurvivalMethodConfig):
+        raise TypeError("trails_no_survival注册器收到不匹配的配置")
+    return TrailsNoSurvivalBaseline(
+        config.name,
+        _require_n_clusters(n_clusters),
+        seed,
+        config.model,
+        config.trainer,
     )

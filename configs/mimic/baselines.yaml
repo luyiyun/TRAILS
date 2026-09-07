@@ -5,28 +5,32 @@ defaults:
   - _self_
 
 split_dir: data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517
-n_clusters: 3
-model:
-  n_clusters: ${n_clusters}
 trainer:
   risk_horizon: 28.0
 prediction_times: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0]
 methods:
   - kind: summary_kmeans
     name: summary_kmeans
+    n_clusters: 3
     seeds: [20260517]
   - kind: ufpca_kmeans
     name: ufpca_kmeans
+    n_clusters: 3
     seeds: [20260517]
   - kind: mfpca_kmeans
     name: mfpca_kmeans
+    n_clusters: 3
     seeds: [20260517]
   - kind: cox_risk_kmeans
     name: cox_risk_kmeans
+    n_clusters: 3
     seeds: [20260517]
   - kind: trails_no_survival
     name: trails_no_survival
+    n_clusters: 4
     seeds: [20260517]
+    model: ${model}
+    trainer: ${trainer}
   - kind: cox_ph
     name: cox_ph
     seeds: [20260517]
@@ -35,6 +39,7 @@ methods:
     seeds: [20260517]
   - kind: mpjlcmm
     name: mpjlcmm
+    n_clusters: 3
     seeds: [20260517]
     max_iterations: 100
     grid_repetitions: 20
@@ -55,6 +60,7 @@ methods:
     patient_batch_size: 32
   - kind: deep_cox_mixtures
     name: deep_cox_mixtures
+    n_clusters: 3
     seeds: [20260517]
     n_components: 3
     grid_size: 16
@@ -67,6 +73,7 @@ methods:
     batch_size: 256
   - kind: vadesc
     name: vadesc
+    n_clusters: 3
     seeds: [20260517]
     n_components: 3
     grid_size: 16

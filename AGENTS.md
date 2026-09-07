@@ -60,7 +60,7 @@ clean reusable method library.
 - Run real-data case modeling: `uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv`
 - Generate MIMIC patient splits and tensor datasets: `uv run python -m scripts.mimic.06_split`
 - Run MIMIC modeling with configured or automatically selected K: `uv run python -m scripts.mimic.07_run`
-- Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517 n_clusters=<K>`
+- Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517`
 - Evaluate frozen MIMIC predictions: `uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<primary-run>,outputs/mimic_case/<other-runs>]' 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
 - Run lightweight baselines on existing splits: `uv run python scripts/baseline.py paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run python scripts/optim.py paths.data_root=data/simulated/base`
@@ -93,7 +93,11 @@ clean reusable method library.
   内容附近添加简洁中文注释说明意图即可。
 - 对于较为复杂的基础设施逻辑（例如多进程进度条），优先使用内聚的面向对象
   封装，避免将状态、上下文和协调逻辑分散在多个松散 helper 中。
-- Avoid `try/except` unless the code can recover or add useful diagnostics.
+- 默认让异常直接向上抛出并保留原始 traceback；不要用 `try/except` 仅为改写错误、
+  记录状态或继续批处理。只有调用方能够实质恢复时才捕获异常。
+- `scripts/` 下运行脚本的主要流程使用清晰的中文分段注释；复杂长流程参考
+  `scripts/mimic/04_extract_features.py` 和 `09_evaluation.py`，用分隔线、编号标题及
+  必要的子步骤注释说明数据边界和执行意图。
 - 未经用户明确要求，不执行 `git add`、`git commit` 或其他会改变 Git 索引、分支、
   提交历史的命令；代码的暂存和版本管理由用户手动完成。Git 状态与 diff 等只读检查不受此限。
 - 仅测试 `src/trails/__init__.py` 中 `__all__` 导出的用户 API 及其公开方法。
@@ -282,14 +286,21 @@ clean reusable method library.
 - `scripts/mimic/08_baselines.py` fits each method/seed only on frozen train
   (validation may control early stopping), saves models and three-split predictions,
   and records its direct 06 split reference plus artifact SHA256 hashes in an atomic
-  manifest. `split_dir` is its sole dataset input, `n_clusters` explicitly sets K,
-  and shared model/trainer presets configure its no-survival `TrailsEstimator`
-  ablation without depending on a 07 run. Shared baselines
+  manifest. `split_dir` is its sole dataset input; every clustering method owns
+  its `n_clusters`, where an integer or one-element list means fixed K and a longer
+  list requests method-specific K selection; methods without clustering do not expose it.
+  The registry declares each method's capabilities, K-selection rule, model suffix,
+  and prediction format; manifests distinguish `not_applicable`, `fixed`, and
+  `automatic` K modes explicitly.
+  Shared model/trainer presets are resolved into the no-survival method config,
+  which constructs its `TrailsEstimator` without depending on a 07 run. Its
+  multi-K mode minimizes train latent
+  Gaussian-mixture BIC and never uses survival outcomes. Shared baselines
   write `BaselinePrediction` NPZ; `ufpca_kmeans` concatenates per-variable UFPCA
   scores, while `mfpca_kmeans` uses FDApy joint MFPCA and DCM/VaDeSC remain
   UFPCA-based. R exchange files and checkpoints stay remote.
-  Failed methods are recorded, other methods may finish, but the batch exits nonzero
-  and is not accepted as a complete comparison. New run directories are required.
+  Any method error propagates immediately with its original traceback; a partial run
+  is not accepted as a complete comparison. New run directories are required.
 - `09_evaluation.py` accepts any number of completed `baseline_dirs`, branches
   between `TrailsPrediction` and baseline NPZ readers,
   and evaluates each method/seed/split once according to its cluster and survival

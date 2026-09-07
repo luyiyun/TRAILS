@@ -9,6 +9,7 @@ import joblib
 import numpy as np
 import torch
 from numpy.typing import NDArray
+from sksurv.metrics import concordance_index_censored
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
@@ -206,6 +207,42 @@ class VaDeSCBaseline:
         self.best_validation_loss = best_loss
         return self
 
+    def k_selection_metrics(
+        self,
+        train: ClinicalTimeSeriesDataset,
+        validation: ClinicalTimeSeriesDataset,
+        *,
+        prediction_times: NDArray[np.float64],
+        risk_horizon: float,
+    ) -> dict[str, float]:
+        """返回train潜在混合BIC与validation固定时间风险C-index。"""
+        if self.model is None:
+            raise RuntimeError("VaDeSCBaseline必须先拟合")
+        train_features = self.features.transform(train).astype(np.float32)
+        log_likelihood_sum = 0.0
+        with torch.no_grad():
+            log_prior = F.log_softmax(self.model.prior_logits, dim=0).unsqueeze(0)
+            for start in range(0, len(train_features), self.batch_size):
+                features = torch.from_numpy(train_features[start : start + self.batch_size])
+                latent, _ = self.model.encode(features)
+                _, _, component_log_prob, _ = self.model.components(latent)
+                log_likelihood_sum += float(
+                    torch.logsumexp(log_prior + component_log_prob, dim=-1).sum().item()
+                )
+        n_parameters = self.n_clusters * (2 * self.latent_dim) + (self.n_clusters - 1)
+        bic = -2.0 * log_likelihood_sum + float(np.log(len(train)) * n_parameters)
+
+        prediction = self.predict(
+            validation,
+            prediction_times=prediction_times,
+            risk_horizon=risk_horizon,
+        )
+        if prediction.risk_score is None:
+            raise RuntimeError("VaDeSC未返回计算C-index所需的风险分数")
+        valid_event, valid_time = dataset_survival_arrays(validation)
+        cindex = concordance_index_censored(valid_event, valid_time, prediction.risk_score)[0]
+        return {"bic": bic, "cindex": float(cindex)}
+
     def predict(
         self,
         data: ClinicalTimeSeriesDataset,
@@ -216,27 +253,35 @@ class VaDeSCBaseline:
         """外部预测只用p(c|z)，再按硬分配簇计算Weibull生存曲线。"""
         if self.model is None or self.time_scale is None:
             raise RuntimeError("VaDeSCBaseline必须先拟合")
-        features = torch.from_numpy(self.features.transform(data).astype(np.float32))
+        feature_values = self.features.transform(data).astype(np.float32)
+        label_batches: list[NDArray[np.int64]] = []
+        risk_batches: list[NDArray[np.float64]] = []
+        survival_batches: list[NDArray[np.float64]] = []
+        times = torch.from_numpy(prediction_times / self.time_scale).float()
+        horizon = times.new_tensor(risk_horizon / self.time_scale)
         with torch.no_grad():
-            mean, _ = self.model.encode(features)
-            probabilities, scales, _, _ = self.model.components(mean)
-            labels = probabilities.argmax(dim=1)
-            selected_scales = scales.gather(1, labels.unsqueeze(1)).squeeze(1)
-            times = torch.from_numpy(prediction_times / self.time_scale).float()
-            survival = torch.exp(
-                -(times.unsqueeze(0) / selected_scales.unsqueeze(1)).pow(self.weibull_shape)
-            )
-            horizon = selected_scales.new_tensor(risk_horizon / self.time_scale)
-            risk = 1.0 - torch.exp(-(horizon / selected_scales).pow(self.weibull_shape))
+            for start in range(0, len(feature_values), self.batch_size):
+                features = torch.from_numpy(feature_values[start : start + self.batch_size])
+                mean, _ = self.model.encode(features)
+                probabilities, scales, _, _ = self.model.components(mean)
+                labels = probabilities.argmax(dim=1)
+                selected_scales = scales.gather(1, labels.unsqueeze(1)).squeeze(1)
+                survival = torch.exp(
+                    -(times.unsqueeze(0) / selected_scales.unsqueeze(1)).pow(self.weibull_shape)
+                )
+                risk = 1.0 - torch.exp(-(horizon / selected_scales).pow(self.weibull_shape))
+                label_batches.append(labels.numpy().astype(np.int64))
+                risk_batches.append(risk.numpy().astype(np.float64))
+                survival_batches.append(survival.numpy().astype(np.float64))
         return BaselinePrediction(
             method_name=self.name,
             patient_ids=dataset_patient_ids(data),
-            cluster_labels=labels.numpy().astype(np.int64),
+            cluster_labels=np.concatenate(label_batches),
             n_clusters=self.n_clusters,
-            risk_score=risk.numpy().astype(np.float64),
+            risk_score=np.concatenate(risk_batches),
             risk_horizon=risk_horizon,
             survival_times=prediction_times.copy(),
-            survival_probabilities=survival.numpy().astype(np.float64),
+            survival_probabilities=np.concatenate(survival_batches),
         )
 
     def save_model(self, path: Path) -> None:

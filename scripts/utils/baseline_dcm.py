@@ -6,6 +6,8 @@ from typing import Any, Self, cast
 import joblib
 import numpy as np
 from numpy.typing import NDArray
+from sksurv.metrics import integrated_brier_score
+from sksurv.util import Surv
 
 from trails import ClinicalTimeSeriesDataset
 
@@ -79,6 +81,38 @@ class DeepCoxMixturesBaseline:
             batch_size=self.batch_size,
         )
         return self
+
+    def k_selection_metrics(
+        self,
+        train: ClinicalTimeSeriesDataset,
+        validation: ClinicalTimeSeriesDataset,
+        *,
+        prediction_times: NDArray[np.float64],
+        risk_horizon: float,
+    ) -> dict[str, float]:
+        """用train删失分布计算validation integrated Brier score。"""
+        prediction = self.predict(
+            validation,
+            prediction_times=prediction_times,
+            risk_horizon=risk_horizon,
+        )
+        probabilities = prediction.survival_probabilities
+        times = prediction.survival_times
+        if probabilities is None or times is None:
+            raise RuntimeError("DCM未返回计算IBS所需的生存曲线")
+        train_event, train_time = dataset_survival_arrays(train)
+        valid_event, valid_time = dataset_survival_arrays(validation)
+        if len(times) < 2 or times[0] <= valid_time.min() or times[-1] >= valid_time.max():
+            raise ValueError("prediction_times必须位于validation随访时间的开区间内")
+        train_survival = Surv.from_arrays(train_event, train_time)
+        valid_survival = Surv.from_arrays(valid_event, valid_time)
+        score = integrated_brier_score(
+            train_survival,
+            valid_survival,
+            probabilities,
+            times,
+        )
+        return {"ibs": float(score)}
 
     def predict(
         self,

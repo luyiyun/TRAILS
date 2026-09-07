@@ -20,7 +20,11 @@ from .baseline_features import (
     dataset_patient_ids,
     dataset_survival_arrays,
 )
-from .baselines import BaselineCapability, BaselinePrediction
+from .baselines import (
+    BaselineCapability,
+    BaselinePrediction,
+    kmeans_silhouette_metrics,
+)
 
 
 class CoxRiskKMeansBaseline:
@@ -34,6 +38,8 @@ class CoxRiskKMeansBaseline:
         n_clusters: int,
         seed: int,
         kmeans_iters: int,
+        kmeans_n_init: int,
+        silhouette_sample_size: int | None,
         cox_alpha: float,
         risk_feature_weight: float,
     ) -> None:
@@ -41,6 +47,8 @@ class CoxRiskKMeansBaseline:
         self.n_clusters = n_clusters
         self.seed = seed
         self.kmeans_iters = kmeans_iters
+        self.kmeans_n_init = kmeans_n_init
+        self.silhouette_sample_size = silhouette_sample_size
         self.risk_feature_weight = risk_feature_weight
         self.features = SummaryFeaturePipeline()
         self.risk_model = CoxPHSurvivalAnalysis(alpha=cast(Any, cox_alpha))
@@ -61,11 +69,38 @@ class CoxRiskKMeansBaseline:
         scaled_risk = self.risk_scaler.fit_transform(risk) * self.risk_feature_weight
         self.model = KMeans(
             n_clusters=self.n_clusters,
-            n_init="auto",
+            n_init=cast(Any, self.kmeans_n_init),
             max_iter=self.kmeans_iters,
             random_state=self.seed,
         ).fit(np.hstack((features, scaled_risk)))
         return self
+
+    def k_selection_metrics(
+        self,
+        train: ClinicalTimeSeriesDataset,
+        validation: ClinicalTimeSeriesDataset,
+        *,
+        prediction_times: NDArray[np.float64],
+        risk_horizon: float,
+    ) -> dict[str, float]:
+        """在train的摘要特征与Cox风险联合空间计算silhouette。"""
+        del validation, prediction_times, risk_horizon
+        if self.model is None:
+            raise RuntimeError("CoxRiskKMeansBaseline必须先拟合")
+        features = self.features.transform(train)
+        risk = np.asarray(self.risk_model.predict(features), dtype=np.float64).reshape(-1, 1)
+        scaled_risk = (
+            np.asarray(self.risk_scaler.transform(risk), dtype=np.float64)
+            * self.risk_feature_weight
+        )
+        augmented = np.hstack((features, scaled_risk))
+        labels = np.asarray(self.model.predict(augmented), dtype=np.int64)
+        return kmeans_silhouette_metrics(
+            augmented,
+            labels,
+            sample_size=self.silhouette_sample_size,
+            seed=self.seed,
+        )
 
     def predict(
         self,

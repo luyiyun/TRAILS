@@ -63,6 +63,7 @@ class MPJLCMMBaseline:
         )
         self.model_path = self.backend.work_dir / "mpjlcmm_model.rds"
         self._fitted = False
+        self.bic: float | None = None
         self._prediction_index = 0
 
     def fit(
@@ -100,10 +101,28 @@ class MPJLCMMBaseline:
         self._validate_common_result(result, len(train))
         if int(result.get("convergence", -1)) != 1:
             raise RuntimeError(f"mpjlcmm未收敛：convergence={result.get('convergence')}")
+        bic = result.get("bic")
+        if not isinstance(bic, (int, float)) or not np.isfinite(bic):
+            raise ValueError("mpjlcmm未返回有限的BIC")
         if not self.model_path.is_file():
             raise FileNotFoundError("mpjlcmm未生成模型文件")
+        self.bic = float(bic)
         self._fitted = True
         return self
+
+    def k_selection_metrics(
+        self,
+        train: ClinicalTimeSeriesDataset,
+        validation: ClinicalTimeSeriesDataset,
+        *,
+        prediction_times: NDArray[np.float64],
+        risk_horizon: float,
+    ) -> dict[str, float]:
+        """返回train上已收敛joint latent class model的BIC。"""
+        del train, validation, prediction_times, risk_horizon
+        if not self._fitted or self.bic is None:
+            raise RuntimeError("MPJLCMMBaseline必须先拟合")
+        return {"bic": self.bic}
 
     def predict(
         self,

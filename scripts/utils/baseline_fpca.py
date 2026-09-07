@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Self, cast
 
 import joblib
 import numpy as np
@@ -24,7 +24,11 @@ from sklearn.preprocessing import StandardScaler
 from trails import ClinicalTimeSeriesDataset
 
 from .baseline_features import dataset_patient_ids
-from .baselines import BaselineCapability, BaselinePrediction
+from .baselines import (
+    BaselineCapability,
+    BaselinePrediction,
+    kmeans_silhouette_metrics,
+)
 
 
 class UFPCAFeaturePipeline:
@@ -145,6 +149,8 @@ class UFPCAKMeansBaseline(UFPCAFeaturePipeline):
         n_clusters: int,
         seed: int,
         kmeans_iters: int,
+        kmeans_n_init: int,
+        silhouette_sample_size: int | None,
         n_components: int,
         grid_size: int,
         time_start: float,
@@ -155,6 +161,8 @@ class UFPCAKMeansBaseline(UFPCAFeaturePipeline):
         self.n_clusters = n_clusters
         self.seed = seed
         self.kmeans_iters = kmeans_iters
+        self.kmeans_n_init = kmeans_n_init
+        self.silhouette_sample_size = silhouette_sample_size
         self.model: KMeans | None = None
 
     def fit(
@@ -166,11 +174,29 @@ class UFPCAKMeansBaseline(UFPCAFeaturePipeline):
         del validation
         self.model = KMeans(
             n_clusters=self.n_clusters,
-            n_init="auto",
+            n_init=cast(Any, self.kmeans_n_init),
             max_iter=self.kmeans_iters,
             random_state=self.seed,
         ).fit(self.fit_transform(train))
         return self
+
+    def k_selection_metrics(
+        self,
+        train: ClinicalTimeSeriesDataset,
+        validation: ClinicalTimeSeriesDataset,
+        *,
+        prediction_times: NDArray[np.float64],
+        risk_horizon: float,
+    ) -> dict[str, float]:
+        """在train的逐变量FPCA得分空间计算silhouette。"""
+        del validation, prediction_times, risk_horizon
+        if self.model is None:
+            raise RuntimeError("UFPCAKMeansBaseline必须先拟合")
+        features = self.transform(train)
+        labels = np.asarray(self.model.predict(features), dtype=np.int64)
+        return kmeans_silhouette_metrics(
+            features, labels, sample_size=self.silhouette_sample_size, seed=self.seed
+        )
 
     def predict(
         self,
@@ -334,6 +360,8 @@ class MFPCAKMeansBaseline(MFPCAFeaturePipeline):
         n_clusters: int,
         seed: int,
         kmeans_iters: int,
+        kmeans_n_init: int,
+        silhouette_sample_size: int | None,
         n_components: int,
         grid_size: int,
         time_start: float,
@@ -344,6 +372,8 @@ class MFPCAKMeansBaseline(MFPCAFeaturePipeline):
         self.n_clusters = n_clusters
         self.seed = seed
         self.kmeans_iters = kmeans_iters
+        self.kmeans_n_init = kmeans_n_init
+        self.silhouette_sample_size = silhouette_sample_size
         self.kmeans: KMeans | None = None
 
     def fit(
@@ -355,11 +385,29 @@ class MFPCAKMeansBaseline(MFPCAFeaturePipeline):
         del validation
         self.kmeans = KMeans(
             n_clusters=self.n_clusters,
-            n_init="auto",
+            n_init=cast(Any, self.kmeans_n_init),
             max_iter=self.kmeans_iters,
             random_state=self.seed,
         ).fit(self.fit_transform(train))
         return self
+
+    def k_selection_metrics(
+        self,
+        train: ClinicalTimeSeriesDataset,
+        validation: ClinicalTimeSeriesDataset,
+        *,
+        prediction_times: NDArray[np.float64],
+        risk_horizon: float,
+    ) -> dict[str, float]:
+        """在train的联合MFPCA得分空间计算silhouette。"""
+        del validation, prediction_times, risk_horizon
+        if self.kmeans is None:
+            raise RuntimeError("MFPCAKMeansBaseline必须先拟合")
+        features = self.transform(train)
+        labels = np.asarray(self.kmeans.predict(features), dtype=np.int64)
+        return kmeans_silhouette_metrics(
+            features, labels, sample_size=self.silhouette_sample_size, seed=self.seed
+        )
 
     def predict(
         self,

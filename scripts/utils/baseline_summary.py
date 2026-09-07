@@ -20,7 +20,11 @@ from .baseline_features import (
     dataset_patient_ids,
     dataset_survival_arrays,
 )
-from .baselines import BaselineCapability, BaselinePrediction
+from .baselines import (
+    BaselineCapability,
+    BaselinePrediction,
+    kmeans_silhouette_metrics,
+)
 
 
 class SummaryKMeansBaseline:
@@ -34,11 +38,15 @@ class SummaryKMeansBaseline:
         n_clusters: int,
         seed: int,
         kmeans_iters: int,
+        kmeans_n_init: int,
+        silhouette_sample_size: int | None,
     ) -> None:
         self.name = name
         self.n_clusters = n_clusters
         self.seed = seed
         self.kmeans_iters = kmeans_iters
+        self.kmeans_n_init = kmeans_n_init
+        self.silhouette_sample_size = silhouette_sample_size
         self.features = SummaryFeaturePipeline()
         self.model: KMeans | None = None
 
@@ -52,11 +60,29 @@ class SummaryKMeansBaseline:
         train_features = self.features.fit_transform(train)
         self.model = KMeans(
             n_clusters=self.n_clusters,
-            n_init="auto",
+            n_init=cast(Any, self.kmeans_n_init),
             max_iter=self.kmeans_iters,
             random_state=self.seed,
         ).fit(train_features)
         return self
+
+    def k_selection_metrics(
+        self,
+        train: ClinicalTimeSeriesDataset,
+        validation: ClinicalTimeSeriesDataset,
+        *,
+        prediction_times: NDArray[np.float64],
+        risk_horizon: float,
+    ) -> dict[str, float]:
+        """在train特征空间计算可复现的silhouette。"""
+        del validation, prediction_times, risk_horizon
+        if self.model is None:
+            raise RuntimeError("SummaryKMeansBaseline必须先拟合")
+        features = self.features.transform(train)
+        labels = np.asarray(self.model.predict(features), dtype=np.int64)
+        return kmeans_silhouette_metrics(
+            features, labels, sample_size=self.silhouette_sample_size, seed=self.seed
+        )
 
     def predict(
         self,

@@ -4,10 +4,17 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from trails import ModelConfig, TrainerConfig
 from trails_case.config import CaseApplicationConfig
+
+ClusterCount = Annotated[int, Field(ge=2)]
+ClusterCounts = ClusterCount | tuple[ClusterCount, ...]
+
+
+def _requested_clusters(value: ClusterCounts) -> tuple[int, ...]:
+    return (value,) if isinstance(value, int) else value
 
 
 class MimicSplitConfig(BaseModel):
@@ -57,10 +64,23 @@ class MimicBaselineMethodBaseConfig(BaseModel):
     seeds: tuple[int, ...] = Field(default=(20260517,), min_length=1)
 
 
-class MimicKMeansMethodConfig(MimicBaselineMethodBaseConfig):
+class MimicClusterMethodBaseConfig(MimicBaselineMethodBaseConfig):
+    """需要显式簇数的基线方法。"""
+
+    n_clusters: ClusterCounts
+
+    @property
+    def requested_clusters(self) -> tuple[int, ...]:
+        """把固定K与候选K统一为只读元组。"""
+        return _requested_clusters(self.n_clusters)
+
+
+class MimicKMeansMethodConfig(MimicClusterMethodBaseConfig):
     """共享KMeans迭代配置的聚类基线。"""
 
     kmeans_iters: int = Field(default=100, ge=1)
+    kmeans_n_init: int = Field(default=20, ge=1)
+    silhouette_sample_size: int | None = Field(default=5000, ge=2)
 
 
 class SummaryKMeansMethodConfig(MimicKMeansMethodConfig):
@@ -93,10 +113,27 @@ class CoxRiskKMeansMethodConfig(MimicKMeansMethodConfig):
     risk_feature_weight: float = Field(default=1.0, gt=0.0)
 
 
-class TrailsNoSurvivalMethodConfig(MimicBaselineMethodBaseConfig):
+class TrailsNoSurvivalMethodConfig(MimicClusterMethodBaseConfig):
     """仅关闭生存损失的TRAILS消融配置。"""
 
     kind: Literal["trails_no_survival"] = "trails_no_survival"
+    n_clusters: ClusterCounts = 4
+    model: ModelConfig = Field(default_factory=ModelConfig, validate_default=True)
+    trainer: TrainerConfig = Field(default_factory=TrainerConfig, validate_default=True)
+
+    @field_validator("model")
+    @classmethod
+    def disable_survival_loss(cls, value: ModelConfig) -> ModelConfig:
+        """由方法配置本身固定消融语义。"""
+        return value.model_copy(
+            update={"loss": value.loss.model_copy(update={"survival_weight": 0.0})}
+        )
+
+    @field_validator("trainer")
+    @classmethod
+    def disable_internal_validation_split(cls, value: TrainerConfig) -> TrainerConfig:
+        """08直接传入冻结validation，不再从train内部切分。"""
+        return value.model_copy(update={"valid_size": 0.0})
 
 
 class CoxPHMethodConfig(MimicBaselineMethodBaseConfig):
@@ -131,10 +168,16 @@ class MPJLCMMMethodConfig(MimicJointModelMethodConfig):
     """lcmm多变量joint latent class model配置。"""
 
     kind: Literal["mpjlcmm"] = "mpjlcmm"
+    n_clusters: ClusterCounts
     max_iterations: int = Field(default=100, ge=1)
     grid_repetitions: int = Field(default=20, ge=1)
     grid_iterations: int = Field(default=15, ge=1)
     n_processes: int = Field(default=1, ge=1)
+
+    @property
+    def requested_clusters(self) -> tuple[int, ...]:
+        """把固定K与候选K统一为只读元组。"""
+        return _requested_clusters(self.n_clusters)
 
 
 class JMbayes2MethodConfig(MimicJointModelMethodConfig):
@@ -162,7 +205,7 @@ class JMbayes2MethodConfig(MimicJointModelMethodConfig):
         return self
 
 
-class DeepCoxMixturesMethodConfig(MimicBaselineMethodBaseConfig):
+class DeepCoxMixturesMethodConfig(MimicClusterMethodBaseConfig):
     """train-fitted FPCA输入的官方Deep Cox Mixtures配置。"""
 
     kind: Literal["deep_cox_mixtures"] = "deep_cox_mixtures"
@@ -177,7 +220,7 @@ class DeepCoxMixturesMethodConfig(MimicBaselineMethodBaseConfig):
     batch_size: int = Field(default=256, ge=1)
 
 
-class VaDeSCMethodConfig(MimicBaselineMethodBaseConfig):
+class VaDeSCMethodConfig(MimicClusterMethodBaseConfig):
     """train-fitted FPCA输入的VaDeSC配置。"""
 
     kind: Literal["vadesc"] = "vadesc"
@@ -215,7 +258,6 @@ class MimicBaselinesConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     split_dir: Path
-    n_clusters: int = Field(ge=2)
     model: ModelConfig = Field(default_factory=ModelConfig)
     trainer: TrainerConfig = Field(default_factory=TrainerConfig)
     prediction_times: tuple[float, ...] = Field(min_length=1)
@@ -231,6 +273,10 @@ class MimicBaselinesConfig(BaseModel):
         for method in self.methods:
             if len(method.seeds) != len(set(method.seeds)):
                 raise ValueError(f"{method.name}的seeds不能重复")
+            if isinstance(method, (MimicClusterMethodBaseConfig, MPJLCMMMethodConfig)):
+                requested = method.requested_clusters
+                if not requested or len(requested) != len(set(requested)):
+                    raise ValueError(f"{method.name}的n_clusters不能为空或重复")
         if any(right <= left for left, right in pairwise(self.prediction_times)):
             raise ValueError("prediction_times必须严格递增")
         if (
