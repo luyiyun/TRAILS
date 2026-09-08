@@ -1,0 +1,61 @@
+# @package _global_
+dataset: crc_yunnan
+version: v1
+
+paths:
+  raw_root: data/real/crc_yunnan
+  patients_csv: ${paths.raw_root}/surv_all_no_name.csv
+  observations_csv: ${paths.raw_root}/long_combine_no_name.csv
+  derived_dir: data/derived/crc_yunnan/preprocessed/${version}
+  run_dir: outputs/crc_yunnan/preprocess/${version}
+
+columns:
+  export_index: "Unnamed: 0"
+  patient_id: 住院号
+  surgery_date: 手术日期
+  last_followup_date: 末次随访时间
+  survival_time: Survival_Time
+  death: Death
+  recurrence_free_time: Recurrence_free_Time
+  recurrence: Recurrence
+  baseline:
+    - Preoperative_CEA
+    - Preoperative_CA242
+    - Age
+    - Sex
+    - Primary_site
+    - Surgical_approach
+    - Tumor_differentiation
+    - AJCC_8th_ed_Stage
+    - Lymph_node_yield
+    - Mucinous_colloid_type
+    - Lymphovascular_invasion
+    - Perineural_invasion
+    - Adjuvant_chemotherapy
+  feature: var_name
+  feature_group: var_type
+  measurement_date: 测量日期
+  value: value
+
+processing:
+  drop_export_index: true
+  research_id_seed: 20260908
+  apply_date_corrections: true
+  same_day_aggregation: median
+  exclude_invalid_surgery_date: true
+  exclude_negative_outcome_time: true
+  outcome_time_unit_days: 30
+  refuse_overwrite: true
+
+date_corrections:
+  patients:
+    "0004-07-20": "2004-07-20"
+  observations:
+    "0005-04-20": "2005-04-20"
+    "3019-10-29": "2019-10-29"
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.run_dir}
