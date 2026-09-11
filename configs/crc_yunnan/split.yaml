@@ -1,0 +1,246 @@
+# @package _global_
+dataset: crc_yunnan
+version: v1
+split_version: v1
+outcome: dfs
+landmark_months: 12
+
+paths:
+  preprocessed_root: data/derived/crc_yunnan/preprocessed/${version}
+  patients_csv: ${paths.preprocessed_root}/patients.csv
+  observations_csv: ${paths.preprocessed_root}/observations.csv
+  assignment_root: data/derived/crc_yunnan/assignments/${split_version}
+  dir: data/derived/crc_yunnan/splits/${split_version}/${outcome}/landmark-${landmark_months}m/${features.panel}
+  output_dir: outputs/crc_yunnan/splits/${split_version}/${outcome}/landmark-${landmark_months}m/${features.panel}
+  run_dir: outputs/crc_yunnan/split_runs/${now:%Y%m%d-%H%M%S}
+
+cohort:
+  min_observation_dates: 2
+  exclude_followup_before_surgery: true
+  max_outcome_days: 7305
+
+split:
+  strategies: [random, temporal]
+  seeds: [20260908]
+  random:
+    train_fraction: 0.64
+    validation_fraction: 0.16
+    test_fraction: 0.20
+  temporal:
+    test_start_year: 2017
+    validation_fraction: 0.20
+
+features:
+  panel: D20
+  # 明确列出每套面板；新增源指标不会自动进入任何面板。
+  panels:
+    A2: [CEA, CA242]
+    B8:
+      [
+        CEA,
+        CA242,
+        血清白蛋白,
+        血红蛋白,
+        中性粒细胞绝对值,
+        淋巴细胞绝对值,
+        血小板,
+        肌酐,
+      ]
+    C12:
+      [
+        CEA,
+        CA242,
+        血清白蛋白,
+        血红蛋白,
+        中性粒细胞绝对值,
+        淋巴细胞绝对值,
+        血小板,
+        肌酐,
+        CA199,
+        前白蛋白,
+        谷丙转氨酶,
+        总胆红素,
+      ]
+    D20:
+      [
+        CEA,
+        CA242,
+        血清白蛋白,
+        血红蛋白,
+        中性粒细胞绝对值,
+        淋巴细胞绝对值,
+        血小板,
+        肌酐,
+        CA199,
+        前白蛋白,
+        谷丙转氨酶,
+        总胆红素,
+        白细胞绝对值,
+        单核细胞绝对值,
+        尿素,
+        尿酸,
+        谷草转氨酶,
+        直接胆红素,
+        碱性磷酸酶,
+        r谷氨酰转移酶,
+      ]
+    E60:
+      [
+        CEA,
+        CA242,
+        血清白蛋白,
+        血红蛋白,
+        中性粒细胞绝对值,
+        淋巴细胞绝对值,
+        血小板,
+        肌酐,
+        CA199,
+        前白蛋白,
+        谷丙转氨酶,
+        总胆红素,
+        白细胞绝对值,
+        单核细胞绝对值,
+        尿素,
+        尿酸,
+        谷草转氨酶,
+        直接胆红素,
+        碱性磷酸酶,
+        r谷氨酰转移酶,
+        嗜碱性粒细胞绝对值,
+        嗜酸性粒细胞绝对值,
+        大型血小板比率,
+        平均血小板体积,
+        平均血红蛋白浓度,
+        平均血红蛋白量,
+        红细胞,
+        红细胞体积分布宽度,
+        红细胞体积变异系数,
+        红细胞压积,
+        红细胞平均体积,
+        血小板分布宽度,
+        血小板压积,
+        PT_INR,
+        凝血酶原时间,
+        凝血酶时间,
+        活化部分凝血活酶时间,
+        纤维蛋白原,
+        部分凝血活酶时间比率,
+        C反应蛋白,
+        aL岩藻糖甘酶,
+        a羟丁酸脱氢酶,
+        乳酸脱氢酶,
+        总胆固醇,
+        总胆汁酸,
+        总蛋白,
+        白球比,
+        肌酸激酶,
+        肌酸激酶同工酶,
+        胆碱酯酶,
+        腺苷脱氨酶,
+        血清低密度脂蛋白,
+        血清球蛋白,
+        血清高密度脂蛋白,
+        谷草_谷丙比值,
+        间接胆红素,
+        AFP,
+        CA125,
+        CA153,
+        CA724,
+      ]
+    F88:
+      [
+        CEA,
+        CA242,
+        血清白蛋白,
+        血红蛋白,
+        中性粒细胞绝对值,
+        淋巴细胞绝对值,
+        血小板,
+        肌酐,
+        CA199,
+        前白蛋白,
+        谷丙转氨酶,
+        总胆红素,
+        白细胞绝对值,
+        单核细胞绝对值,
+        尿素,
+        尿酸,
+        谷草转氨酶,
+        直接胆红素,
+        碱性磷酸酶,
+        r谷氨酰转移酶,
+        嗜碱性粒细胞绝对值,
+        嗜酸性粒细胞绝对值,
+        大型血小板比率,
+        平均血小板体积,
+        平均血红蛋白浓度,
+        平均血红蛋白量,
+        红细胞,
+        红细胞体积分布宽度,
+        红细胞体积变异系数,
+        红细胞压积,
+        红细胞平均体积,
+        血小板分布宽度,
+        血小板压积,
+        PT_INR,
+        凝血酶原时间,
+        凝血酶时间,
+        活化部分凝血活酶时间,
+        纤维蛋白原,
+        部分凝血活酶时间比率,
+        C反应蛋白,
+        aL岩藻糖甘酶,
+        a羟丁酸脱氢酶,
+        乳酸脱氢酶,
+        总胆固醇,
+        总胆汁酸,
+        总蛋白,
+        白球比,
+        肌酸激酶,
+        肌酸激酶同工酶,
+        胆碱酯酶,
+        腺苷脱氨酶,
+        血清低密度脂蛋白,
+        血清球蛋白,
+        血清高密度脂蛋白,
+        谷草_谷丙比值,
+        间接胆红素,
+        AFP,
+        CA125,
+        CA153,
+        CA724,
+        IFN_gamma,
+        IL_10,
+        IL_2,
+        IL_4,
+        IL_6,
+        TNF_alpha,
+        促卵泡生成激素,
+        促黄体生成素,
+        泌乳素,
+        雌二醇,
+        CIK细胞绝对值,
+        NK细胞绝对值,
+        Th_Ts比值,
+        Th细胞比率,
+        Th细胞绝对值,
+        Ts细胞比率,
+        Ts细胞绝对值,
+        T细胞比率,
+        T细胞绝对值,
+        三碘甲状腺原氨酸,
+        促甲状腺激素,
+        反三碘甲状腺原氨酸,
+        抗甲状腺球蛋白抗体,
+        抗甲状腺过氧化物酶自身抗体,
+        游离三碘甲状腺原氨酸,
+        游离甲状腺素,
+        甲状腺球蛋白,
+        甲状腺素,
+      ]
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.run_dir}

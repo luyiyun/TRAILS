@@ -59,6 +59,7 @@ clean reusable method library.
 - Train with mTAN-style input: `uv run python scripts/train.py training=mtan paths.data_root=data/simulated/base`
 - Run real-data case modeling: `uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv`
 - Generate MIMIC patient splits and tensor datasets: `uv run python -m scripts.mimic.06_split`
+- Freeze CRC Yunnan patient splits and tensor datasets: `uv run python -m scripts.crc_yunnan.03_split`
 - Run MIMIC modeling with configured or automatically selected K: `uv run python -m scripts.mimic.07_run`
 - Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517`
 - Evaluate frozen MIMIC predictions: `uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<primary-run>,outputs/mimic_case/<other-runs>]' 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
@@ -246,6 +247,27 @@ clean reusable method library.
   only for internal early stopping, and saves the converted dataset, model,
   history, predictions, patient-level clusters, cluster summaries, feature
   summaries, and `case_summary.json` under `paths.dir`.
+- CRC Yunnan `03_split.py` is a linear Hydra analysis script, following the local
+  `01_preprocess.py` and `02_eda.py` style. It defaults to a 360-day DFS landmark,
+  the explicit C12 feature panel, random 64/16/20 and temporal-2017 splits, and
+  seed 20260908. Its config also defines A2/B8/D20/E60/F88 panels and selectable
+  outcome, landmark, strategies and seeds. No feature coverage gate is applied.
+- CRC Yunnan master assignments are frozen before landmark and observation
+  filtering, stratified by DFS/OS event combination, and reused across outcomes,
+  panels and windows. Source hashes and base-cohort/split rules must match on
+  reuse. By default, exclude reversed follow-up dates and either outcome over
+  7305 days; retain the supplied outcome-time definition for other records.
+  Window observations include both endpoints, eligibility requires outcome time
+  strictly after the landmark, and survival time starts at the landmark.
+- CRC Yunnan frozen bundles retain at least two distinct observed dates across
+  the final feature panel. Train alone determines removal of unobserved/constant
+  features and median/IQR scaling (population-SD fallback); technical feature
+  and patient filtering contracts monotonically until stable. No clipping or
+  log transform is applied. Clinical covariates and both outcomes remain in
+  evaluation tables, outside the longitudinal inputs. ID-only assignments,
+  tensors, preprocessing parameters and final manifests are immutable; Hydra
+  logs are separate. Patient-level files stay remote; only aggregates and safe
+  manifests are retrieved.
 - MIMIC concept preprocessing is executed directly from the pinned external
   mimic-code SQL files by `01_build_sepsis.py`; downstream extraction reads the
   resulting official tables and adds study-specific cohort/window aggregation.
