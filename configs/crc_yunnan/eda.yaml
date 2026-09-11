@@ -1,0 +1,34 @@
+# @package _global_
+dataset: crc_yunnan
+version: v1
+
+paths:
+  preprocessed_root: data/derived/crc_yunnan/preprocessed/${version}
+  patients_csv: ${paths.preprocessed_root}/patients.csv
+  observations_csv: ${paths.preprocessed_root}/observations.csv
+  output_dir: outputs/crc_yunnan/eda/${version}
+  run_dir: outputs/crc_yunnan/eda_runs/${version}
+
+columns:
+  numeric_baseline: [Preoperative_CEA, Preoperative_CA242, Age]
+  categorical_baseline: [Sex, Primary_site, Surgical_approach, Tumor_differentiation,
+    AJCC_8th_ed_Stage, Lymph_node_yield, Mucinous_colloid_type, Lymphovascular_invasion,
+    Perineural_invasion, Adjuvant_chemotherapy]
+
+quality:
+  refuse_overwrite: true
+
+trajectory:
+  landmark_days: [360, 720, 1080]
+  time_bin_days: 90
+  annual_segment_days: 360
+
+plot:
+  dpi: 220
+  font_families: ["Noto Sans CJK JP", "DejaVu Sans"]
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.run_dir}

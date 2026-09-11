@@ -359,17 +359,3 @@ Run these commands in order after code changes:
 4. `UV_CACHE_DIR=/tmp/uv-cache uv run pytest`
 
 If any step fails, fix it before considering the change complete.
-
-<!-- pair-programming:active:start -->
-## 结对编程（已启用）
-
-本项目默认使用已安装的全局 `$pair-programming` skill。除非用户在当前请求中明确指定不用，否则编码任务开始前自动调用该 skill。Codex 担任 driver，用户担任 navigator。
-
-- 明确继续已有受管任务时直接恢复；新任务若未明确是否受管，先询问用户。只有用户确认后才创建 `.pair` 任务；不受管任务不得修改或切换既有 pair 状态。
-- `.pair/` 由项目根 `.gitignore` 排除；`.pair/PAIR.md` 只保存任务索引，每个任务以 `.pair/tasks/<task-id>/task.json` 与 `nodes.jsonl` 保存元数据和 DAG。
-- 每轮先运行管理脚本的 `summary`，再按需使用 `show/search/list`；不要直接读取完整 `nodes.jsonl`。Markdown 和 SVG 只是按需生成的派生视图。
-- SVG 依赖 Graphviz `dot`，缺失时提醒用户安装；只生成 SVG，不生成 PNG。
-- 每批手写代码、测试和配置的新增与修改不超过 navigator 确认的行数（默认 200）；纯删除不限。每批必须是完整、可运行、可审查的最小单元。
-- 每批完成后做最小必要验证，更新任务 DAG 和摘要，向 navigator 汇报并等待审查；未经通过不开始下一批。
-- 保护既有 WIP 和 navigator 已确认、暂存或提交的改动；不添加需求外抽象、测试或校验。
-<!-- pair-programming:active:end -->
