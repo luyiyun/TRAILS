@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import numpy as np
 import torch
@@ -130,6 +131,24 @@ def weibull_event_probability(
     time = weibull_scale.new_tensor(horizon)
     cumulative_hazard = torch.pow(time / weibull_scale, weibull_shape)
     return -torch.expm1(-cumulative_hazard)
+
+
+def weibull_risk_score(
+    weibull_shape: Tensor,
+    weibull_scale: Tensor,
+    horizon: float | None = None,
+    *,
+    method: Literal["event_probability", "median_survival"] = "event_probability",
+) -> Tensor:
+    """将患者 Weibull 曲线转换成越大越危险的 C-index 排序分数。"""
+    if method == "median_survival":
+        # 在对数域计算负中位时间，保持排序并避免极短中位时间产生数值并列。
+        return -(weibull_scale.double().log() + math.log(math.log(2.0)) / weibull_shape.double())
+    if method != "event_probability":
+        raise ValueError(f"Unknown risk score method: {method}")
+    if horizon is None:
+        raise ValueError("event_probability requires a positive horizon.")
+    return weibull_event_probability(weibull_shape, weibull_scale, horizon)
 
 
 def concordance_index(risk_score: Tensor, survival_time: Tensor, event: Tensor) -> float:

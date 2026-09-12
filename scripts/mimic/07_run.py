@@ -144,6 +144,7 @@ def run(config: MimicApplicationConfig) -> dict[str, object]:
             require_non_empty=config.k_selection.require_non_empty,
             min_cluster_fraction=config.k_selection.min_cluster_fraction,
             min_mean_pairwise_ari=config.k_selection.min_mean_pairwise_ari,
+            compute_stability=config.k_selection.compute_stability,
             estimator_config=trails_config,
         )
         k_selection_result = selector.select(train, validation_data=validation)

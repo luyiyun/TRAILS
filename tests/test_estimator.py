@@ -1,12 +1,15 @@
 import logging
+import math
 from pathlib import Path
 from typing import Literal
 
 import pytest
 import torch
+from sksurv.metrics import concordance_index_censored
 
 from trails import (
     ClinicalTimeSeriesDataset,
+    ClusterNumberSelector,
     DataConfig,
     DecoderConfig,
     EncoderConfig,
@@ -252,9 +255,16 @@ def test_unlabeled_data_skips_cluster_metrics() -> None:
     assert "valid" not in estimator.history[-1]
 
 
-def test_estimator_save_load(tmp_path: Path) -> None:
+@pytest.mark.parametrize("method", ["event_probability", "median_survival"])
+def test_estimator_save_load(
+    tmp_path: Path, method: Literal["event_probability", "median_survival"]
+) -> None:
     data = simulate_dataset(seed=17)
-    estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data)
+    config = tiny_config(data.n_features)
+    config = config.model_copy(
+        update={"trainer": config.trainer.model_copy(update={"cindex_risk_score": method})}
+    )
+    estimator = TrailsEstimator(config).fit(data)
     path = tmp_path / "trails.pt"
     estimator.save(path)
     loaded = TrailsEstimator.load(path)
@@ -262,8 +272,55 @@ def test_estimator_save_load(tmp_path: Path) -> None:
     estimator.predict(data).save(prediction_path)
     loaded_prediction = TrailsPrediction.load(prediction_path)
 
+    assert loaded.config.trainer.cindex_risk_score == method
     assert torch.equal(estimator.predict(data).predict(), loaded.predict(data).predict())
     assert torch.equal(
-        estimator.predict(data).risk_score(28.0),
-        loaded_prediction.risk_score(28.0),
+        estimator.predict(data).risk_score(28.0, method=method),
+        loaded_prediction.risk_score(28.0, method=method),
     )
+
+
+def test_prediction_median_risk_preserves_time_ranking() -> None:
+    prediction = TrailsPrediction(
+        latent_representation=torch.zeros(3, 2),
+        cluster_probabilities=torch.full((3, 2), 0.5),
+        weibull_shape=torch.tensor([1.0, 2.0, 0.001]),
+        weibull_scale=torch.tensor([100.0, 200.0, 1.0]),
+    )
+    risk = prediction.risk_score(method="median_survival")
+    median = torch.exp(-risk)
+    assert median[0].item() == pytest.approx(100.0 * math.log(2.0))
+    assert median[1].item() == pytest.approx(200.0 * math.sqrt(math.log(2.0)))
+    assert torch.isfinite(risk).all()
+    assert risk.argsort(descending=True).tolist() == [2, 0, 1]
+    assert torch.equal(risk, prediction.risk_score(28.0, method="median_survival"))
+    with pytest.raises(ValueError, match="requires a positive horizon"):
+        prediction.risk_score()
+
+
+def test_median_cindex_agrees_in_selection_training_and_prediction() -> None:
+    data = simulate_dataset(seed=17)
+    config = tiny_config(data.n_features)
+    config = config.model_copy(
+        update={
+            "trainer": config.trainer.model_copy(
+                update={"cindex_risk_score": "median_survival", "batch_size": 3}
+            )
+        }
+    )
+    result = ClusterNumberSelector(
+        (2,), seeds=13, compute_stability=False, estimator_config=config
+    ).select(data, validation_data=data)
+    estimator = result.selected_estimators[13]
+    prediction = estimator.predict(data)
+    expected = concordance_index_censored(
+        torch.stack([sample.event for sample in data.samples]).bool().numpy(),
+        torch.stack([sample.survival_time for sample in data.samples]).numpy(),
+        prediction.risk_score(method="median_survival").numpy(),
+        tied_tol=1e-8,
+    )[0]
+    assert float(result.run_metrics.iloc[0]["cindex"]) == pytest.approx(expected)
+    assert estimator.test(data)["cindex"] == pytest.approx(expected)
+    last_epoch = estimator.history[-1]
+    assert "valid" in last_epoch
+    assert last_epoch["valid"]["cindex"] == pytest.approx(expected)

@@ -5,13 +5,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import Tensor
 
 from .diagnostics import LatentDiagnostics
-from .metrics import weibull_event_probability
+from .metrics import weibull_risk_score
 
 
 @dataclass(frozen=True)
@@ -43,9 +43,18 @@ class TrailsPrediction:
         """返回每位患者对全部簇的后验概率。"""
         return self.cluster_probabilities
 
-    def risk_score(self, horizon: float) -> Tensor:
-        """返回指定时间窗内的 Weibull 事件概率 ``1 - S(horizon)``。"""
-        return weibull_event_probability(self.weibull_shape, self.weibull_scale, horizon)
+    def risk_score(
+        self,
+        horizon: float | None = None,
+        *,
+        method: Literal["event_probability", "median_survival"] = "event_probability",
+    ) -> Tensor:
+        """返回越大越危险的患者风险分数。
+
+        默认保留 ``1 - S(horizon)``；``median_survival`` 返回负的对数中位
+        生存时间，不需要 horizon，也不截断随访。该分数不是事件概率。
+        """
+        return weibull_risk_score(self.weibull_shape, self.weibull_scale, horizon, method=method)
 
     def survival(self, times: Sequence[float] | Tensor) -> Tensor:
         """返回每位患者的 Weibull 生存曲线。

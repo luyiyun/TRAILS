@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -23,12 +24,13 @@ from .metrics import (
     cluster_assignment_diagnostics,
     concordance_index,
     gaussian_log_prob,
-    weibull_event_probability,
+    weibull_risk_score,
 )
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
+LOGGER = logging.getLogger(__name__)
 
 _PLOT_METRIC_LABELS = {
     "cindex": "Validation C-index",
@@ -254,6 +256,7 @@ class ClusterNumberSelector:
         require_non_empty: bool = False,
         min_cluster_fraction: float | None = None,
         min_mean_pairwise_ari: float | None = None,
+        compute_stability: bool = True,
         estimator_config: TrailsConfig | Mapping[str, object] | None = None,
     ) -> None:
         """校验直接参数并建立 K 选择配置，尚不训练模型。
@@ -267,6 +270,7 @@ class ClusterNumberSelector:
             require_non_empty: 是否排除任何运行产生空簇的候选 K。
             min_cluster_fraction: 可选的最小簇占比门槛。
             min_mean_pairwise_ari: 可选的多 seed 平均成对 ARI 门槛。
+            compute_stability: 是否收集验证集标签并计算跨 seed 的成对 ARI。
             estimator_config: 基础 TRAILS 配置或可由 Pydantic 解析的映射。
         """
         estimator = (
@@ -283,6 +287,7 @@ class ClusterNumberSelector:
             require_non_empty=require_non_empty,
             min_cluster_fraction=min_cluster_fraction,
             min_mean_pairwise_ari=min_mean_pairwise_ari,
+            compute_stability=compute_stability,
             estimator=estimator,
         )
 
@@ -311,7 +316,8 @@ class ClusterNumberSelector:
         显式验证集会用于全部运行；否则只按 ``split_seed`` 划分一次。每个 seed
         内先将潜空间混合 BIC 做 min-max 归一化，再按
         ``sqrt(C-index² + (1 - BIC_norm)²)`` 计算复合分数；多 seed 时进一步
-        计算验证集簇标签的两两 ARI。没有候选通过配置门槛时不会静默回退。
+        按 compute_stability 决定是否计算验证集簇标签的两两 ARI。
+        没有候选通过配置门槛时不会静默回退。
 
         参数：
             data: 候选模型的训练数据，或内部划分前的完整训练数据。
@@ -336,6 +342,13 @@ class ClusterNumberSelector:
         for seed in self.config.seeds:
             candidate_metrics: list[dict[str, float | int]] = []
             for n_clusters in self.config.candidates:
+                LOGGER.info(
+                    "K选择候选 %d/%d：seed=%d，K=%d",
+                    len(estimators) + 1,
+                    len(self.config.seeds) * len(self.config.candidates),
+                    seed,
+                    n_clusters,
+                )
                 config = base_config.model_copy(
                     update={
                         "seed": seed,
@@ -353,16 +366,21 @@ class ClusterNumberSelector:
                     }
                 )
                 estimators[(seed, n_clusters)] = estimator
-                cluster_assignments[(seed, n_clusters)] = (
-                    estimator.predict(valid_data).predict().numpy()
-                )
+                if self.config.compute_stability:
+                    cluster_assignments[(seed, n_clusters)] = (
+                        estimator.predict(valid_data).predict().numpy()
+                    )
             candidate_scores = self._score_and_rank_candidates(pd.DataFrame(candidate_metrics))
             candidate_scores.insert(0, "seed", seed)
             run_scores.append(candidate_scores)
             seed_winners[seed] = int(candidate_scores.iloc[0]["n_clusters"])
 
         run_metrics = pd.concat(run_scores, ignore_index=True).sort_values(["n_clusters", "seed"])
-        stability_pairs = self._calculate_stability(cluster_assignments)
+        stability_pairs = (
+            self._calculate_stability(cluster_assignments)
+            if self.config.compute_stability
+            else pd.DataFrame(columns=["n_clusters", "seed_a", "seed_b", "ari"])
+        )
         k_summary = self._summarize_candidates(run_metrics, stability_pairs)
         selected_k = self._select_k(k_summary)
 
@@ -405,14 +423,14 @@ class ClusterNumberSelector:
         return {
             "cindex": float(
                 concordance_index(
-                    weibull_event_probability(
+                    weibull_risk_score(
                         outputs.weibull_shape,
                         outputs.weibull_scale,
                         estimator.config.trainer.risk_horizon,
+                        method=estimator.config.trainer.cindex_risk_score,
                     )
                     .detach()
-                    .cpu()
-                    .float(),
+                    .cpu(),
                     batch["survival_time"].detach().cpu().float(),
                     batch["event"].detach().cpu().float(),
                 )

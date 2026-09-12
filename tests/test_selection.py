@@ -45,6 +45,15 @@ def test_selector_config_supports_single_seed_and_json_round_trip() -> None:
             {"candidates": (2,), "seeds": 1, "min_mean_pairwise_ari": 0.75},
             "requires at least two seeds",
         ),
+        (
+            {
+                "candidates": (2,),
+                "seeds": (1, 2),
+                "compute_stability": False,
+                "min_mean_pairwise_ari": 0.75,
+            },
+            "requires compute_stability=True",
+        ),
     ],
 )
 def test_selector_config_rejects_invalid_settings(kwargs: dict[str, object], message: str) -> None:
@@ -103,9 +112,11 @@ def test_selection_result_plots_metrics_by_k(tmp_path: Path) -> None:
         result.plot_metrics(("unknown_metric",))
 
 
+@pytest.mark.parametrize("compute_stability", [True, False])
 def test_selector_runs_shared_split_and_selects_across_seeds(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    compute_stability: bool,
 ) -> None:
     def fake_fit(estimator: TrailsEstimator, *args: Any, **kwargs: Any) -> TrailsEstimator:
         return estimator
@@ -125,9 +136,8 @@ def test_selector_runs_shared_split_and_selects_across_seeds(
     monkeypatch.setattr(ClusterNumberSelector, "_calculate_candidate_metrics", fake_metrics)
     prediction = Mock()
     prediction.predict.return_value = torch.tensor([0, 1, 0])
-    monkeypatch.setattr(
-        selection_module.TrailsEstimator, "predict", lambda estimator, data: prediction
-    )
+    predict = Mock(return_value=prediction)
+    monkeypatch.setattr(selection_module.TrailsEstimator, "predict", predict)
     data: Any = Mock()
     data.split.return_value = [data, data]
     selector = ClusterNumberSelector(
@@ -135,13 +145,25 @@ def test_selector_runs_shared_split_and_selects_across_seeds(
         seeds=(11, 12),
         split_seed=42,
         selection_rule="one_standard_error",
-        min_mean_pairwise_ari=0.75,
+        min_mean_pairwise_ari=0.75 if compute_stability else None,
+        compute_stability=compute_stability,
     )
 
     result = ClusterNumberSelector.from_config(selector.config).select(data)
 
     data.split.assert_called_once_with([0.8, 0.2], seed=42)
     assert result.selected_k == 2
+    assert len(result.run_metrics) == 4
+    assert result.config.compute_stability is compute_stability
+    assert result.stability_pairs.empty is (not compute_stability)
+    if compute_stability:
+        assert predict.call_count == 4
+    else:
+        predict.assert_not_called()
+        assert result.k_summary["mean_pairwise_ari"].isna().to_numpy().all()
+    assert ClusterNumberSelectorConfig.model_validate_json(result.config.model_dump_json()) == (
+        result.config
+    )
     assert {"latent_mixture_bic_normalized", "selection_score", "rank"} <= set(
         result.run_metrics.columns
     )

@@ -1,0 +1,46 @@
+# @package _global_
+defaults:
+  - /model: base
+  - /trainer: full
+  - _self_
+
+description: "CRC Yunnan DFS TRAILS analysis on frozen splits"
+split:
+  seed: 20260908
+  # 改为 temporal-2017 即读取同版本的时间划分；每次只运行一套。
+  strategy: random
+  dir: data/derived/crc_yunnan/splits/v1/dfs/landmark-12m/D20/${split.strategy}/seed-${split.seed}
+
+# null表示自动K选择；整数表示只训练该K，使用trainer.seed。
+n_clusters: null
+k_selection:
+  enabled: true
+  candidate_clusters: [2, 3, 4, 5, 6, 7, 8, 9, 10]
+  seeds: [20260908, 20260909, 20260910]
+  selection_rule: one_standard_error
+  require_non_empty: true
+  min_cluster_fraction: 0.05
+  compute_stability: false
+  min_mean_pairwise_ari: null
+  result_dir: k_selection
+
+trainer:
+  seed: 20260908
+  valid_size: 0.0
+  batch_size: 64
+  # 使用负对数预测中位DFS时间排序；不使用risk_horizon，也不截断随访。
+  cindex_risk_score: median_survival
+artifacts:
+  names: [history]
+swanlab:
+  enabled: false
+outputs:
+  summary: run_manifest.json
+paths:
+  dir: outputs/crc_yunnan/modeling/dfs12-d20-${split.strategy}-${now:%Y%m%d-%H%M%S-%f}
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.dir}

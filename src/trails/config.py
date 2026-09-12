@@ -245,6 +245,7 @@ class TrainerConfig(BaseModel):
         early_stopping_min_delta: 被视为改善所需的最小变化量。
         early_stopping_monitor: 监控总损失、生存损失或 C-index。
         risk_horizon: 计算 C-index 风险排序所用的固定结局时间窗。
+        cindex_risk_score: C-index 的排序分数；中位生存时间方式不使用 risk_horizon。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -264,6 +265,7 @@ class TrainerConfig(BaseModel):
     early_stopping_min_delta: float = Field(default=0.0, ge=0.0)
     early_stopping_monitor: Literal["loss", "survival_loss", "cindex"] = "loss"
     risk_horizon: float = Field(default=1.0, gt=0.0)
+    cindex_risk_score: Literal["event_probability", "median_survival"] = "event_probability"
 
 
 class TrailsConfig(BaseModel):
@@ -297,6 +299,7 @@ class ClusterNumberSelectorConfig(BaseModel):
         require_non_empty: 是否排除任一重复运行产生空簇的候选 K。
         min_cluster_fraction: 可选的最小簇占比门槛。
         min_mean_pairwise_ari: 可选的 seed 间平均成对 ARI 门槛。
+        compute_stability: 是否计算跨 seed 验证集标签的成对 ARI。
         estimator: 所有 K 和 seed 共享并按运行覆盖簇数与种子的估计器基础配置。
     """
 
@@ -310,6 +313,7 @@ class ClusterNumberSelectorConfig(BaseModel):
     require_non_empty: bool = False
     min_cluster_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
     min_mean_pairwise_ari: float | None = Field(default=None, ge=-1.0, le=1.0)
+    compute_stability: bool = True
     estimator: TrailsConfig = Field(default_factory=TrailsConfig)
 
     @field_validator("seeds", mode="before")
@@ -333,4 +337,6 @@ class ClusterNumberSelectorConfig(BaseModel):
             raise ValueError("seeds values must be unique.")
         if len(self.seeds) == 1 and self.min_mean_pairwise_ari is not None:
             raise ValueError("min_mean_pairwise_ari requires at least two seeds.")
+        if not self.compute_stability and self.min_mean_pairwise_ari is not None:
+            raise ValueError("min_mean_pairwise_ari requires compute_stability=True.")
         return self

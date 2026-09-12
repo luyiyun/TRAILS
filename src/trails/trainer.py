@@ -19,7 +19,7 @@ from .metrics import (
     Cindex,
     ClusteringAccuracy,
     cluster_assignment_diagnostics,
-    weibull_event_probability,
+    weibull_risk_score,
 )
 from .model import TrailsLossBreakdown, TrailsModelOutput, TrailsSurvVaderModel
 from .progress import ProgressBar
@@ -396,10 +396,11 @@ class TrailsTrainer:
                 if survival_metrics is not None:
                     for m in survival_metrics.values():
                         m.update(
-                            weibull_event_probability(
+                            weibull_risk_score(
                                 output.weibull_shape,
                                 output.weibull_scale,
                                 self.config.risk_horizon,
+                                method=self.config.cindex_risk_score,
                             ),
                             device_batch["survival_time"],
                             device_batch["event"],

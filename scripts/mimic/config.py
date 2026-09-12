@@ -6,8 +6,8 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from scripts.configs import FrozenSplitConfig, TrailsApplicationConfig
 from trails import ModelConfig, TrainerConfig
-from trails_case.config import CaseApplicationConfig
 
 ClusterCount = Annotated[int, Field(ge=2)]
 ClusterCounts = ClusterCount | tuple[ClusterCount, ...]
@@ -17,34 +17,19 @@ def _requested_clusters(value: ClusterCounts) -> tuple[int, ...]:
     return (value,) if isinstance(value, int) else value
 
 
-class MimicSplitConfig(BaseModel):
-    """正式训练所消费的固定患者划分。"""
-
-    model_config = ConfigDict(extra="forbid")
+class MimicSplitConfig(FrozenSplitConfig):
+    """保留 MIMIC 原有的冻结划分默认值。"""
 
     seed: int = 20260517
     dir: Path = Path("data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517")
 
 
-class MimicApplicationConfig(CaseApplicationConfig):
-    """增加外部患者划分配置的 MIMIC 训练命令配置。"""
+class MimicApplicationConfig(TrailsApplicationConfig):
+    """引用共享建模配置，保留 MIMIC 配置入口。"""
 
-    n_clusters: int | None = Field(default=None, ge=2)
-    split: MimicSplitConfig = Field(default_factory=MimicSplitConfig)
-
-    @model_validator(mode="after")
-    def validate_k_resolution(self) -> Self:
-        """未指定固定K时要求启用选择并显式提供候选集合。"""
-        if self.n_clusters is None:
-            if not self.k_selection.enabled:
-                raise ValueError("n_clusters未指定时必须启用k_selection")
-            if not self.k_selection.candidate_clusters:
-                raise ValueError("自动K选择要求k_selection.candidate_clusters非空")
-            if not self.k_selection.seeds:
-                raise ValueError("自动K选择要求k_selection.seeds非空")
-            if self.trainer.seed not in self.k_selection.seeds:
-                raise ValueError("trainer.seed必须包含在k_selection.seeds中以锁定最终模型")
-        return self
+    split: MimicSplitConfig = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
+        default_factory=MimicSplitConfig
+    )
 
 
 class MimicBaselinePathsConfig(BaseModel):

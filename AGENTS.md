@@ -16,6 +16,8 @@ items.
 - `scripts/`: one Hydra CLI entrypoint per command. Top-level commands use
   `uv run python scripts/<command>.py ...`; numbered MIMIC commands use
   `uv run python -m scripts.mimic.<numbered_command> ...`.
+- `scripts/configs.py`: shared frozen-split TRAILS command configuration, reused
+  by MIMIC and CRC Yunnan; dataset defaults remain in their YAML or thin subclasses.
 - `scripts/utils/`: reusable command-layer methods and artifact contracts shared
   by MIMIC and future workflow packages such as `scripts/simulation/`.
 - `configs/`: Hydra command roots plus shared simulation, training, baseline, optimization, summary, and case configuration.
@@ -34,6 +36,8 @@ Allowed dependencies:
 - `scripts/* -> trails_case`
 - `scripts.mimic command modules -> scripts.mimic` non-command support modules
 - workflow packages under `scripts/ -> scripts.utils`
+- workflow packages under `scripts/ -> scripts.configs`
+- `scripts.configs -> trails_case.config` for the existing command config inheritance
 - `scripts.utils -> trails`
 - `trails_simulate -> trails`
 - `trails_case -> trails`
@@ -60,6 +64,7 @@ clean reusable method library.
 - Run real-data case modeling: `uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv`
 - Generate MIMIC patient splits and tensor datasets: `uv run python -m scripts.mimic.06_split`
 - Freeze CRC Yunnan patient splits and tensor datasets: `uv run python -m scripts.crc_yunnan.03_split`
+- Run CRC Yunnan K selection and TRAILS on one frozen split: `uv run python -m scripts.crc_yunnan.04_run`
 - Run MIMIC modeling with configured or automatically selected K: `uv run python -m scripts.mimic.07_run`
 - Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517`
 - Evaluate frozen MIMIC predictions: `uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<primary-run>,outputs/mimic_case/<other-runs>]' 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
@@ -205,7 +210,9 @@ clean reusable method library.
   `risk_score(horizon)`, and `survival()` derive cluster labels, posterior probabilities,
   fixed-horizon event risks, and survival curves from the saved latent and
   patient-specific Weibull parameters. `trainer.risk_horizon` supplies the
-  configurable horizon used for training and evaluation C-index calculations.
+  configurable horizon when `trainer.cindex_risk_score=event_probability` (the default).
+  `risk_score(method="median_survival")` returns negative log predicted median survival
+  time without a horizon. The trainer and K selector honor the same configured risk method.
 - Train and baseline commands recursively discover all sibling `train.pt`/`test.pt`
   directories under `paths.data_root`, infer K from dataset metadata when present,
   and save unified prediction payloads under mirrored run directories plus
@@ -268,6 +275,18 @@ clean reusable method library.
   tensors, preprocessing parameters and final manifests are immutable; Hydra
   logs are separate. Patient-level files stay remote; only aggregates and safe
   manifests are retrieved.
+- CRC Yunnan `04_run.py` consumes one frozen bundle, defaults to DFS/12-month/D20/random
+  with split seed 20260908, and accepts `split.strategy=temporal-2017` to switch bundles.
+  It shares `TrailsApplicationConfig` from `scripts/configs.py` with MIMIC's thin config
+  subclass. Defaults are K=2..10, seeds 20260908/09/10, base model/full trainer,
+  median-survival C-index ranking, and no SwanLab. K selection requires no validation
+  empty clusters and at least 5% per cluster in every seed, then uses one standard error.
+  `compute_stability=false` skips cross-seed ARI without skipping score aggregation.
+  After K selection, CRC chooses the highest validation selection score seed, breaking
+  ties by higher C-index, lower BIC, then smaller seed, and reuses that candidate.
+  Test is loaded only after K and seed are locked. Outputs are candidate artifacts,
+  the final model/history, three-split predictions and patient tables, one metrics CSV,
+  and a short manifest referencing the frozen split; no copied datasets or clinical plots.
 - MIMIC concept preprocessing is executed directly from the pinned external
   mimic-code SQL files by `01_build_sepsis.py`; downstream extraction reads the
   resulting official tables and adds study-specific cohort/window aggregation.
