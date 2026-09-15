@@ -12,7 +12,7 @@ import pandas as pd
 
 from trails import ClinicalTimeSeriesDataset
 
-from .baseline_features import dataset_patient_ids, dataset_survival_arrays
+from .features import dataset_patient_ids, dataset_survival_arrays
 
 
 @dataclass(frozen=True)

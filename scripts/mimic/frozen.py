@@ -8,7 +8,7 @@ from pathlib import Path
 
 from trails import ClinicalTimeSeriesDataset
 
-from ..utils.baseline_features import dataset_patient_ids
+from ..baselines.features import dataset_patient_ids
 
 
 def sha256_file(path: Path) -> str:

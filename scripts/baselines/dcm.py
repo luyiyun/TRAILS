@@ -11,9 +11,9 @@ from sksurv.util import Surv
 
 from trails import ClinicalTimeSeriesDataset
 
-from .baseline_features import dataset_patient_ids, dataset_survival_arrays
-from .baseline_fpca import UFPCAFeaturePipeline
-from .baselines import BaselineCapability, BaselinePrediction
+from .base import BaselineCapability, BaselinePrediction
+from .features import dataset_patient_ids, dataset_survival_arrays
+from .fpca import UFPCAFeaturePipeline
 
 
 class DeepCoxMixturesBaseline:

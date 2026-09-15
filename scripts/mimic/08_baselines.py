@@ -17,9 +17,9 @@ from trails import ClinicalTimeSeriesDataset
 from trails.artifacts import plot_history, save_history_csv, save_json
 from trails_simulate.config import resolved_payload
 
-from ..utils.baseline_features import dataset_patient_ids
-from ..utils.baseline_trails import TrailsNoSurvivalBaseline
-from ..utils.baselines import BaselineMethod, KSelectableBaselineMethod
+from ..baselines.base import BaselineMethod, KSelectableBaselineMethod
+from ..baselines.features import dataset_patient_ids
+from ..baselines.trails import TrailsNoSurvivalBaseline
 from .baseline_registry import BASELINE_REGISTRY
 from .config import (
     MimicBaselineMethodConfig,

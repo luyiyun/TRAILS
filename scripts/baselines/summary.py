@@ -15,15 +15,15 @@ from sksurv.util import Surv
 
 from trails import ClinicalTimeSeriesDataset
 
-from .baseline_features import (
-    SummaryFeaturePipeline,
-    dataset_patient_ids,
-    dataset_survival_arrays,
-)
-from .baselines import (
+from .base import (
     BaselineCapability,
     BaselinePrediction,
     kmeans_silhouette_metrics,
+)
+from .features import (
+    SummaryFeaturePipeline,
+    dataset_patient_ids,
+    dataset_survival_arrays,
 )
 
 

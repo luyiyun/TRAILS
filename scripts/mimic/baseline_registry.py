@@ -7,19 +7,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from ..utils.baseline_cox_risk import CoxRiskKMeansBaseline
-from ..utils.baseline_dcm import DeepCoxMixturesBaseline
-from ..utils.baseline_fpca import MFPCAKMeansBaseline, UFPCAKMeansBaseline
-from ..utils.baseline_jmbayes2 import JMbayes2Baseline
-from ..utils.baseline_mpjlcmm import MPJLCMMBaseline
-from ..utils.baseline_summary import (
+from ..baselines.base import BaselineCapability, BaselineKSelectionRule, BaselineMethod
+from ..baselines.cox_risk import CoxRiskKMeansBaseline
+from ..baselines.dcm import DeepCoxMixturesBaseline
+from ..baselines.fpca import MFPCAKMeansBaseline, UFPCAKMeansBaseline
+from ..baselines.jmbayes2 import JMbayes2Baseline
+from ..baselines.mpjlcmm import MPJLCMMBaseline
+from ..baselines.summary import (
     CoxPHBaseline,
     RandomSurvivalForestBaseline,
     SummaryKMeansBaseline,
 )
-from ..utils.baseline_trails import TrailsNoSurvivalBaseline
-from ..utils.baseline_vadesc import VaDeSCBaseline
-from ..utils.baselines import BaselineCapability, BaselineKSelectionRule, BaselineMethod
+from ..baselines.trails import TrailsNoSurvivalBaseline
+from ..baselines.vadesc import VaDeSCBaseline
 from .config import (
     CoxPHMethodConfig,
     CoxRiskKMeansMethodConfig,

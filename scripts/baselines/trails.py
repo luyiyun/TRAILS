@@ -13,8 +13,8 @@ from numpy.typing import NDArray
 import trails
 from trails.metrics import gaussian_log_prob
 
-from .baseline_features import dataset_patient_ids
-from .baselines import BaselineCapability, BaselinePrediction
+from .base import BaselineCapability, BaselinePrediction
+from .features import dataset_patient_ids
 
 
 class TrailsNoSurvivalBaseline:

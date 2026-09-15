@@ -30,7 +30,7 @@ from trails import ClinicalTimeSeriesDataset
 from trails.artifacts import save_json
 from trails_simulate.config import resolved_payload
 
-from ..utils.baselines import BaselinePrediction
+from ..baselines.base import BaselinePrediction
 from .config import MimicEvaluationConfig
 from .evaluation import (
     AdjustedCoxAnalysis,

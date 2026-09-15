@@ -23,12 +23,12 @@ from sklearn.preprocessing import StandardScaler
 
 from trails import ClinicalTimeSeriesDataset
 
-from .baseline_features import dataset_patient_ids
-from .baselines import (
+from .base import (
     BaselineCapability,
     BaselinePrediction,
     kmeans_silhouette_metrics,
 )
+from .features import dataset_patient_ids
 
 
 class UFPCAFeaturePipeline:

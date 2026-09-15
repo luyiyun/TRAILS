@@ -18,8 +18,8 @@ from sksurv.nonparametric import kaplan_meier_estimator
 from trails import TrailsPrediction
 from trails.data import ClinicalTimeSeriesDataset
 
-from ..utils.baseline_features import dataset_patient_ids, dataset_survival_arrays
-from ..utils.baselines import BaselinePrediction
+from ..baselines.base import BaselinePrediction
+from ..baselines.features import dataset_patient_ids, dataset_survival_arrays
 from .config import BASELINE_COVARIATE_COLUMNS, MimicEvaluationConfig
 from .frozen import sha256_file
 from .paths import resolve_input_path
