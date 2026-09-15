@@ -20,8 +20,7 @@ from trails.data import ClinicalTimeSeriesDataset
 
 from ..utils.baseline_features import dataset_patient_ids, dataset_survival_arrays
 from ..utils.baselines import BaselinePrediction
-from .config import MimicEvaluationConfig
-from .data import BASELINE_COVARIATE_COLUMNS
+from .config import BASELINE_COVARIATE_COLUMNS, MimicEvaluationConfig
 from .frozen import sha256_file
 from .paths import resolve_input_path
 

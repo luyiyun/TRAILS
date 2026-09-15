@@ -119,6 +119,17 @@ clean reusable method library.
   `scripts/utils`; dataset-specific workflow packages own only configuration,
   orchestration, and adapters. `src/trails_simulate` and `src/trails_case` are
   legacy workflow modules to migrate into `scripts/` or remove incrementally.
+- Shared custom preprocessing steps live in `scripts/utils/preprocessing.py`.
+  They accept multi-feature matrices, fit each column while ignoring NaN, and
+  preserve missing positions. Split commands pivot patient-time observations to
+  feature columns and directly fit one sklearn Pipeline on train, then restore
+  the original observed rows. Standard/minmax use native sklearn scalers;
+  robust scaling computes the population-SD fallback only when IQR is zero.
+  Custom steps retain only fitted attributes needed for transformation and the
+  sklearn interface. Disabled log uses Pipeline passthrough. MIMIC retains its
+  five-column parameter CSV; CRC exports only feature, transform, center and scale.
+  MIMIC dataset preparation lives in `06_split.py`; shared baseline covariate
+  names live in `scripts/mimic/config.py`.
 - CLI lives in command-specific Hydra scripts under `scripts/`; no package console script is configured.
 - Non-MIMIC command scripts use root configs at `configs/<command>.yaml`; Hydra
   configs for `scripts/mimic/` live under `configs/mimic/`. `scripts/simulate.py`
@@ -254,27 +265,41 @@ clean reusable method library.
   only for internal early stopping, and saves the converted dataset, model,
   history, predictions, patient-level clusters, cluster summaries, feature
   summaries, and `case_summary.json` under `paths.dir`.
-- CRC Yunnan `03_split.py` is a linear Hydra analysis script, following the local
-  `01_preprocess.py` and `02_eda.py` style. It defaults to a 360-day DFS landmark,
-  the explicit C12 feature panel, random 64/16/20 and temporal-2017 splits, and
-  seed 20260908. Its config also defines A2/B8/D20/E60/F88 panels and selectable
+- CRC Yunnan `03_split.py` follows the linear `main -> run -> output` structure of
+  `04_run.py`. Its Hydra entrypoint validates the resolved YAML with
+  `scripts/crc_yunnan/config.py::CRCSplitConfig` before reading data; `run` and
+  its helpers use the typed configuration. YAML remains the source of defaults.
+  It defaults to a 360-day DFS landmark,
+  the explicit D20 feature panel, random 64/16/20 and temporal-2017 splits, and
+  seed 20260908. Its config also defines A2/B8/C12/E60/F88 panels and selectable
   outcome, landmark, strategies and seeds. No feature coverage gate is applied.
 - CRC Yunnan master assignments are frozen before landmark and observation
   filtering, stratified by DFS/OS event combination, and reused across outcomes,
-  panels and windows. Source hashes and base-cohort/split rules must match on
-  reuse. By default, exclude reversed follow-up dates and either outcome over
+  panels and windows. Reuse checks the base-cohort IDs and split rules, including
+  existing assignment manifests; source and ID files are no longer hash-audited.
+  By default, exclude reversed follow-up dates and either outcome over
   7305 days; retain the supplied outcome-time definition for other records.
   Window observations include both endpoints, eligibility requires outcome time
   strictly after the landmark, and survival time starts at the landmark.
-- CRC Yunnan frozen bundles retain at least two distinct observed dates across
-  the final feature panel. Train alone determines removal of unobserved/constant
-  features and median/IQR scaling (population-SD fallback); technical feature
-  and patient filtering contracts monotonically until stable. No clipping or
-  log transform is applied. Clinical covariates and both outcomes remain in
-  evaluation tables, outside the longitudinal inputs. ID-only assignments,
-  tensors, preprocessing parameters and final manifests are immutable; Hydra
-  logs are separate. Patient-level files stay remote; only aggregates and safe
-  manifests are retrieved.
+- CRC Yunnan frozen bundles filter patients once for at least two distinct observed
+  dates across the full configured panel. Unobserved or constant train features
+  raise an error; features and patients are not automatically removed afterward.
+  Final train observations alone determine preprocessing, with each observation
+  weighted equally. Default `auto-log1p` requires at least three nonnegative values,
+  adjusted Fisher–Pearson skewness above 1.0 (configurable), and strictly reduced
+  absolute skewness after log1p. Selected log features reject negative holdout values.
+  Scaling is configurable as none, robust (median/IQR with population-SD fallback),
+  standard (mean/population SD), or minmax; robust is the default and no clipping
+  is applied. Bundles include a configurable preprocessing-name
+  directory beneath the panel. Master assignments remain shared across variants.
+  Clinical covariates and both outcomes remain outside the longitudinal inputs.
+  Bundles retain a short split manifest, tensors, patient tables, ID files, resolved
+  config and preprocessing parameters; existing outputs cannot be overwritten.
+  The split command consumes the standard 01 outputs without repeating their
+  clinical consistency audit. It does not generate cohort-flow, split-summary or
+  feature-coverage CSVs; patient/event counts are recorded once in the manifest.
+  The legacy paths.output_dir override remains accepted but is unused. Hydra logs
+  are separate. Patient-level files stay remote.
 - CRC Yunnan `04_run.py` consumes one frozen bundle, defaults to DFS/12-month/D20/random
   with split seed 20260908, and accepts `split.strategy=temporal-2017` to switch bundles.
   It shares `TrailsApplicationConfig` from `scripts/configs.py` with MIMIC's thin config

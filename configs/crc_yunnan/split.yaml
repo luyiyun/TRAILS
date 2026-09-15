@@ -5,13 +5,19 @@ split_version: v1
 outcome: dfs
 landmark_months: 12
 
+preprocessing:
+  name: ${preprocessing.log_transform}-${preprocessing.scaling}
+  log_transform: auto-log1p  # auto-log1p | none
+  skew_threshold: 1.0
+  scaling: robust          # none | robust | standard | minmax
+
 paths:
   preprocessed_root: data/derived/crc_yunnan/preprocessed/${version}
   patients_csv: ${paths.preprocessed_root}/patients.csv
   observations_csv: ${paths.preprocessed_root}/observations.csv
   assignment_root: data/derived/crc_yunnan/assignments/${split_version}
-  dir: data/derived/crc_yunnan/splits/${split_version}/${outcome}/landmark-${landmark_months}m/${features.panel}
-  output_dir: outputs/crc_yunnan/splits/${split_version}/${outcome}/landmark-${landmark_months}m/${features.panel}
+  dir: data/derived/crc_yunnan/splits/${split_version}/${outcome}/landmark-${landmark_months}m/${features.panel}/${preprocessing.name}
+  output_dir: outputs/crc_yunnan/splits/${split_version}/${outcome}/landmark-${landmark_months}m/${features.panel}/${preprocessing.name}
   run_dir: outputs/crc_yunnan/split_runs/${now:%Y%m%d-%H%M%S}
 
 cohort:
@@ -31,7 +37,7 @@ split:
     validation_fraction: 0.20
 
 features:
-  panel: D20
+  panel: E60
   # 明确列出每套面板；新增源指标不会自动进入任何面板。
   panels:
     A2: [CEA, CA242]

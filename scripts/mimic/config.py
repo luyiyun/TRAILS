@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from scripts.configs import FrozenSplitConfig, TrailsApplicationConfig
 from trails import ModelConfig, TrainerConfig
 
+BASELINE_COVARIATE_COLUMNS = ("age", "gender", "race", "sofa_score")
+
 ClusterCount = Annotated[int, Field(ge=2)]
 ClusterCounts = ClusterCount | tuple[ClusterCount, ...]
 

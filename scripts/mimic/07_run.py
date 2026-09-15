@@ -28,8 +28,7 @@ from trails_case.evaluation import (
 from trails_simulate.config import resolved_payload
 from trails_simulate.training import log_swanlab_history
 
-from .config import MimicApplicationConfig
-from .data import BASELINE_COVARIATE_COLUMNS
+from .config import BASELINE_COVARIATE_COLUMNS, MimicApplicationConfig
 from .paths import resolve_input_path, resolve_output_path
 
 
