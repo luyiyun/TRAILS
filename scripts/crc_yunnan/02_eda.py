@@ -2,994 +2,752 @@ from __future__ import annotations
 
 # pyright: reportArgumentType=false, reportAttributeAccessIssue=false
 # pyright: reportCallIssue=false, reportIndexIssue=false, reportOperatorIssue=false
+import json
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import hydra
 import matplotlib
 import numpy as np
 import pandas as pd
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
+from scripts.crc_yunnan.config import CRCEDAConfig
 
 matplotlib.use("Agg")
 import seaborn as sns  # noqa: E402
 from lifelines import KaplanMeierFitter  # noqa: E402
 from lifelines.plotting import add_at_risk_counts  # noqa: E402
 from matplotlib import font_manager  # noqa: E402
-from matplotlib import pyplot as plt  # noqa: E402
+from matplotlib import pyplot as plt
 from matplotlib.figure import Figure  # noqa: E402
+
+BASELINE_LABELS = {
+    "Preoperative_CEA": "术前CEA",
+    "Preoperative_CA242": "术前CA242",
+    "Age": "年龄",
+    "Sex": "性别",
+    "Primary_site": "原发部位",
+    "Surgical_approach": "手术方式",
+    "Tumor_differentiation": "肿瘤分化",
+    "AJCC_8th_ed_Stage": "AJCC第8版分期",
+    "Lymph_node_yield": "淋巴结检出数",
+    "Mucinous_colloid_type": "黏液胶样类型",
+    "Lymphovascular_invasion": "淋巴血管侵犯",
+    "Perineural_invasion": "神经侵犯",
+    "Adjuvant_chemotherapy": "辅助化疗",
+}
 
 
 def _percent(numerator: int | float, denominator: int | float) -> float:
-    return 100.0 * numerator / denominator if denominator else np.nan
+    return 100 * numerator / denominator if denominator else np.nan
 
 
-def _category(series: pd.Series) -> pd.Series:
-    return cast(
-        pd.Series,
-        series.fillna("MISSING").astype("string").str.strip().replace("", "MISSING"),
+def _category(values: pd.Series) -> pd.Series:
+    return values.fillna("缺失").astype("string").str.strip().replace("", "缺失")
+
+
+def _distribution(values: pd.Series) -> dict[str, int | float]:
+    """同类数值的描述统计用于JSON，不把不同含义的指标拼成通用表。"""
+    values = values.dropna()
+    return {
+        "有效数": int(values.size),
+        "最小值": values.min(),
+        "下四分位数": values.quantile(0.25),
+        "中位数": values.median(),
+        "上四分位数": values.quantile(0.75),
+        "最大值": values.max(),
+        "负值数": int(values.lt(0).sum()),
+        "零值数": int(values.eq(0).sum()),
+        "正值数": int(values.gt(0).sum()),
+    }
+
+
+def _patient_counts(window: pd.DataFrame, ids: pd.Series, features: list[str]) -> pd.DataFrame:
+    """将非缺失单元格计为观测，无观测的合格患者仍保留在分母中。"""
+    observed = window[features].notna()
+    return (
+        pd.DataFrame(
+            {
+                "有效观测数": observed.sum(axis=1).groupby(window["patient_id"]).sum(),
+                "观测日期数": window.groupby("patient_id")["time_days"].nunique(),
+                "观测特征数": observed.groupby(window["patient_id"]).any().sum(axis=1),
+            }
+        )
+        .reindex(ids)
+        .fillna(0)
     )
 
 
-def _save_png(figure: Figure, output_dir: Path, name: str, dpi: int) -> None:
-    figure.savefig(output_dir / f"{name}.png", dpi=dpi, bbox_inches="tight")
+def _coverage(window: pd.DataFrame, features: list[str], denominator: int) -> pd.DataFrame:
+    observed_dates = window[features].notna().groupby(window["patient_id"]).sum()
+    counts = pd.DataFrame(
+        {
+            "至少一次观测人数": observed_dates.ge(1).sum(),
+            "至少两次观测人数": observed_dates.ge(2).sum(),
+        }
+    ).reindex(features, fill_value=0)
+    counts["合格患者数"] = denominator
+    counts["至少一次覆盖率（%）"] = counts["至少一次观测人数"] / (denominator or np.nan) * 100
+    counts["至少两次覆盖率（%）"] = counts["至少两次观测人数"] / (denominator or np.nan) * 100
+    return counts.rename_axis("特征")
+
+
+def _save_png(figure: Figure, output: Path, name: str, dpi: int) -> None:
+    figure.savefig(output / f"{name}.png", dpi=dpi, bbox_inches="tight")
     plt.close(figure)
 
 
-def _add_group_separators(axes: Any, feature_groups: pd.Series) -> None:
-    axis_list = np.atleast_1d(axes).ravel()
-    groups = feature_groups.to_numpy()
-    changes = np.flatnonzero(groups[1:] != groups[:-1]) + 1
-    for axis in axis_list:
-        for position in changes:
-            axis.axhline(position - 0.5, color="white", linewidth=1.2)
-
-
-@hydra.main(config_path="../../configs", config_name="crc_yunnan/eda", version_base="1.3")
-def main(config: DictConfig) -> None:
-
-    # 参数配置解析
-    landmark_days = sorted(int(value) for value in config.trajectory.landmark_days)
-    time_bin_days = int(config.trajectory.time_bin_days)
-    annual_segment_days = int(config.trajectory.annual_segment_days)
-    max_landmark = max(landmark_days)
-    dpi = int(config.plot.dpi)
-    categorical_baseline = [str(name) for name in config.columns.categorical_baseline]
-
-    # 设置绘图风格和字体，确保中文显示正常。
-    available_fonts = {font.name for font in font_manager.fontManager.ttflist}
-    font_family = next(
-        (str(name) for name in config.plot.font_families if str(name) in available_fonts),
-        "DejaVu Sans",
-    )
-    sns.set_theme(style="whitegrid", context="notebook")
-    plt.rcParams.update(
-        {
-            "font.family": font_family,
-            "axes.unicode_minus": False,
-            "figure.dpi": int(config.plot.dpi),
-        }
-    )
-
-    # ==================================================================================
-    # 一、读取预处理后的患者表与纵向观测表，固定本次描述性EDA的数据边界。
-    # ==================================================================================
-    patient_path = Path(str(config.paths.patients_csv)).resolve()
-    observation_path = Path(str(config.paths.observations_csv)).resolve()
-    missing_paths = [str(path) for path in (patient_path, observation_path) if not path.is_file()]
-    if missing_paths:
-        raise FileNotFoundError(f"缺少CRC云南EDA输入：{missing_paths}")
-
-    output_dir = Path(str(config.paths.output_dir)).resolve()
-    if bool(config.quality.refuse_overwrite) and output_dir.exists():
-        raise FileExistsError(f"拒绝覆盖既有EDA目录：{output_dir}")
-
-    numeric_baseline = [str(name) for name in config.columns.numeric_baseline]
-    # 在读取时明确数值类型；非法数值沿用pandas默认行为，直接抛出异常。
-    patients = pd.read_csv(
-        patient_path,
-        dtype={
-            "patient_id": "string",
-            "dfs_time_days": "float64",
-            "dfs_event": "float64",
-            "os_time_days": "float64",
-            "os_event": "float64",
-            **dict.fromkeys(numeric_baseline, "float64"),
-        },
-        parse_dates=["surgery_date", "last_followup_date"],
-    )
-    observations = pd.read_csv(
-        observation_path,
-        dtype={
-            "patient_id": "string",
-            "feature": "string",
-            "feature_group": "string",
-            "time_days": "float32",
-            "value": "float32",
-        },
-    )
-
-    # 保证EDA输入表格包含必要字段，避免后续分析中出现KeyError。
-    required_patient_columns = {
-        "patient_id",
-        "surgery_date",
-        "last_followup_date",
-        "dfs_time_days",
-        "dfs_event",
-        "os_time_days",
-        "os_event",
-        *[str(name) for name in config.columns.numeric_baseline],
-        *[str(name) for name in config.columns.categorical_baseline],
-    }
-    required_observation_columns = {
-        "patient_id",
-        "feature",
-        "feature_group",
-        "time_days",
-        "value",
-    }
-    missing_patient_columns = sorted(required_patient_columns - set(patients.columns))
-    missing_observation_columns = sorted(required_observation_columns - set(observations.columns))
-    if missing_patient_columns or missing_observation_columns:
-        raise ValueError(
-            "EDA输入缺少必要字段："
-            f"patients={missing_patient_columns}, observations={missing_observation_columns}"
-        )
-
-    # 确保输出目录存在，若拒绝覆盖则在已存在时抛出异常。
-    output_dir.mkdir(parents=True, exist_ok=not bool(config.quality.refuse_overwrite))
-
-    # 计算日历随访天数和手术年份，便于后续分析。
-    patients["calendar_followup_days"] = (
-        patients["last_followup_date"] - patients["surgery_date"]
-    ).dt.days
-    patients["surgery_year"] = patients["surgery_date"].dt.year.astype("Int64")
-
-    # 计算患者ID和观测ID的集合，并找出有观测记录的患者ID。
-    patient_ids = set(patients["patient_id"].dropna())
-    observation_ids = set(observations["patient_id"].dropna())
-    observed_patient_ids = patient_ids & observation_ids
-
-    # 根据观测表中的特征和特征组信息，生成特征元数据表格，并按特征组和特征名称排序。
-    feature_metadata = (
-        observations[["feature", "feature_group"]]
-        .dropna(subset=["feature"])
-        .assign(feature_group=lambda frame: _category(frame["feature_group"]))
-        .groupby("feature", observed=True)["feature_group"]
-        .agg(lambda values: values.mode().iloc[0] if not values.mode().empty else "MISSING")
-        .rename("feature_group")
-        .reset_index()
-        .sort_values(["feature_group", "feature"], kind="stable")
-        .reset_index(drop=True)
-    )
-    ordered_features = feature_metadata["feature"].astype(str).tolist()
-    ordered_groups = feature_metadata.set_index("feature")["feature_group"].reindex(
-        ordered_features
-    )
-
-    # ==================================================================================
-    # 二、用三张小型表格概括队列边界、数据质量事实及基线临床特征。
-    # ==================================================================================
-    cohort_rows: list[dict[str, Any]] = []
-
-    def add_cohort_row(
-        section: str,
-        metric: str,
-        value: Any,
-        denominator: int | None = None,
-        unit: str | None = None,
-    ) -> None:
-        numeric_value = float(value) if isinstance(value, (int, float, np.number)) else np.nan
-        cohort_rows.append(
-            {
-                "section": section,
-                "metric": metric,
-                "value": value,
-                "denominator": denominator,
-                "percent": (
-                    _percent(numeric_value, denominator)
-                    if denominator is not None and np.isfinite(numeric_value)
-                    else np.nan
-                ),
-                "unit": unit,
-            }
-        )
-
-    add_cohort_row("size", "patients", len(patients), unit="patients")
-    add_cohort_row("size", "observations", len(observations), unit="records")
-    add_cohort_row("size", "features", observations["feature"].nunique(), unit="features")
-    add_cohort_row("size", "feature_groups", observations["feature_group"].nunique(), unit="groups")
-    add_cohort_row(
-        "observation_linkage",
-        "patients_with_observations",
-        len(observed_patient_ids),
-        len(patients),
-        "patients",
-    )
-    add_cohort_row(
-        "observation_linkage",
-        "patients_without_observations",
-        len(patient_ids - observation_ids),
-        len(patients),
-        "patients",
-    )
-    for metric, series in (
-        ("surgery_date", patients["surgery_date"]),
-        ("last_followup_date", patients["last_followup_date"]),
-    ):
-        add_cohort_row("calendar_range", f"{metric}_minimum", series.min(), unit="date")
-        add_cohort_row("calendar_range", f"{metric}_maximum", series.max(), unit="date")
-    add_cohort_row(
-        "observation_time",
-        "relative_time_minimum",
-        observations["time_days"].min(),
-        unit="days_from_surgery",
-    )
-    add_cohort_row(
-        "observation_time",
-        "relative_time_maximum",
-        observations["time_days"].max(),
-        unit="days_from_surgery",
-    )
-    pd.DataFrame(cohort_rows).to_csv(output_dir / "cohort_summary.csv", index=False)
-
-    quality_rows: list[dict[str, Any]] = []
-
-    def add_quality_row(
-        table: str,
-        check: str,
-        n_affected: int,
-        denominator: int,
-        definition: str,
-    ) -> None:
-        quality_rows.append(
-            {
-                "table": table,
-                "check": check,
-                "n_affected": int(n_affected),
-                "denominator": int(denominator),
-                "percent": _percent(n_affected, denominator),
-                "definition": definition,
-            }
-        )
-
-    patient_quality_checks = [
-        ("missing_patient_id", patients["patient_id"].isna(), "patient_id is missing"),
-        (
-            "duplicate_patient_id_rows",
-            patients["patient_id"].duplicated(keep=False),
-            "rows belonging to a patient_id appearing more than once",
-        ),
-        ("exact_duplicate_rows", patients.duplicated(), "rows exactly duplicated"),
-        ("missing_surgery_date", patients["surgery_date"].isna(), "surgery_date is missing"),
-        (
-            "missing_last_followup_date",
-            patients["last_followup_date"].isna(),
-            "last_followup_date is missing",
-        ),
-        (
-            "followup_before_surgery",
-            patients["last_followup_date"] < patients["surgery_date"],
-            "last_followup_date is earlier than surgery_date",
-        ),
-        (
-            "invalid_dfs_event_code",
-            patients["dfs_event"].notna() & ~patients["dfs_event"].isin([0, 1]),
-            "dfs_event is not 0 or 1",
-        ),
-        (
-            "invalid_os_event_code",
-            patients["os_event"].notna() & ~patients["os_event"].isin([0, 1]),
-            "os_event is not 0 or 1",
-        ),
-        ("missing_dfs_time", patients["dfs_time_days"].isna(), "dfs_time_days is missing"),
-        ("missing_os_time", patients["os_time_days"].isna(), "os_time_days is missing"),
-        ("negative_dfs_time", patients["dfs_time_days"] < 0, "dfs_time_days is negative"),
-        ("negative_os_time", patients["os_time_days"] < 0, "os_time_days is negative"),
-        (
-            "dfs_time_exceeds_os_time",
-            patients["dfs_time_days"] > patients["os_time_days"],
-            "dfs_time_days is greater than os_time_days",
-        ),
-    ]
-    for check, affected, definition in patient_quality_checks:
-        add_quality_row("patients", check, int(affected.sum()), len(patients), definition)
-    add_quality_row(
-        "patients",
-        "patient_without_observation",
-        len(patient_ids - observation_ids),
-        len(patient_ids),
-        "patient_id has no linked longitudinal observation",
-    )
-
-    for column in ("patient_id", "feature", "feature_group", "time_days", "value"):
-        add_quality_row(
-            "observations",
-            f"missing_{column}",
-            int(observations[column].isna().sum()),
-            len(observations),
-            f"{column} is missing",
-        )
-    add_quality_row(
-        "observations",
-        "exact_duplicate_rows",
-        int(observations.duplicated().sum()),
-        len(observations),
-        "rows exactly duplicated after preprocessing",
-    )
-    observation_keys = ["patient_id", "time_days", "feature"]
-    key_sizes = observations.groupby(observation_keys, dropna=False, observed=True).size()
-    add_quality_row(
-        "observations",
-        "duplicate_patient_time_feature_groups",
-        int((key_sizes > 1).sum()),
-        len(key_sizes),
-        "patient_id, time_days, and feature identify more than one row",
-    )
-    value_counts = observations.groupby(observation_keys, dropna=False, observed=True)[
-        "value"
-    ].nunique(dropna=False)
-    add_quality_row(
-        "observations",
-        "conflicting_value_groups",
-        int((value_counts > 1).sum()),
-        len(value_counts),
-        "the same patient_id, time_days, and feature has multiple values",
-    )
-    group_counts = observations.groupby(observation_keys, dropna=False, observed=True)[
-        "feature_group"
-    ].nunique(dropna=False)
-    add_quality_row(
-        "observations",
-        "conflicting_feature_group_groups",
-        int((group_counts > 1).sum()),
-        len(group_counts),
-        "the same patient_id, time_days, and feature has multiple feature groups",
-    )
-    add_quality_row(
-        "observations",
-        "observation_patient_not_in_patient_table",
-        len(observation_ids - patient_ids),
-        len(observation_ids),
-        "observed patient_id is absent from the patient table",
-    )
-    pd.DataFrame(quality_rows).to_csv(output_dir / "data_quality.csv", index=False)
-
-    baseline_rows: list[dict[str, Any]] = []
-    for variable in numeric_baseline:
-        values = patients[variable]
-        observed = values.dropna()
-        baseline_rows.append(
-            {
-                "variable": variable,
-                "type": "numeric",
-                "level": pd.NA,
-                "summary": (
-                    f"{observed.median():.3g} [{observed.quantile(0.25):.3g}, "
-                    f"{observed.quantile(0.75):.3g}]; {observed.mean():.3g} "
-                    f"({observed.std():.3g}); {observed.min():.3g}–{observed.max():.3g}"
-                    if not observed.empty
-                    else "NA"
-                ),
-                "n_available": int(observed.size),
-                "n_missing": int(values.isna().sum()),
-                "missing_percent": _percent(values.isna().sum(), len(values)),
-            }
-        )
-    for variable in categorical_baseline:
-        values = _category(patients[variable])
-        missing_count = int((values == "MISSING").sum())
-        for level, count in values.value_counts(dropna=False).items():
-            baseline_rows.append(
-                {
-                    "variable": variable,
-                    "type": "categorical",
-                    "level": str(level),
-                    "summary": f"{int(count)} ({_percent(int(count), len(values)):.1f}%)",
-                    "n_available": len(values) - missing_count,
-                    "n_missing": missing_count,
-                    "missing_percent": _percent(missing_count, len(values)),
-                }
-            )
-    pd.DataFrame(baseline_rows).to_csv(output_dir / "baseline_characteristics.csv", index=False)
-
-    # ==================================================================================
-    # 三、描述DFS、OS、日历随访的一致性，以及三个landmark可用人群。
-    # ==================================================================================
-    outcome_rows: list[dict[str, Any]] = []
-
-    def add_outcome_row(
-        section: str,
-        name: str,
-        values: pd.Series,
-        events: pd.Series | None = None,
-    ) -> None:
-        observed = values.dropna()
-        event_values = events.dropna() if events is not None else None
-        outcome_rows.append(
-            {
-                "section": section,
-                "outcome_or_group": name,
-                "n": int(observed.size),
-                "events": int((event_values == 1).sum()) if event_values is not None else np.nan,
-                "event_percent": (
-                    _percent((event_values == 1).sum(), event_values.size)
-                    if event_values is not None
-                    else np.nan
-                ),
-                "minimum_days": observed.min(),
-                "q25_days": observed.quantile(0.25),
-                "median_days": observed.median(),
-                "q75_days": observed.quantile(0.75),
-                "maximum_days": observed.max(),
-                "n_negative": int((observed < 0).sum()),
-                "n_zero": int((observed == 0).sum()),
-                "n_positive": int((observed > 0).sum()),
-            }
-        )
-
-    add_outcome_row("outcome_time", "DFS", patients["dfs_time_days"], patients["dfs_event"])
-    add_outcome_row("outcome_time", "OS", patients["os_time_days"], patients["os_event"])
-    add_outcome_row("calendar_followup", "all", patients["calendar_followup_days"])
-    os_calendar_delta = patients["os_time_days"] - patients["calendar_followup_days"]
-    for event_code, label in ((0, "censored"), (1, "death")):
-        add_outcome_row(
-            "os_minus_calendar_followup",
-            label,
-            os_calendar_delta.loc[patients["os_event"] == event_code],
-        )
-    add_outcome_row("dfs_minus_os", "all", patients["dfs_time_days"] - patients["os_time_days"])
-    pd.DataFrame(outcome_rows).to_csv(output_dir / "outcome_followup_summary.csv", index=False)
-
-    landmark_rows: list[dict[str, Any]] = []
-    eligible_by_landmark: dict[int, pd.DataFrame] = {}
-    window_observations: dict[int, pd.DataFrame] = {}
-    for landmark in landmark_days:
-        eligible = patients.loc[patients["dfs_time_days"] > landmark].copy()
-        eligible_by_landmark[landmark] = eligible
-        eligible_ids = set(eligible["patient_id"].dropna())
-        window = observations.loc[
-            observations["patient_id"].isin(eligible_ids)
-            & observations["time_days"].between(0, landmark, inclusive="both")
-        ].copy()
-        window_observations[landmark] = window
-
-        per_patient = (
-            window.groupby("patient_id", observed=True)
-            .agg(
-                n_observations=("value", "size"),
-                n_dates=("time_days", "nunique"),
-                n_features=("feature", "nunique"),
-            )
-            .reindex(eligible["patient_id"])
-            .fillna(0)
-        )
-        n_bins = (
-            window.assign(time_bin=np.floor(window["time_days"] / time_bin_days).astype("Int64"))
-            .groupby("patient_id", observed=True)["time_bin"]
-            .nunique()
-            .reindex(eligible["patient_id"])
-            .fillna(0)
-        )
-        annual_segments = [
-            (
-                window["time_days"]
-                .between(start, min(start + annual_segment_days, landmark), inclusive="left")
-                .groupby(window["patient_id"], observed=True)
-                .any()
-                .reindex(eligible["patient_id"])
-                .fillna(False)
-            )
-            for start in range(0, landmark, annual_segment_days)
-        ]
-        all_segments = pd.concat(annual_segments, axis=1).all(axis=1)
-        remaining_dfs = eligible["dfs_time_days"] - landmark
-        remaining_os = eligible["os_time_days"] - landmark
-        landmark_rows.append(
-            {
-                "landmark_days": landmark,
-                "landmark_months_30day": landmark / 30,
-                "n_total": len(patients),
-                "n_dfs_eligible": len(eligible),
-                "dfs_eligible_percent": _percent(len(eligible), len(patients)),
-                "n_dfs_events_after_landmark": int((eligible["dfs_event"] == 1).sum()),
-                "dfs_events_after_landmark_percent": _percent(
-                    (eligible["dfs_event"] == 1).sum(), len(eligible)
-                ),
-                "remaining_dfs_q25_days": remaining_dfs.quantile(0.25),
-                "remaining_dfs_median_days": remaining_dfs.median(),
-                "remaining_dfs_q75_days": remaining_dfs.quantile(0.75),
-                "n_os_eligible": int((patients["os_time_days"] > landmark).sum()),
-                "n_os_events_after_landmark": int(
-                    ((patients["os_time_days"] > landmark) & (patients["os_event"] == 1)).sum()
-                ),
-                "n_with_observation": int((per_patient["n_observations"] > 0).sum()),
-                "with_observation_percent": _percent(
-                    (per_patient["n_observations"] > 0).sum(), len(eligible)
-                ),
-                "n_with_two_dates": int((per_patient["n_dates"] >= 2).sum()),
-                "with_two_dates_percent": _percent(
-                    (per_patient["n_dates"] >= 2).sum(), len(eligible)
-                ),
-                "n_with_two_time_bins": int((n_bins >= 2).sum()),
-                "with_two_time_bins_percent": _percent((n_bins >= 2).sum(), len(eligible)),
-                "n_with_every_annual_segment": int(all_segments.sum()),
-                "with_every_annual_segment_percent": _percent(all_segments.sum(), len(eligible)),
-                "median_observations_all_eligible": per_patient["n_observations"].median(),
-                "median_dates_all_eligible": per_patient["n_dates"].median(),
-                "median_features_all_eligible": per_patient["n_features"].median(),
-                "median_time_bins_all_eligible": n_bins.median(),
-                "remaining_os_median_days": remaining_os.median(),
-            }
-        )
-    pd.DataFrame(landmark_rows).to_csv(output_dir / "landmark_summary.csv", index=False)
-
-    # ==================================================================================
-    # 四、用一幅双面板KM图展示完整队列的DFS和OS，不输出重复的生存估计表。
-    # ==================================================================================
-    calendar_max = patients.loc[
-        patients["calendar_followup_days"] >= 0, "calendar_followup_days"
-    ].max()
+def _plot_survival_curves(patients: pd.DataFrame, output: Path, dpi: int) -> None:
+    """绘制基础队列的DFS和OS生存曲线及风险人数。"""
+    figure, axes = plt.subplots(1, 2, figsize=(14, 6))
+    calendar_max = float(patients["calendar_followup_days"].clip(lower=0).max())
     if pd.isna(calendar_max) or calendar_max <= 0:
         calendar_max = max(
-            patients["dfs_time_days"].quantile(0.99),
-            patients["os_time_days"].quantile(0.99),
+            patients["dfs_time_days"].quantile(0.99), patients["os_time_days"].quantile(0.99)
         )
-    display_limit_years = float(calendar_max) / 365.25
-    figure, axes = plt.subplots(1, 2, figsize=(14, 5.7))
-    for axis, outcome, event, label, title, color in (
-        (axes[0], "dfs_time_days", "dfs_event", "DFS", "Disease-free survival", "#0072B2"),
-        (axes[1], "os_time_days", "os_event", "OS", "Overall survival", "#D55E00"),
+    for axis, outcome, title in zip(
+        axes, ("dfs", "os"), ("无病生存（DFS）", "总生存（OS）"), strict=True
     ):
-        valid = patients[outcome].notna() & patients[event].isin([0, 1])
-        kmf = KaplanMeierFitter(label=label)
-        kmf.fit(
-            patients.loc[valid, outcome] / 365.25,
-            event_observed=patients.loc[valid, event],
-        )
-        kmf.plot_survival_function(ax=axis, ci_show=True, color=color, censor_styles=None)
-        axis.set_xlim(0, display_limit_years)
-        axis.set_ylim(0, 1.03)
-        axis.set_xlabel("Years since surgery")
-        axis.set_ylabel("Survival probability")
-        axis.set_title(f"{title} (n={int(valid.sum()):,})")
-        if axis.legend_ is not None:
-            axis.legend_.remove()
-        add_at_risk_counts(kmf, ax=axis, rows_to_show=["At risk"], ypos=-0.45)
-    figure.suptitle(
-        "CRC Yunnan survival experience\n"
-        "Display range follows the non-negative calendar follow-up span; "
-        "recorded maxima are in the outcome table",
-        y=1.05,
-    )
+        valid = patients[f"{outcome}_time_days"].ge(0) & patients[f"{outcome}_event"].isin([0, 1])
+        if valid.any():
+            km = KaplanMeierFitter(label=outcome.upper()).fit(
+                patients.loc[valid, f"{outcome}_time_days"] / 365.25,
+                event_observed=patients.loc[valid, f"{outcome}_event"],
+            )
+            km.plot_survival_function(ax=axis, ci_show=True)
+            axis.set_xlim(0, max(float(calendar_max) / 365.25, 0.01))
+            add_at_risk_counts(km, ax=axis, rows_to_show=["At risk"], ypos=-0.45)
+            risk_axis = figure.axes[-1]
+            ticks = risk_axis.get_xticks()
+            risk_axis.set_xticks(
+                ticks,
+                [
+                    label.get_text().replace("At risk", "风险人数")
+                    for label in risk_axis.get_xticklabels()
+                ],
+            )
+        axis.set(title=title, xlabel="手术后时间（年）", ylabel="生存概率", ylim=(0, 1.03))
+    figure.suptitle("云南结直肠癌基础队列生存曲线（阴影为95%置信区间）")
     figure.subplots_adjust(bottom=0.27, wspace=0.25)
-    _save_png(figure, output_dir, "survival_curves", dpi)
+    _save_png(figure, output, "survival_curves", dpi)
 
-    # ==================================================================================
-    # 五、展示患者观测密度与相对手术时间分布，观察长期监测数据的实际形态。
-    # ==================================================================================
-    post_window = observations.loc[observations["time_days"].between(0, max_landmark)]
-    patient_observation_counts = (
-        post_window.groupby("patient_id", observed=True)
-        .agg(
-            observations=("value", "size"),
-            dates=("time_days", "nunique"),
-            features=("feature", "nunique"),
-        )
-        .reindex(patients["patient_id"])
-        .fillna(0)
-    )
+
+def _plot_observation_patterns(
+    counts: pd.DataFrame,
+    density: pd.Series,
+    max_landmark: int,
+    bin_days: int,
+    output: Path,
+    dpi: int,
+) -> None:
+    """绘制患者观测分布与相对手术时间的观测密度。"""
     figure, axes = plt.subplots(2, 2, figsize=(13, 9))
-    for axis, metric, title, color in (
-        (axes[0, 0], "observations", "Observation records per patient", "#0072B2"),
-        (axes[0, 1], "dates", "Observed dates per patient", "#009E73"),
-        (axes[1, 0], "features", "Observed features per patient", "#CC79A7"),
-    ):
-        sns.ecdfplot(patient_observation_counts[metric], ax=axis, color=color, linewidth=2)
-        if patient_observation_counts[metric].max() > 0:
+    for axis, column in zip(axes.flat, counts.columns, strict=False):
+        sns.ecdfplot(counts[column], ax=axis)
+        if counts[column].max() > 0:
             axis.set_xscale("symlog", linthresh=1)
-        axis.set_xlabel(f"{metric.capitalize()} within 0–{max_landmark} days")
-        axis.set_ylabel("Cumulative proportion")
-        axis.set_title(title)
-
-    density_bins = np.arange(-360, max_landmark + time_bin_days, time_bin_days)
-    interval_index = pd.IntervalIndex.from_breaks(density_bins, closed="left")
-    density = (
-        observations.loc[observations["time_days"].between(-360, max_landmark)]
-        .assign(
-            time_bin=lambda frame: pd.cut(
-                frame["time_days"], bins=density_bins, right=False, include_lowest=True
-            )
+        axis.set(
+            xlabel=f"0–{max_landmark}天{column}", ylabel="累计比例", title=f"每位患者的{column}"
         )
-        .groupby("time_bin", observed=False)["patient_id"]
-        .nunique()
-        .reindex(interval_index, fill_value=0)
+    axes[1, 1].plot(
+        [(interval.left + interval.right) / 60 for interval in density.index],
+        density.to_numpy(),
+        marker="o",
     )
-    bin_centers_months = np.array([interval.mid for interval in density.index]) / 30.0
-    axes[1, 1].plot(bin_centers_months, density.to_numpy(), marker="o", color="#E69F00")
-    axes[1, 1].axvline(0, color="black", linestyle="--", linewidth=1)
-    axes[1, 1].set_xlabel("Months from surgery (30-day months)")
-    axes[1, 1].set_ylabel("Patients with ≥1 observation")
-    axes[1, 1].set_title("Patient observation density by 90-day interval")
-    figure.suptitle("Longitudinal observation patterns", y=1.01)
+    axes[1, 1].axvline(0, color="black", linestyle="--")
+    axes[1, 1].set(
+        xlabel="相对手术时间（月，每月30天）",
+        ylabel="有观测患者数",
+        title=f"每{bin_days}天的观测人数",
+    )
     figure.tight_layout()
-    _save_png(figure, output_dir, "observation_patterns", dpi)
+    _save_png(figure, output, "observation_patterns", dpi)
 
-    # ==================================================================================
-    # 六、比较完整队列与三个DFS-landmark队列的基线构成变化。
-    # ==================================================================================
-    landmark_labels = [
-        f"{days // 30}m\n(n={len(eligible_by_landmark[days]):,})" for days in landmark_days
-    ]
-    numeric_shift = pd.DataFrame(index=numeric_baseline, columns=landmark_labels, dtype=float)
-    for variable in numeric_baseline:
-        overall = patients[variable]
-        overall_iqr = overall.quantile(0.75) - overall.quantile(0.25)
-        for landmark, label in zip(landmark_days, landmark_labels, strict=True):
-            cohort_median = eligible_by_landmark[landmark][variable].median()
-            numeric_shift.loc[variable, label] = (
-                (cohort_median - overall.median()) / overall_iqr
-                if pd.notna(overall_iqr) and overall_iqr != 0
-                else np.nan
-            )
 
-    categorical_shift_rows: list[pd.Series] = []
-    categorical_shift_names: list[str] = []
-    for variable in categorical_baseline:
-        overall_values = _category(patients[variable])
-        for level in sorted(overall_values.unique().tolist()):
-            shifts: dict[str, float] = {}
-            overall_percent = _percent((overall_values == level).sum(), len(overall_values))
-            for landmark, label in zip(landmark_days, landmark_labels, strict=True):
-                cohort_values = _category(eligible_by_landmark[landmark][variable])
-                shifts[label] = (
-                    _percent((cohort_values == level).sum(), len(cohort_values)) - overall_percent
-                )
-            categorical_shift_rows.append(pd.Series(shifts))
-            categorical_shift_names.append(f"{variable} = {level}")
-    categorical_shift = pd.DataFrame(categorical_shift_rows, index=categorical_shift_names)
-
-    figure_height = max(11.0, 5.0 + 0.32 * len(categorical_shift))
-    figure = plt.figure(figsize=(11, figure_height))
-    grid = figure.add_gridspec(
+def _plot_landmark_population_shift(
+    numeric_shift: pd.DataFrame,
+    categorical_shift: pd.DataFrame,
+    outcome_label: str,
+    output: Path,
+    dpi: int,
+) -> None:
+    """用已计算的基线差异展示landmark人群变化。"""
+    figure, axes = plt.subplots(
         2,
         1,
-        height_ratios=[max(2, len(numeric_shift)), max(4, len(categorical_shift))],
-        hspace=0.35,
+        figsize=(11, max(10, 5 + 0.32 * len(categorical_shift))),
+        gridspec_kw={"height_ratios": [max(5, len(numeric_shift)), max(4, len(categorical_shift))]},
     )
-    numeric_axis = figure.add_subplot(grid[0])
-    categorical_axis = figure.add_subplot(grid[1])
-    sns.heatmap(
-        numeric_shift,
-        ax=numeric_axis,
-        cmap="vlag",
-        center=0,
-        annot=True,
-        fmt=".2f",
-        cbar_kws={"label": "Change in median / full-cohort IQR"},
-    )
-    numeric_axis.set_title("Numeric baseline shift relative to the full cohort")
-    numeric_axis.set_xlabel("")
-    numeric_axis.set_ylabel("")
-    sns.heatmap(
-        categorical_shift,
-        ax=categorical_axis,
-        cmap="vlag",
-        center=0,
-        annot=True,
-        fmt=".1f",
-        cbar_kws={"label": "Percentage-point change from full cohort"},
-    )
-    categorical_axis.set_title("Categorical baseline shift relative to the full cohort")
-    categorical_axis.set_xlabel("DFS-landmark eligible cohort")
-    categorical_axis.set_ylabel("")
-    figure.suptitle("Population composition after landmark eligibility", y=0.995)
-    _save_png(figure, output_dir, "landmark_population_shift", dpi)
+    for axis, frame, title, unit in (
+        (axes[0], numeric_shift, "连续基线相对完整队列的变化", "中位数变化 / 完整队列IQR"),
+        (axes[1], categorical_shift, "分类基线相对完整队列的变化", "比例变化（百分点）"),
+    ):
+        if not frame.empty:
+            limit = float(np.nanmax(np.abs(frame.to_numpy(dtype=float)), initial=0)) or 1.0
+            sns.heatmap(
+                frame,
+                ax=axis,
+                cmap="vlag",
+                center=0,
+                vmin=-limit,
+                vmax=limit,
+                annot=True,
+                fmt=".2f",
+                cbar_kws={"label": unit},
+            )
+        axis.set(title=title, xlabel=f"{outcome_label}-landmark合格队列", ylabel="")
+    figure.tight_layout()
+    _save_png(figure, output, "landmark_population_shift", dpi)
 
-    # ==================================================================================
-    # 七、用一幅全特征矩阵展示三个窗口及逐90天分箱的患者覆盖情况。
-    # ==================================================================================
-    coverage_matrix = pd.DataFrame(index=ordered_features, dtype=float)
-    for landmark, label in zip(landmark_days, landmark_labels, strict=True):
-        eligible = eligible_by_landmark[landmark]
-        window = window_observations[landmark]
-        denominator = len(eligible)
-        patient_feature = window.groupby("feature", observed=True)["patient_id"].nunique()
-        patient_feature_dates = (
-            window.groupby(["patient_id", "feature"], observed=True)["time_days"]
-            .nunique()
-            .ge(2)
-            .groupby("feature", observed=True)
-            .sum()
-        )
-        short_label = label.split("\n")[0]
-        coverage_matrix[f"{short_label} observed"] = (
-            patient_feature.reindex(ordered_features, fill_value=0) / denominator * 100
-        )
-        coverage_matrix[f"{short_label} ≥2 dates"] = (
-            patient_feature_dates.reindex(ordered_features, fill_value=0) / denominator * 100
-        )
 
-    for start in range(0, max_landmark, time_bin_days):
-        end = min(start + time_bin_days, max_landmark)
-        bin_eligible = patients.loc[patients["dfs_time_days"] > end]
-        bin_window = observations.loc[
-            observations["patient_id"].isin(set(bin_eligible["patient_id"].dropna()))
-            & observations["time_days"].between(start, end, inclusive="left")
-        ]
-        patient_feature = bin_window.groupby("feature", observed=True)["patient_id"].nunique()
-        coverage_matrix[f"{start // 30}–{end // 30}m"] = (
-            patient_feature.reindex(ordered_features, fill_value=0) / len(bin_eligible) * 100
-        )
-
-    figure, axis = plt.subplots(figsize=(18, max(13, 0.29 * len(coverage_matrix))))
+def _plot_feature_coverage_matrix(
+    coverage_matrix: pd.DataFrame, bin_days: int, output: Path, dpi: int
+) -> None:
+    """绘制各landmark及时间箱的特征覆盖热图。"""
+    figure, axis = plt.subplots(figsize=(18, max(5, 0.29 * len(coverage_matrix))))
     sns.heatmap(
         coverage_matrix,
         ax=axis,
         cmap="viridis",
         vmin=0,
         vmax=100,
-        cbar_kws={"label": "Eligible patients observed (%)"},
         yticklabels=True,
+        cbar_kws={"label": "合格患者覆盖率（%）"},
     )
-    _add_group_separators(axis, ordered_groups)
-    axis.set_title(
-        "Feature availability across nested landmarks and 90-day intervals\n"
-        "Each interval denominator is patients remaining DFS-event-free through its end"
+    axis.set(
+        title=f"各landmark及{bin_days}天时间箱的特征覆盖\n分母与具体人数见Excel覆盖表",
+        xlabel="观测窗口",
+        ylabel="特征（按特征组排列）",
     )
-    axis.set_xlabel("Observation window")
-    axis.set_ylabel("Feature (ordered by feature group)")
     axis.tick_params(axis="x", rotation=45)
     axis.tick_params(axis="y", rotation=0)
-    _save_png(figure, output_dir, "feature_coverage_matrix", dpi)
+    _save_png(figure, output, "feature_coverage_matrix", dpi)
 
-    # ==================================================================================
-    # 八、展示全部指标的观测量、零值/负值比例及无单位依赖的尾部分布形态。
-    # ==================================================================================
-    feature_grouped = observations.groupby("feature", observed=True)["value"]
-    value_patterns = feature_grouped.agg(
-        n_observations="size", minimum="min", median="median", maximum="max"
-    ).reindex(ordered_features)
-    quantiles = (
-        feature_grouped.quantile([0.01, 0.25, 0.75, 0.99]).unstack().reindex(ordered_features)
-    )
-    value_patterns["zero_percent"] = (
-        observations["value"]
-        .eq(0)
-        .groupby(observations["feature"], observed=True)
-        .mean()
-        .reindex(ordered_features)
-        .mul(100)
-    )
-    value_patterns["negative_percent"] = (
-        observations["value"]
-        .lt(0)
-        .groupby(observations["feature"], observed=True)
-        .mean()
-        .reindex(ordered_features)
-        .mul(100)
-    )
-    iqr = quantiles[0.75] - quantiles[0.25]
-    value_patterns["central_tail_span"] = ((quantiles[0.99] - quantiles[0.01]) / iqr).where(iqr > 0)
-    upper_gap = (value_patterns["maximum"] - quantiles[0.99]) / iqr
-    lower_gap = (quantiles[0.01] - value_patterns["minimum"]) / iqr
-    value_patterns["outer_extreme_gap"] = (
-        pd.concat([upper_gap, lower_gap], axis=1).max(axis=1).where(iqr > 0)
-    )
-    value_patterns = value_patterns.replace([np.inf, -np.inf], np.nan)
 
-    y_positions = np.arange(len(value_patterns))
-    figure, axes = plt.subplots(
-        1, 4, figsize=(19, max(13, 0.29 * len(value_patterns))), sharey=True
-    )
-    axes[0].scatter(value_patterns["n_observations"], y_positions, s=15, color="#0072B2")
-    axes[0].set_xscale("log")
-    axes[0].set_xlabel("Observation records (log scale)")
-    axes[0].set_yticks(y_positions)
-    axes[0].set_yticklabels(ordered_features, fontsize=7)
-    axes[0].invert_yaxis()
-    axes[1].scatter(
-        value_patterns["zero_percent"], y_positions, s=14, label="Zero", color="#009E73"
-    )
-    axes[1].scatter(
-        value_patterns["negative_percent"],
-        y_positions,
-        s=14,
-        label="Negative",
-        color="#D55E00",
-    )
-    axes[1].set_xlabel("Observation values (%)")
-    axes[1].legend(loc="lower right")
-    axes[2].scatter(
-        np.log1p(value_patterns["central_tail_span"].clip(lower=0)),
-        y_positions,
-        s=15,
-        color="#CC79A7",
-    )
-    axes[2].set_xlabel("log1p((Q99−Q01) / IQR)")
-    axes[3].scatter(
-        np.log1p(value_patterns["outer_extreme_gap"].clip(lower=0)),
-        y_positions,
-        s=15,
-        color="#E69F00",
-    )
-    axes[3].set_xlabel("log1p(max outer gap / IQR)")
+def _plot_feature_value_patterns(value_patterns: pd.DataFrame, output: Path, dpi: int) -> None:
+    """绘制特征观测数、零负值比例和尾部分布。"""
+    features: list[str] = value_patterns.index.tolist()
+    figure, axes = plt.subplots(1, 4, figsize=(19, max(5, 0.29 * len(features))), sharey=True)
+    y = np.arange(len(features))
+    axes[0].scatter(value_patterns["有效观测数"], y)
+    if value_patterns["有效观测数"].gt(0).to_numpy().any():
+        axes[0].set_xscale("log")
+    axes[0].set_xlabel("有效观测数（对数刻度）")
+    axes[0].set_yticks(y, features)
+    for column in ("零值比例（%）", "负值比例（%）"):
+        axes[1].scatter(value_patterns[column], y, label=column)
+    axes[1].legend()
+    axes[1].set_xlabel("实际观测值的比例（%）")
+    for axis, column in zip(axes[2:], ("中部尾跨度比", "外侧极端间距比"), strict=True):
+        axis.scatter(np.log1p(value_patterns[column].clip(lower=0)), y)
+        axis.set_xlabel(f"log1p（{column}）")
     for axis in axes:
-        axis.set_ylim(len(value_patterns) - 0.5, -0.5)
-        axis.grid(axis="y", visible=False)
-    _add_group_separators(axes, ordered_groups)
+        axis.set_ylim(len(features) - 0.5, -0.5)
     figure.suptitle(
-        "Feature value patterns without value removal or winsorization\n"
-        "Scale-free tail ratios support visual review when measurement units are unavailable",
-        y=0.995,
-    )
-    figure.tight_layout(rect=(0, 0, 1, 0.98))
-    _save_png(figure, output_dir, "feature_value_patterns", dpi)
-
-    # ==================================================================================
-    # 九、展示手术年代的队列规模、随访、结局比例及全指标覆盖变化。
-    # ==================================================================================
-    years = sorted(int(year) for year in patients["surgery_year"].dropna().unique())
-    year_index = pd.Index(years, name="surgery_year")
-    year_counts = patients.groupby("surgery_year", observed=True).size().reindex(year_index)
-    year_followup = (
-        patients.groupby("surgery_year", observed=True)["calendar_followup_days"]
-        .median()
-        .reindex(year_index)
-        / 365.25
-    )
-    year_dfs_event = (
-        patients.groupby("surgery_year", observed=True)["dfs_event"]
-        .mean()
-        .reindex(year_index)
-        .mul(100)
-    )
-    year_os_event = (
-        patients.groupby("surgery_year", observed=True)["os_event"]
-        .mean()
-        .reindex(year_index)
-        .mul(100)
-    )
-
-    observation_year = observations.loc[
-        observations["time_days"].between(0, max_landmark), ["patient_id", "feature"]
-    ].merge(
-        patients[["patient_id", "surgery_year"]],
-        on="patient_id",
-        how="inner",
-        validate="many_to_one",
-    )
-    feature_year_counts = (
-        observation_year.groupby(["feature", "surgery_year"], observed=True)["patient_id"]
-        .nunique()
-        .unstack(fill_value=0)
-    )
-    feature_year_coverage = (
-        feature_year_counts.reindex(index=ordered_features, columns=years, fill_value=0)
-        .div(year_counts, axis=1)
-        .mul(100)
-    )
-
-    figure = plt.figure(figsize=(19, max(15, 7 + 0.27 * len(ordered_features))))
-    grid = figure.add_gridspec(2, 3, height_ratios=[1, 4], hspace=0.32, wspace=0.28)
-    count_axis = figure.add_subplot(grid[0, 0])
-    followup_axis = figure.add_subplot(grid[0, 1])
-    event_axis = figure.add_subplot(grid[0, 2])
-    coverage_axis = figure.add_subplot(grid[1, :])
-    count_axis.bar(years, year_counts, color="#0072B2")
-    count_axis.set_title("Patients by surgery year")
-    count_axis.set_ylabel("Patients")
-    followup_axis.plot(years, year_followup, marker="o", color="#009E73")
-    followup_axis.set_title("Median calendar follow-up")
-    followup_axis.set_ylabel("Years")
-    event_axis.plot(years, year_dfs_event, marker="o", label="DFS event", color="#D55E00")
-    event_axis.plot(years, year_os_event, marker="o", label="Death", color="#CC79A7")
-    event_axis.set_title("Crude recorded event proportions")
-    event_axis.set_ylabel("Patients (%)")
-    event_axis.legend()
-    for axis in (count_axis, followup_axis, event_axis):
-        axis.tick_params(axis="x", rotation=45)
-    sns.heatmap(
-        feature_year_coverage,
-        ax=coverage_axis,
-        cmap="viridis",
-        vmin=0,
-        vmax=100,
-        cbar_kws={"label": f"Patients observed within 0–{max_landmark} days (%)"},
-        yticklabels=True,
-    )
-    _add_group_separators(coverage_axis, ordered_groups)
-    coverage_axis.set_title("Feature coverage by surgery year")
-    coverage_axis.set_xlabel("Surgery year")
-    coverage_axis.set_ylabel("Feature (ordered by feature group)")
-    coverage_axis.tick_params(axis="y", rotation=0)
-    figure.suptitle("Calendar-time patterns", y=0.995)
-    _save_png(figure, output_dir, "calendar_time_patterns", dpi)
-
-    # ==================================================================================
-    # 十、枚举全部可用手术年份作为时间切分点，仅展示样本、事件和随访权衡。
-    # ==================================================================================
-    cutoff_rows: list[dict[str, Any]] = []
-    for landmark in landmark_days:
-        eligible = eligible_by_landmark[landmark]
-        for cutoff in years[1:]:
-            development = eligible.loc[eligible["surgery_year"] < cutoff]
-            test = eligible.loc[eligible["surgery_year"] >= cutoff]
-            cutoff_rows.append(
-                {
-                    "landmark_days": landmark,
-                    "cutoff_year": cutoff,
-                    "development_patients": len(development),
-                    "test_patients": len(test),
-                    "development_dfs_events": int((development["dfs_event"] == 1).sum()),
-                    "test_dfs_events": int((test["dfs_event"] == 1).sum()),
-                    "test_remaining_dfs_median_years": (
-                        (test["dfs_time_days"] - landmark).median() / 365.25
-                    ),
-                }
-            )
-    cutoff_frame = pd.DataFrame(cutoff_rows)
-    figure, axes = plt.subplots(
-        len(landmark_days),
-        3,
-        figsize=(18, 4.1 * len(landmark_days)),
-        squeeze=False,
-        sharex=True,
-    )
-    for row, landmark in enumerate(landmark_days):
-        data = cutoff_frame.loc[cutoff_frame["landmark_days"] == landmark]
-        axes[row, 0].plot(
-            data["cutoff_year"],
-            data["development_patients"],
-            marker="o",
-            label="Development",
-        )
-        axes[row, 0].plot(
-            data["cutoff_year"], data["test_patients"], marker="o", label="Temporal test"
-        )
-        axes[row, 0].set_ylabel(f"{landmark // 30}m landmark\nPatients")
-        axes[row, 1].plot(
-            data["cutoff_year"],
-            data["development_dfs_events"],
-            marker="o",
-            label="Development",
-        )
-        axes[row, 1].plot(
-            data["cutoff_year"],
-            data["test_dfs_events"],
-            marker="o",
-            label="Temporal test",
-        )
-        axes[row, 1].set_ylabel("Subsequent DFS events")
-        axes[row, 2].plot(
-            data["cutoff_year"],
-            data["test_remaining_dfs_median_years"],
-            marker="o",
-            color="#009E73",
-        )
-        axes[row, 2].set_ylabel("Test median remaining DFS (years)")
-        for axis in axes[row]:
-            axis.grid(alpha=0.3)
-            axis.tick_params(axis="x", rotation=45)
-    axes[0, 0].set_title("Eligible sample allocation")
-    axes[0, 1].set_title("Subsequent event allocation")
-    axes[0, 2].set_title("Temporal-test follow-up")
-    axes[0, 0].legend()
-    axes[0, 1].legend()
-    for axis in axes[-1]:
-        axis.set_xlabel("First surgery year assigned to temporal test")
-    figure.suptitle(
-        "Temporal cutoff trade-offs across all observed surgery years\n"
-        "The figure is descriptive and does not select or reject a cutoff",
-        y=1.01,
+        "特征数值分布：保留原值，不删除或截尾\n"
+        "中部尾跨度比=(Q99−Q01)/IQR；外侧极端间距比=max(最大值−Q99, Q01−最小值)/IQR"
     )
     figure.tight_layout()
-    _save_png(figure, output_dir, "temporal_cutoff_tradeoff", dpi)
+    _save_png(figure, output, "feature_value_patterns", dpi)
 
-    print(
-        f"CRC云南EDA完成：{len(patients):,}名患者，{len(observations):,}条观测，"
-        f"结果保存至 {output_dir}"
+
+def _plot_calendar_time_patterns(
+    year_summary: pd.DataFrame,
+    year_coverage: pd.DataFrame,
+    max_landmark: int,
+    output: Path,
+    dpi: int,
+) -> None:
+    """绘制年度队列概况及按手术年份的特征覆盖。"""
+    figure = plt.figure(figsize=(18, max(9, 5 + 0.27 * len(year_coverage))))
+    grid = figure.add_gridspec(2, 3, height_ratios=[1, 3], hspace=0.4)
+    for index, columns, title in (
+        (0, ["患者数"], "手术年份与人数"),
+        (1, ["日历随访中位数（年）"], "日历随访"),
+        (2, ["DFS事件比例（%）", "OS事件比例（%）"], "粗事件比例"),
+    ):
+        axis = figure.add_subplot(grid[0, index])
+        for column in columns:
+            axis.plot(year_summary.index, year_summary[column], marker="o", label=column)
+        axis.set(title=title, xlabel="手术年份")
+        axis.legend()
+    axis = figure.add_subplot(grid[1, :])
+    sns.heatmap(
+        year_coverage,
+        ax=axis,
+        vmin=0,
+        vmax=100,
+        cmap="viridis",
+        yticklabels=True,
+        cbar_kws={"label": f"0–{max_landmark}天有观测患者比例（%）"},
     )
+    axis.set(xlabel="手术年份", ylabel="特征", title="按手术年份的特征覆盖（分母为当年全部患者）")
+    axis.tick_params(axis="y", rotation=0)
+    _save_png(figure, output, "calendar_time_patterns", dpi)
+
+
+def _plot_temporal_cutoff_tradeoff(
+    cutoff_frame: pd.DataFrame,
+    landmark_days: list[int],
+    outcome_label: str,
+    output: Path,
+    dpi: int,
+) -> None:
+    """展示各landmark下时间切点的样本、事件和随访权衡。"""
+    figure, axes = plt.subplots(
+        len(landmark_days), 3, figsize=(18, 4 * len(landmark_days)), squeeze=False
+    )
+    for row, landmark in enumerate(landmark_days):
+        data = cutoff_frame.loc[cutoff_frame["landmark（天）"] == landmark]
+        for axis, columns in zip(
+            axes[row],
+            (
+                ["开发集人数", "测试集人数"],
+                [f"开发集{outcome_label}事件数", f"测试集{outcome_label}事件数"],
+                [f"测试集剩余{outcome_label}中位数（年）"],
+            ),
+            strict=True,
+        ):
+            for column in columns:
+                axis.plot(data["时间测试集起始年份"], data[column], marker="o", label=column)
+            axis.set(xlabel="时间测试集起始手术年份", title=f"{landmark / 30:g}个月landmark")
+            axis.legend()
+    figure.suptitle("时间切点的样本、事件和随访权衡：仅作描述，不自动选择切点")
+    figure.tight_layout()
+    _save_png(figure, output, "temporal_cutoff_tradeoff", dpi)
+
+
+def run(config: CRCEDAConfig) -> None:
+    ##################################################
+    # 一、读取01基础队列及中格式矩阵；确定中文展示和统计分母。
+    ##################################################
+    output = config.paths.output_dir
+    if config.quality.refuse_overwrite and output.exists():
+        raise FileExistsError(f"拒绝覆盖既有EDA目录：{output}")
+    # 直接消费01的标准产物；读取时恢复类型，不重复校验其结构和键约束。
+    patients = pd.read_csv(config.paths.patients_csv, dtype={"patient_id": "string"})
+    metadata = pd.read_csv(config.paths.feature_metadata_csv, dtype="string").sort_values(
+        ["feature_group", "feature"]
+    )
+    features = metadata["feature"].tolist()
+    observations = pd.read_csv(
+        config.paths.observations_csv,
+        dtype={"patient_id": "string", **dict.fromkeys(["time_days", *features], "float64")},
+    )
+    patients[["surgery_date", "last_followup_date"]] = patients[
+        ["surgery_date", "last_followup_date"]
+    ].apply(pd.to_datetime)
+    patients["calendar_followup_days"] = (
+        patients["last_followup_date"] - patients["surgery_date"]
+    ).dt.days
+    patients["surgery_year"] = patients["surgery_date"].dt.year.astype("Int64")
+    matrix = observations[features]
+    outcome_label = config.outcome.upper()
+    time_column, event_column = f"{config.outcome}_time_days", f"{config.outcome}_event"
+    landmark_days = config.trajectory.landmark_days
+    bin_days, annual_days = (
+        config.trajectory.time_bin_days,
+        config.trajectory.annual_segment_days,
+    )
+    max_landmark = max(landmark_days)
+    numeric = config.columns.numeric_baseline
+    categorical = config.columns.categorical_baseline
+    patients[numeric] = patients[numeric].astype(float)
+    available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+    font = next((name for name in config.plot.font_families if name in available_fonts), None)
+    if font is None:
+        raise ValueError("未找到配置中的中文绘图字体，请安装中文字体或设置plot.font_families")
+    sns.set_theme(style="whitegrid", context="notebook", font=font)
+    plt.rcParams.update({"font.family": [font, "DejaVu Sans"], "axes.unicode_minus": False})
+    dpi = config.plot.dpi
+    output.mkdir(parents=True, exist_ok=not config.quality.refuse_overwrite)
+    tables: dict[str, pd.DataFrame] = {}
+    summary: dict[str, Any] = {
+        "统计口径": {
+            "人群": "01完成基础纳排后的队列",
+            "有效观测数": "中格式特征列中的非缺失单元格数",
+            "患者时间点数": "中格式观测表的行数",
+            "landmark": f"{outcome_label}时间严格大于landmark；观测窗口包括0和landmark两端",
+            "分箱覆盖率": f"分母为{outcome_label}时间严格大于分箱右端的患者；窗口左闭右开",
+            "分类编码": "保留源数据类别编码，不推定未提供的编码含义",
+        },
+        "队列": {
+            "患者数": len(patients),
+            "有效观测数": int(matrix.count().sum()),
+            "患者时间点数": len(observations),
+            "特征数": len(features),
+            "特征组数": int(metadata["feature_group"].nunique()),
+            "有观测患者数": int(observations["patient_id"].nunique()),
+            "无观测患者数": int((~patients["patient_id"].isin(observations["patient_id"])).sum()),
+            "最早手术日期": patients["surgery_date"].min(),
+            "最晚手术日期": patients["surgery_date"].max(),
+            "最早末次随访日期": patients["last_followup_date"].min(),
+            "最晚末次随访日期": patients["last_followup_date"].max(),
+            "观测相对手术最早天数": observations["time_days"].min(),
+            "观测相对手术最晚天数": observations["time_days"].max(),
+        },
+        "数据质量": {
+            "患者表分母": len(patients),
+            "观测时间点分母": len(observations),
+            "重复患者ID数": int(patients["patient_id"].duplicated().sum()),
+            "重复患者时间点数": int(observations.duplicated(["patient_id", "time_days"]).sum()),
+            "手术日期缺失人数": int(patients["surgery_date"].isna().sum()),
+            "末次随访日期缺失人数": int(patients["last_followup_date"].isna().sum()),
+            "随访早于手术人数": int(patients["calendar_followup_days"].lt(0).sum()),
+            "DFS时间超过OS人数": int(patients["dfs_time_days"].gt(patients["os_time_days"]).sum()),
+        },
+        "结局与随访": {},
+    }
+    for outcome, label in (("dfs", "无病生存DFS"), ("os", "总生存OS")):
+        times, events = patients[f"{outcome}_time_days"], patients[f"{outcome}_event"]
+        summary["结局与随访"][label] = {
+            "时间（天）": _distribution(times),
+            "事件数": int(events.eq(1).sum()),
+            "事件有效人数": int(events.notna().sum()),
+            "事件比例（%）": _percent(events.eq(1).sum(), events.notna().sum()),
+        }
+        summary["数据质量"][f"{label}时间缺失人数"] = int(times.isna().sum())
+        summary["数据质量"][f"{label}时间为负人数"] = int(times.lt(0).sum())
+        summary["数据质量"][f"{label}事件编码无效人数"] = int((~events.isin([0, 1])).sum())
+    summary["结局与随访"]["日历随访（天）"] = _distribution(patients["calendar_followup_days"])
+    summary["结局与随访"]["DFS减OS（天）"] = _distribution(
+        patients["dfs_time_days"] - patients["os_time_days"]
+    )
+    for code, label in ((0, "删失"), (1, "死亡")):
+        delta = patients["os_time_days"] - patients["calendar_followup_days"]
+        summary["结局与随访"][f"{label}患者OS减日历随访（天）"] = _distribution(
+            delta.loc[patients["os_event"].eq(code)]
+        )
+
+    ##################################################
+    # 二、基线、特征及landmark按各自自然维度形成表格。
+    ##################################################
+    baseline_rows: list[dict[str, Any]] = []
+    for variable in numeric:
+        values = patients[variable]
+        baseline_rows.append(
+            {
+                "变量": BASELINE_LABELS.get(variable, variable),
+                "类型": "连续",
+                "类别": "",
+                "描述": (
+                    f"{values.median():.3g} [{values.quantile(0.25):.3g}, "
+                    f"{values.quantile(0.75):.3g}]; {values.mean():.3g} ({values.std():.3g}); "
+                    f"{values.min():.3g}–{values.max():.3g}"
+                )
+                if values.notna().to_numpy().any()
+                else "缺失",
+                "有效人数": int(values.count()),
+                "缺失人数": int(values.isna().sum()),
+                "缺失率（%）": _percent(values.isna().sum(), len(values)),
+            }
+        )
+    for variable in categorical:
+        values = _category(patients[variable])
+        missing = int(values.eq("缺失").sum())
+        for level, count in values.value_counts().items():
+            baseline_rows.append(
+                {
+                    "变量": BASELINE_LABELS.get(variable, variable),
+                    "类型": "分类",
+                    "类别": level,
+                    "描述": f"{count} ({_percent(count, len(values)):.1f}%)",
+                    "有效人数": len(values) - missing,
+                    "缺失人数": missing,
+                    "缺失率（%）": _percent(missing, len(values)),
+                }
+            )
+    tables["基线特征"] = pd.DataFrame(baseline_rows)
+    summary["统计口径"]["连续基线描述"] = (
+        "中位数[下四分位数,上四分位数]；均值(标准差)；最小值–最大值"
+    )
+    quantiles = matrix.quantile([0.01, 0.25, 0.75, 0.99])
+    iqr = quantiles.loc[0.75] - quantiles.loc[0.25]
+    value_patterns = (
+        pd.DataFrame(
+            {
+                "有效观测数": matrix.count(),
+                "时间点分母": len(matrix),
+                "缺失时间点数": matrix.isna().sum(),
+                "缺失比例（%）": matrix.isna().mean() * 100,
+                "最小值": matrix.min(),
+                "中位数": matrix.median(),
+                "最大值": matrix.max(),
+                "下四分位数": quantiles.loc[0.25],
+                "上四分位数": quantiles.loc[0.75],
+                "第1百分位数": quantiles.loc[0.01],
+                "第99百分位数": quantiles.loc[0.99],
+                "零值比例（%）": matrix.eq(0).sum() / matrix.count().replace(0, np.nan) * 100,
+                "负值比例（%）": matrix.lt(0).sum() / matrix.count().replace(0, np.nan) * 100,
+                "中部尾跨度比": ((quantiles.loc[0.99] - quantiles.loc[0.01]) / iqr).where(iqr > 0),
+                "外侧极端间距比": pd.concat(
+                    [
+                        (matrix.max() - quantiles.loc[0.99]) / iqr,
+                        (quantiles.loc[0.01] - matrix.min()) / iqr,
+                    ],
+                    axis=1,
+                )
+                .max(axis=1)
+                .where(iqr > 0),
+            }
+        )
+        .reindex(features)
+        .rename_axis("特征")
+    )
+    value_patterns.insert(
+        0, "特征组", metadata.set_index("feature")["feature_group"].reindex(features)
+    )
+    tables["特征分布"] = value_patterns.reset_index()
+    eligible_by_landmark: dict[int, pd.DataFrame] = {}
+    landmark_rows: list[dict[str, Any]] = []
+    coverage_rows: list[pd.DataFrame] = []
+    coverage_matrix = pd.DataFrame(index=features)
+    for landmark in landmark_days:
+        eligible = patients.loc[patients[time_column] > landmark]
+        eligible_by_landmark[landmark] = eligible
+        window = observations.loc[
+            observations["patient_id"].isin(eligible["patient_id"])
+            & observations["time_days"].between(0, landmark)
+        ]
+        counts = _patient_counts(window, eligible["patient_id"], features)
+        bins = (
+            (window["time_days"] // bin_days)
+            .groupby(window["patient_id"])
+            .nunique()
+            .reindex(eligible["patient_id"])
+            .fillna(0)
+        )
+        segments = pd.DataFrame(
+            {
+                start: window.loc[
+                    window["time_days"].between(
+                        start, min(start + annual_days, landmark), inclusive="left"
+                    )
+                ]
+                .groupby("patient_id")
+                .size()
+                .reindex(eligible["patient_id"], fill_value=0)
+                .gt(0)
+                for start in range(0, landmark, annual_days)
+            }
+        )
+        remaining = eligible[time_column] - landmark
+        landmark_rows.append(
+            {
+                "landmark（天）": landmark,
+                "landmark（月，每月30天）": landmark / 30,
+                "完整队列人数": len(patients),
+                f"{outcome_label}合格比例（%）": _percent(len(eligible), len(patients)),
+                f"后续{outcome_label}事件比例（%）": _percent(
+                    eligible[event_column].eq(1).sum(), len(eligible)
+                ),
+                f"剩余{outcome_label}下四分位数（天）": remaining.quantile(0.25),
+                f"剩余{outcome_label}中位数（天）": remaining.median(),
+                f"剩余{outcome_label}上四分位数（天）": remaining.quantile(0.75),
+                **{
+                    f"{outcome.upper()}合格人数": int(
+                        patients[f"{outcome}_time_days"].gt(landmark).sum()
+                    )
+                    for outcome in ("dfs", "os")
+                },
+                **{
+                    f"后续{outcome.upper()}事件数": int(
+                        (
+                            patients[f"{outcome}_time_days"].gt(landmark)
+                            & patients[f"{outcome}_event"].eq(1)
+                        ).sum()
+                    )
+                    for outcome in ("dfs", "os")
+                },
+                "有观测人数": int(counts["有效观测数"].gt(0).sum()),
+                "有观测比例（%）": _percent(counts["有效观测数"].gt(0).sum(), len(eligible)),
+                "至少两个日期人数": int(counts["观测日期数"].ge(2).sum()),
+                "至少两个日期比例（%）": _percent(counts["观测日期数"].ge(2).sum(), len(eligible)),
+                "至少两个时间箱人数": int(bins.ge(2).sum()),
+                "至少两个时间箱比例（%）": _percent(bins.ge(2).sum(), len(eligible)),
+                "每个年度段均有观测人数": int(segments.all(axis=1).sum()),
+                "每个年度段均有观测比例（%）": _percent(segments.all(axis=1).sum(), len(eligible)),
+                **{f"{column}中位数（全体合格患者）": counts[column].median() for column in counts},
+            }
+        )
+        coverage = _coverage(window, features, len(eligible))
+        coverage_rows.append(coverage.reset_index().assign(**{"landmark（天）": landmark}))
+        for key, label in (
+            ("至少一次覆盖率（%）", "有观测"),
+            ("至少两次覆盖率（%）", "至少两日期"),
+        ):
+            coverage_matrix[f"{landmark / 30:g}月 {label}"] = coverage[key]
+    tables["landmark概况"] = pd.DataFrame(landmark_rows)
+    tables["窗口特征覆盖"] = pd.concat(coverage_rows, ignore_index=True)
+    bin_rows: list[pd.DataFrame] = []
+    for start in range(0, max_landmark, bin_days):
+        end = min(start + bin_days, max_landmark)
+        eligible = patients.loc[patients[time_column] > end]
+        window = observations.loc[
+            observations["patient_id"].isin(eligible["patient_id"])
+            & observations["time_days"].between(start, end, inclusive="left")
+        ]
+        coverage = _coverage(window, features, len(eligible))
+        bin_rows.append(
+            coverage.reset_index().assign(**{"分箱起点（天）": start, "分箱终点（天）": end})
+        )
+        coverage_matrix[f"{start / 30:g}–{end / 30:g}月"] = coverage["至少一次覆盖率（%）"]
+    tables["分箱特征覆盖"] = pd.concat(bin_rows, ignore_index=True)
+
+    ##################################################
+    # 三、统计患者观测模式和相对手术时间的观测密度。
+    ##################################################
+
+    post = observations.loc[observations["time_days"].between(0, max_landmark)]
+    counts = _patient_counts(post, patients["patient_id"], features)
+    summary["观测模式"] = {column: _distribution(counts[column]) for column in counts}
+    density_edges = np.arange(-360, max_landmark + bin_days, bin_days)
+    density = (
+        observations.loc[observations["time_days"].between(-360, max_landmark)]
+        .assign(时间箱=lambda frame: pd.cut(frame["time_days"], bins=density_edges, right=False))
+        .groupby("时间箱", observed=False)["patient_id"]
+        .nunique()
+    )
+    tables["观测时间密度"] = pd.DataFrame(
+        {
+            "分箱起点（天）": [interval.left for interval in density.index],
+            "分箱终点（天）": [interval.right for interval in density.index],
+            "有观测患者数": density.to_numpy(),
+        }
+    )
+
+    ##################################################
+    # 四、比较各landmark合格人群与完整队列的基线特征。
+    ##################################################
+    numeric_shift = pd.DataFrame(index=[BASELINE_LABELS.get(v, v) for v in numeric], dtype=float)
+    categorical_shift = pd.DataFrame(dtype=float)
+    for landmark, eligible in eligible_by_landmark.items():
+        label = f"{landmark / 30:g}个月"
+        for variable in numeric:
+            full = patients[variable]
+            scale = full.quantile(0.75) - full.quantile(0.25)
+            numeric_shift.loc[BASELINE_LABELS.get(variable, variable), label] = (
+                (eligible[variable].median() - full.median()) / scale if scale > 0 else np.nan
+            )
+        for variable in categorical:
+            full_values, eligible_values = (
+                _category(patients[variable]),
+                _category(eligible[variable]),
+            )
+            for level in sorted(full_values.unique()):
+                name = f"{BASELINE_LABELS.get(variable, variable)} = {level}"
+                categorical_shift.loc[name, label] = _percent(
+                    eligible_values.eq(level).sum(), len(eligible)
+                ) - _percent(full_values.eq(level).sum(), len(patients))
+    tables["连续基线变化"] = numeric_shift.rename_axis("变量").reset_index()
+    tables["分类基线变化"] = categorical_shift.rename_axis("变量及类别").reset_index()
+
+    ##################################################
+    # 五、汇总年度变化和时间切点权衡，仅作描述性比较。
+    ##################################################
+    year_summary = (
+        patients.groupby("surgery_year")
+        .agg(
+            患者数=("patient_id", "size"),
+            日历随访中位数天=("calendar_followup_days", "median"),
+            DFS事件比例=("dfs_event", "mean"),
+            OS事件比例=("os_event", "mean"),
+        )
+        .rename_axis("手术年份")
+    )
+    year_summary["日历随访中位数（年）"] = year_summary.pop("日历随访中位数天") / 365.25
+    for outcome in ("DFS", "OS"):
+        year_summary[f"{outcome}事件比例（%）"] = year_summary.pop(f"{outcome}事件比例") * 100
+    yearly_observed = post[features].notna().groupby(post["patient_id"]).any()
+    yearly_observed = yearly_observed.join(patients.set_index("patient_id")["surgery_year"])
+    year_coverage = (
+        yearly_observed.groupby("surgery_year")[features]
+        .sum()
+        .T.reindex(index=features, columns=year_summary.index, fill_value=0)
+        .div(year_summary["患者数"], axis=1)
+        * 100
+    )
+    tables["年度概况"] = year_summary.reset_index()
+    tables["年度特征覆盖"] = (
+        year_coverage.rename_axis("特征")
+        .reset_index()
+        .rename(columns={year: f"{year}年覆盖率（%）" for year in year_coverage.columns})
+    )
+    cutoff_rows: list[dict[str, Any]] = []
+    years = year_summary.index.tolist()
+    for landmark, eligible in eligible_by_landmark.items():
+        for cutoff in years[1:]:
+            development, test = (
+                eligible.loc[eligible["surgery_year"] < cutoff],
+                eligible.loc[eligible["surgery_year"] >= cutoff],
+            )
+            cutoff_rows.append(
+                {
+                    "landmark（天）": landmark,
+                    "时间测试集起始年份": cutoff,
+                    "开发集人数": len(development),
+                    "测试集人数": len(test),
+                    f"开发集{outcome_label}事件数": int(development[event_column].eq(1).sum()),
+                    f"测试集{outcome_label}事件数": int(test[event_column].eq(1).sum()),
+                    f"测试集剩余{outcome_label}中位数（年）": (
+                        test[time_column] - landmark
+                    ).median()
+                    / 365.25,
+                }
+            )
+    cutoff_frame = pd.DataFrame(
+        cutoff_rows,
+        columns=[
+            "landmark（天）",
+            "时间测试集起始年份",
+            "开发集人数",
+            "测试集人数",
+            f"开发集{outcome_label}事件数",
+            f"测试集{outcome_label}事件数",
+            f"测试集剩余{outcome_label}中位数（年）",
+        ],
+    )
+    tables["时间切点比较"] = cutoff_frame
+
+    ##################################################
+    # 六、调用各图的绘制函数，复用上述统计结果。
+    ##################################################
+    _plot_survival_curves(patients, output, dpi)
+    _plot_observation_patterns(counts, density, max_landmark, bin_days, output, dpi)
+    _plot_landmark_population_shift(numeric_shift, categorical_shift, outcome_label, output, dpi)
+    _plot_feature_coverage_matrix(coverage_matrix, bin_days, output, dpi)
+    _plot_feature_value_patterns(value_patterns, output, dpi)
+    _plot_calendar_time_patterns(year_summary, year_coverage, max_landmark, output, dpi)
+    _plot_temporal_cutoff_tradeoff(cutoff_frame, landmark_days, outcome_label, output, dpi)
+
+    ##################################################
+    # 七、保存中文JSON和包含全部汇总表的Excel工作簿。
+    ##################################################
+    # pandas负责将嵌套统计中的NaN/NaT转为null，日期转为ISO字符串。
+    payload = json.loads(pd.Series(summary).to_json(force_ascii=False, date_format="iso"))
+    (output / "eda_summary.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    with pd.ExcelWriter(output / "eda_tables.xlsx", engine="openpyxl") as writer:
+        for sheet, frame in tables.items():
+            frame.to_excel(writer, sheet_name=sheet, index=False, inf_rep="不可计算")
+            worksheet = writer.sheets[sheet]
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+            for column in worksheet.columns:
+                letter = column[0].column_letter
+                worksheet.column_dimensions[letter].width = min(
+                    48, max(14, max(len(str(cell.value or "")) for cell in column) + 2)
+                )
+    print(
+        f"CRC云南EDA完成：{len(patients):,}名患者，{int(matrix.count().sum()):,}个有效观测值；{output}"
+    )
+
+
+@hydra.main(config_path="../../configs", config_name="crc_yunnan/eda", version_base="1.3")
+def main(raw_config: DictConfig) -> None:
+    config = CRCEDAConfig.model_validate(OmegaConf.to_container(raw_config, resolve=True))
+    run(config)
 
 
 if __name__ == "__main__":

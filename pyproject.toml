@@ -50,6 +50,7 @@ dev = [
     "hydra-core>=1.3.2",
     "ipdb>=0.13.13",
     "lifelines>=0.30,<0.31",
+    "openpyxl>=3.1.5,<4",
     "optuna>=4.8.0",
     "pyright>=1.1.409",
     "pytest>=9.0.3",

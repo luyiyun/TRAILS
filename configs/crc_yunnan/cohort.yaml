@@ -1,13 +1,13 @@
 # @package _global_
 dataset: crc_yunnan
-version: v1
+version: v2
 
 paths:
   raw_root: data/real/crc_yunnan
   patients_csv: ${paths.raw_root}/surv_all_no_name.csv
   observations_csv: ${paths.raw_root}/long_combine_no_name.csv
-  derived_dir: data/derived/crc_yunnan/preprocessed/${version}
-  run_dir: outputs/crc_yunnan/preprocess/${version}
+  derived_dir: data/derived/crc_yunnan/cohort/${version}
+  run_dir: outputs/crc_yunnan/cohort_runs/${version}
 
 columns:
   export_index: "Unnamed: 0"
@@ -44,6 +44,8 @@ processing:
   same_day_aggregation: median
   exclude_invalid_surgery_date: true
   exclude_negative_outcome_time: true
+  exclude_followup_before_surgery: true
+  max_outcome_days: 7305
   outcome_time_unit_days: 30
   refuse_overwrite: true
 

@@ -23,7 +23,6 @@ from trails.metrics import cluster_assignment_diagnostics, concordance_index
 from trails_simulate.config import resolved_payload
 
 LOGGER = logging.getLogger(__name__)
-SPLIT_NAMES = ("train", "validation", "test")
 
 
 def _save_split_outputs(
@@ -69,12 +68,22 @@ def _save_split_outputs(
 
 def run(config: TrailsApplicationConfig) -> dict[str, object]:
     # ==================================================================================
-    # 一、定位冻结数据和新输出目录，只读取 train 与 validation。
+    # 一、定位04产物和新输出目录，只读取 train 及可选的 validation。
     # ==================================================================================
     split_dir = config.split.dir.resolve()
     run_dir = config.paths.dir.resolve()
     selection_dir = (run_dir / config.k_selection.result_dir).resolve()
     manifest_path = run_dir / config.outputs.summary
+    split_manifest = json.loads((split_dir / "preproc_manifest.json").read_text(encoding="utf-8"))
+    split_names = split_manifest["datasets"]
+    reserved = {"model.pt", "training_history.csv", "metrics.csv", str(config.outputs.summary)}
+    if config.n_clusters is None:
+        reserved.add(str(config.k_selection.result_dir))
+    if reserved.intersection(split_names):
+        raise ValueError("数据集名称不能与模型、指标或K选择产物冲突")
+    has_validation = "validation" in split_names
+    if not has_validation and config.n_clusters is None:
+        raise ValueError("无独立validation时必须指定固定n_clusters，不执行自动K选择")
     if config.swanlab.enabled:
         raise ValueError("CRC建模仅保存训练历史和日志，请设置swanlab.enabled=false")
     if run_dir == split_dir or split_dir in run_dir.parents:
@@ -84,20 +93,25 @@ def run(config: TrailsApplicationConfig) -> dict[str, object]:
         run_dir / "training_history.csv",
         run_dir / "metrics.csv",
         manifest_path,
-        *(run_dir / name for name in SPLIT_NAMES),
+        *(run_dir / name for name in split_names),
     ]
     if config.n_clusters is None:
         targets.append(selection_dir)
     if existing := [str(path) for path in targets if path.exists()]:
         raise FileExistsError(f"拒绝覆盖已有建模产物：{existing}")
     run_dir.mkdir(parents=True, exist_ok=True)
-    split_manifest = json.loads((split_dir / "split_manifest.json").read_text(encoding="utf-8"))
     datasets = {
         name: ClinicalTimeSeriesDataset.load(split_dir / name / "dataset.pt")
         for name in ("train", "validation")
+        if name in split_names
     }
-    train, validation = datasets["train"], datasets["validation"]
-    LOGGER.info("冻结划分 %s：train=%d，validation=%d", split_dir, len(train), len(validation))
+    train, validation = datasets["train"], datasets.get("validation")
+    LOGGER.info(
+        "预处理数据 %s：train=%d，validation=%s",
+        split_dir,
+        len(train),
+        len(validation) if validation is not None else "无",
+    )
 
     # ==================================================================================
     # 二、复用训练预设；显式传入冻结验证集，不再内部切分。
@@ -146,17 +160,19 @@ def run(config: TrailsApplicationConfig) -> dict[str, object]:
         estimator = TrailsEstimator(trails_config).fit(train, validation_data=validation)
 
     # ==================================================================================
-    # 四、锁定并保存模型后读取 test；三套基础指标使用相同风险口径。
+    # 四、锁定并保存模型后读取其余评价集；仅输出实际配置的数据集。
     # ==================================================================================
     selected_k = estimator.config.model.n_clusters
-    LOGGER.info("模型已锁定：K=%d，seed=%d；开始三套预测", selected_k, selected_seed)
+    LOGGER.info("模型已锁定：K=%d，seed=%d；开始预测 %s", selected_k, selected_seed, split_names)
     estimator.save(run_dir / "model.pt")
     save_history_csv(run_dir / "training_history.csv", estimator.history)
-    datasets["test"] = ClinicalTimeSeriesDataset.load(split_dir / "test" / "dataset.pt")
+    for name in split_names:
+        if name not in datasets:
+            datasets[name] = ClinicalTimeSeriesDataset.load(split_dir / name / "dataset.pt")
     metrics = pd.DataFrame(
         [
             {"split": name, **_save_split_outputs(run_dir, name, datasets[name], estimator)}
-            for name in SPLIT_NAMES
+            for name in split_names
         ]
     )
     metrics.to_csv(run_dir / "metrics.csv", index=False)
@@ -165,8 +181,15 @@ def run(config: TrailsApplicationConfig) -> dict[str, object]:
     # 五、最后保存简短运行引用；原数据、模型与患者结果均保留在远端。
     # ==================================================================================
     manifest: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "split_dir": str(split_dir),
+        "preproc_manifest": str(split_dir / "preproc_manifest.json"),
+        "training_scope": split_manifest["training_scope"],
+        "datasets": split_names,
+        "has_independent_validation": has_validation,
+        "evaluation_datasets": [
+            name for name in split_names if name not in {"train", "validation"}
+        ],
         "outcome": split_manifest["outcome"],
         "landmark_days": split_manifest["landmark_days"],
         "panel": split_manifest["panel"],

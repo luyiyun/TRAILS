@@ -440,6 +440,150 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
         )
 
     @classmethod
+    def from_dataframes(
+        cls,
+        *,
+        patients: pd.DataFrame,
+        observations: pd.DataFrame,
+        patient_id_col: str = "patient_id",
+        survival_time_col: str = "survival_time",
+        event_col: str = "event",
+        cluster_label_col: str | None = "cluster_label",
+        observation_id_col: str = "patient_id",
+        time_col: str = "time",
+        use_features: Sequence[str] = (),
+        description: str = "",
+        metadata: dict[str, Any] | None = None,
+        return_kind: SampleKind = "aligned",
+    ) -> ClinicalTimeSeriesDataset:
+        """从患者表和中格式观测表构建数据集，不修改输入表。
+
+        中格式每个患者—时间点一行，每个特征一列；NaN 表示未观测。按患者表
+        行顺序生成样本，患者内部按时间升序排列，缺失值填零并生成 ``mask``，
+        由时间和掩码计算 ``delta_time``。不聚合重复时间点，不拟合特征变换。
+
+        参数：
+            patients: 每位患者一行，包含 ID、生存时间、事件和可选参考簇标签。
+            observations: 包含患者 ID、时间和数值特征列的中格式表。
+            patient_id_col: 患者表 ID 列名；两表 ID 均转换为字符串后匹配。
+            survival_time_col: 正的生存时间列名。
+            event_col: 事件指示列名。
+            cluster_label_col: 可选参考簇列名；为 None 或列不存在时不使用标签。
+                类别编码为连续整数，原始类别保存在 ``cluster_label_codes`` 中。
+            observation_id_col: 观测表 ID 列名。
+            time_col: 数值时间列名；时间单位由调用方统一。
+            use_features: 特征筛选及排序；为空时使用除 ID、时间外的所有列，
+                保持观测表列顺序。选定列必须存在，允许包含全缺失特征或访视。
+            description: 数据集说明。
+            metadata: 附加元数据，同名键覆盖自动生成的患者 ID 和观测摘要等信息。
+            return_kind: 返回 ``"aligned"`` 或 ``"compact"`` 样本视图。
+
+        返回：
+            特征、时间和结局为 float32，参考簇为 long 的临床时间序列数据集。
+
+        异常：
+            KeyError: 必需列不存在。
+            ValueError: ID 缺失或重复、两表患者不对应、患者时间点重复、特征为空
+                或重复、数值不能表示为有限 float32，或样本不满足数据契约。
+        """
+        feature_names = (
+            list(use_features) or observations.columns.drop([observation_id_col, time_col]).tolist()
+        )
+        if (
+            not feature_names
+            or len(set(feature_names)) != len(feature_names)
+            or not observations.columns.is_unique
+            or {observation_id_col, time_col}.intersection(feature_names)
+        ):
+            raise ValueError("Feature columns must be nonempty, unique, and exclude ID/time.")
+        if (
+            patients[patient_id_col].isna().to_numpy().any()
+            or observations[observation_id_col].isna().to_numpy().any()
+        ):
+            raise ValueError("Patient IDs cannot be missing.")
+        patient_frame = patients.astype({patient_id_col: str}).set_index(patient_id_col)
+        observation_frame: pd.DataFrame = observations.loc[
+            :, [observation_id_col, time_col, *feature_names]
+        ].astype({observation_id_col: str, time_col: np.float32})
+        observed_ids = pd.Index(observation_frame[observation_id_col].unique())
+        if (
+            not patient_frame.index.isin(observed_ids).all()
+            or not observed_ids.isin(patient_frame.index).all()
+        ):
+            raise ValueError("Both tables must contain the same patients, each with visits.")
+        if observation_frame.duplicated([observation_id_col, time_col]).any():
+            raise ValueError("Observations must contain one row per patient and time point.")
+
+        generated_metadata: dict[str, Any] = {}
+        has_cluster_labels = cluster_label_col is not None and cluster_label_col in patient_frame
+        if has_cluster_labels:
+            encoder = LabelEncoder()
+            patient_frame[cluster_label_col] = np.array(
+                encoder.fit_transform(patient_frame[cluster_label_col].to_numpy())
+            )
+            generated_metadata["cluster_label_codes"] = encoder.classes_
+
+        grouped = observation_frame.sort_values(time_col).groupby(observation_id_col, sort=False)
+        samples: list[AlignedClinicalSample] = []
+        patient_summaries: list[dict[str, Any]] = []
+        for index, (patient_id, patient) in enumerate(patient_frame.iterrows()):
+            visits: pd.DataFrame = grouped.get_group(patient_id)  # type: ignore[reportAssignmentType]
+            matrix: pd.DataFrame = visits.loc[:, feature_names]
+            times = torch.as_tensor(visits[time_col].to_numpy(copy=True), dtype=torch.float32)
+            mask = torch.as_tensor(matrix.notna().to_numpy(copy=True), dtype=torch.float32)
+            x = torch.as_tensor(matrix.to_numpy(dtype=np.float32, na_value=np.nan))
+            x = x.masked_fill(mask == 0, 0.0)
+            outcomes = torch.tensor(
+                [patient[survival_time_col], patient[event_col]], dtype=torch.float32
+            )
+            if not all(torch.isfinite(values).all() for values in (times, x, outcomes)):
+                raise ValueError(f"Patient {patient_id!r} has non-finite time, value or outcome.")
+            samples.append(
+                AlignedClinicalSample(
+                    times=times,
+                    x=x,
+                    mask=mask,
+                    delta_time=compute_delta_time(times, mask),
+                    survival_time=outcomes[0],
+                    event=outcomes[1],
+                    cluster_label=(
+                        torch.tensor(patient[cluster_label_col], dtype=torch.long)  # type: ignore[reportGeneralTypeIssues]
+                        if has_cluster_labels
+                        else None
+                    ),
+                )
+            )
+            patient_summaries.append(
+                {
+                    "patient_id": patient_id,
+                    "sample_index": index,
+                    "n_observations": int(mask.sum()),
+                    "n_visits": len(visits),
+                    "first_time": float(times[0]),
+                    "last_time": float(times[-1]),
+                    "missing_fraction": 1 - float(mask.mean()),
+                }
+            )
+        generated_metadata.update(
+            source="dataframes",
+            patient_ids=patient_frame.index.tolist(),
+            patient_summaries=patient_summaries,
+            feature_names=feature_names,
+            n_features=len(feature_names),
+            n_patients=len(samples),
+            n_observations=int(observation_frame.loc[:, feature_names].notna().to_numpy().sum()),
+            has_cluster_labels=has_cluster_labels,
+        )
+        generated_metadata.update(metadata or {})
+        return cls(
+            samples,
+            feature_names=feature_names,
+            description=description,
+            metadata=generated_metadata,
+            return_kind=return_kind,
+        )
+
+    @classmethod
     def load_from_csv(
         cls,
         *,
@@ -460,10 +604,9 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
     ) -> ClinicalTimeSeriesDataset:
         """从患者表和长格式纵向观测表构建临床时间序列数据集。
 
-        观测按患者和时间透视为 aligned 样本，缺失位置填零并由 ``mask`` 标记；
-        ``delta_time`` 根据排序后的时间轴计算。若患者表含参考簇列，其原始类别
-        会编码为连续整数，并在元数据中保存类别编码。生成的元数据还记录列映射、
-        特征顺序、患者 ID 和患者级观测摘要。
+        读取 CSV 后将长格式透视为中格式，交给 :meth:`from_dataframes` 构建样本，
+        统一处理缺失掩码、时间差和参考簇编码。样本沿用患者在筛选后的观测文件中
+        首次出现的顺序。元数据保留 CSV 路径、列映射、特征顺序和患者级观测摘要。
 
         参数：
             patients_csv: 含患者 ID、生存时间、事件和可选参考簇的 CSV。
@@ -485,229 +628,95 @@ class ClinicalTimeSeriesDataset(Dataset[DatasetSample]):
             从两个 CSV 文件构建并校验的 :class:`ClinicalTimeSeriesDataset`。
 
         异常：
-            AssertionError: 当必需列、患者 ID 或观测表基本约束不满足时抛出。
-            ValueError: 当患者没有观测、样本值不满足契约或视图类型无效时抛出。
+            AssertionError: 当患者 ID 重复或长格式观测值缺失时抛出。
+            KeyError: 当必需列不存在时抛出。
+            ValueError: 当观测重复、患者没有观测、样本值不满足契约或视图类型
+                无效时抛出。
         """
         patients_path = Path(patients_csv)
         observations_path = Path(observations_csv)
-        metadata = dict(metadata or {})
-
-        # -----------------------------------------
-        # 1. 读取患者信息
-        # -----------------------------------------
+        na_values = [
+            "nan",
+            "+nan",
+            "-nan",
+            "inf",
+            "+inf",
+            "-inf",
+            "infinity",
+            "+infinity",
+            "-infinity",
+            " ",
+        ]
         patient_frame = pd.read_csv(
             patients_path,
-            na_values=[
-                "nan",
-                "+nan",
-                "-nan",
-                "inf",
-                "+inf",
-                "-inf",
-                "infinity",
-                "+infinity",
-                "-infinity",
-                " ",
-            ],
-        )
-        for col in [patient_id_col, survival_time_col, event_col]:
-            assert col in patient_frame.columns, f"{patients_path} must contain column {col!r}."
-
-        patient_frame = patient_frame.astype(
-            {patient_id_col: str, survival_time_col: float, event_col: float}
+            na_values=na_values,
+            dtype={patient_id_col: str, survival_time_col: float, event_col: float},
         )
         assert not patient_frame[patient_id_col].duplicated().any(), (
             f"{patients_csv} has duplicated ids."
         )
-        assert (patient_frame[survival_time_col].to_numpy() >= 0.0).any(), (
-            f"{patients_csv} must contain positive survival_time values."
-        )
-        assert bool((patient_frame[event_col].isin([0.0, 1.0])).any()), (
-            f"{patients_csv} must contain 0 or 1 event values."
-        )
-
-        has_cluster_labels = cluster_label_col is not None and cluster_label_col in patient_frame
-        if has_cluster_labels:
-            le = LabelEncoder()
-            patient_frame[cluster_label_col] = le.fit_transform(
-                patient_frame[cluster_label_col].to_numpy()
-            )
-            metadata["cluster_label_codes"] = le.classes_
-
-        assert patient_frame.shape[0] > 0, f"{patients_csv} must contain at least one patient row."
-
-        patient_frame.set_index(patient_id_col, inplace=True)
-
-        # -----------------------------------------
-        # 2. 读取纵向观测数值
-        # -----------------------------------------
         observation_frame = pd.read_csv(
             observations_path,
-            na_values=[
-                "nan",
-                "+nan",
-                "-nan",
-                "inf",
-                "+inf",
-                "-inf",
-                "infinity",
-                "+infinity",
-                "-infinity",
-                " ",
-            ],
+            na_values=na_values,
+            dtype={observation_id_col: str, time_col: float, feature_col: str, value_col: float},
         )
-        for col in [observation_id_col, time_col, feature_col, value_col]:
-            assert col in observation_frame.columns, (
-                f"{observations_csv} must contain column {col!r}."
-            )
-        # configured_features = list(feature_order)
-        # _validate_unique_names(configured_features, label="feature_order")
-        # known_patients = {str(record["patient_id"]) for record in patient_records}
-
-        observation_frame = observation_frame.astype(
-            {
-                observation_id_col: str,
-                feature_col: str,
-                value_col: float,
-                time_col: float,
-            }
-        )
-
-        unknown_patient = ~(
-            observation_frame[observation_id_col].isin(patient_frame.index.tolist())
-        )
-        assert not bool(unknown_patient.any()), f"{observations_path} contains unknown patient_ids."
-
         if use_features:
-            mask = observation_frame[feature_col].isin(use_features)
-            observation_frame: pd.DataFrame = observation_frame.loc[mask, :]
-
-        canonical_observations: pd.DataFrame = observation_frame.loc[
-            :, [observation_id_col, time_col, feature_col, value_col]
-        ].rename(
-            columns={
-                observation_id_col: "patient_id",
-                time_col: "time",
-                feature_col: "feature",
-                value_col: "value",
-            }
-        )
-
-        assert not canonical_observations.duplicated(["patient_id", "time", "feature"]).any(), (
-            f"{observations_path} contains duplicate observations."
-        )
-        assert bool(canonical_observations["value"].notna().all()), (
+            observation_frame = observation_frame.loc[
+                observation_frame[feature_col].isin(use_features), :
+            ]
+        assert bool(observation_frame[value_col].notna().all()), (
             f"{observations_path} contains invalid numeric values."
         )
 
-        # -----------------------------------------
-        # 3. 转换格式，形成dataset
-        # -----------------------------------------
+        # 一次透视为中格式，特征顺序和CSV入口原有的患者出现顺序保持不变。
         feature_names = (
             list(dict.fromkeys(use_features))
             if use_features
-            else canonical_observations["feature"].unique().tolist()
+            else observation_frame[feature_col].unique().tolist()
         )
-        grouped_observations = {
-            str(patient_id): patient_observations
-            for patient_id, patient_observations in canonical_observations.groupby(
-                canonical_observations["patient_id"],
-                sort=False,
-            )
-        }
-        missing_patient_ids = [
-            patient_id
-            for patient_id in patient_frame.index.tolist()
-            if patient_id not in grouped_observations
+        patient_order = pd.Index(observation_frame[observation_id_col].unique())
+        patient_frame = patient_frame.iloc[
+            np.argsort(patient_order.get_indexer(patient_frame[patient_id_col]), kind="stable")
         ]
-        if missing_patient_ids:
-            preview = ", ".join(str(patient_id) for patient_id in missing_patient_ids[:5])
-            suffix = (
-                "" if len(missing_patient_ids) <= 5 else f", ... ({len(missing_patient_ids)} total)"
+        middle_observations = (
+            observation_frame.pivot(
+                index=[observation_id_col, time_col], columns=feature_col, values=value_col
             )
-            raise ValueError(
-                f"Every patient must have at least one observation; missing: {preview}{suffix}"
-            )
-
-        samples = []
-        patient_summaries = []
-        for i, (pid, dfi) in enumerate(grouped_observations.items()):
-            dfi_wide = dfi.pivot(index="time", columns="feature", values="value")
-            dfi_wide.sort_index(inplace=True)
-            dfi_wide = dfi_wide.reindex(columns=feature_names)
-            mask = torch.as_tensor(dfi_wide.notna().to_numpy(copy=True), dtype=torch.float32)
-            times = torch.as_tensor(dfi_wide.index.to_numpy(copy=True), dtype=torch.float32)
-            x = torch.as_tensor(dfi_wide.fillna(0.0).to_numpy(copy=True), dtype=torch.float32)
-
-            samples.append(
-                AlignedClinicalSample(
-                    times=times,
-                    x=x,
-                    mask=mask,
-                    delta_time=compute_delta_time(times, mask),
-                    survival_time=torch.as_tensor(
-                        patient_frame.loc[pid, survival_time_col], dtype=torch.float32
-                    ),
-                    event=torch.as_tensor(patient_frame.loc[pid, event_col], dtype=torch.float32),
-                    cluster_label=(
-                        None
-                        if not has_cluster_labels
-                        else torch.as_tensor(
-                            patient_frame.loc[pid, cluster_label_col], dtype=torch.long
-                        )
-                    ),
-                )
-            )
-
-            n_observations = int(mask.sum().item())
-            total_slots = x.shape[0] * x.shape[1]
-            patient_summaries.append(
-                {
-                    "patient_id": pid,
-                    "sample_index": i,
-                    "n_observations": n_observations,
-                    "n_visits": x.shape[0],
-                    "first_time": times[0].item(),
-                    "last_time": times[-1].item(),
-                    "missing_fraction": 1.0 - (n_observations / float(total_slots)),
-                }
-            )
-
-        csv_columns = {
-            "patients": {
-                "patient_id": patient_id_col,
-                "survival_time": survival_time_col,
-                "event": event_col,
-                "cluster_label": cluster_label_col,
+            .reindex(columns=feature_names)
+            .reset_index()
+        )
+        csv_metadata = {
+            "csv_columns": {
+                "patients": {
+                    "patient_id": patient_id_col,
+                    "survival_time": survival_time_col,
+                    "event": event_col,
+                    "cluster_label": cluster_label_col,
+                },
+                "observations": {
+                    "patient_id": observation_id_col,
+                    "time": time_col,
+                    "feature": feature_col,
+                    "value": value_col,
+                },
             },
-            "observations": {
-                "patient_id": observation_id_col,
-                "time": time_col,
-                "feature": feature_col,
-                "value": value_col,
-            },
-        }
-        generated_metadata = {
-            "csv_columns": csv_columns,
-            "feature_names": feature_names,
-            "has_cluster_labels": has_cluster_labels,
-            "n_features": len(feature_names),
-            "n_observations": int(canonical_observations.shape[0]),
-            "n_patients": len(samples),
-            "observations_csv": str(observations_path),
-            "patient_ids": [str(record["patient_id"]) for record in patient_summaries],
-            "patient_summaries": patient_summaries,
             "patients_csv": str(patients_path),
+            "observations_csv": str(observations_path),
             "source": "csv",
         }
-        generated_metadata.update(metadata)
-        metadata = generated_metadata
-
-        return cls(
-            samples,
-            feature_names=feature_names,
+        csv_metadata.update(metadata or {})
+        return cls.from_dataframes(
+            patients=patient_frame,
+            observations=middle_observations,
+            patient_id_col=patient_id_col,
+            survival_time_col=survival_time_col,
+            event_col=event_col,
+            cluster_label_col=cluster_label_col,
+            observation_id_col=observation_id_col,
+            time_col=time_col,
+            use_features=feature_names,
             description=description,
-            metadata=metadata,
+            metadata=csv_metadata,
             return_kind=return_kind,
         )
 

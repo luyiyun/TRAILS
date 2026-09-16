@@ -32,6 +32,32 @@ Subtypes** 的缩写。项目目标是构建面向非同步多变量医学纵向
 
 Dataset 的 `metadata` 会保留 `latent_z`、`cluster_means`、`cluster_covariances`、`survival_coefficients` 和生成参数，方便后续仿真实验评估聚类恢复、风险区分和敏感性分析。
 
+已有中格式观测表（每个患者—时间点一行、每个特征一列）时，可直接构建数据集：
+
+```python
+import pandas as pd
+from trails import ClinicalTimeSeriesDataset
+
+dataset = ClinicalTimeSeriesDataset.from_dataframes(
+    patients=pd.DataFrame({"patient_id": ["p1"], "survival_time": [500.0], "event": [1]}),
+    observations=pd.DataFrame({
+        "patient_id": ["p1", "p1"],
+        "time_days": [0.0, 30.0],
+        "CEA": [2.0, 3.0],
+        "CA242": [float("nan"), 12.0],
+    }),
+    time_col="time_days",
+    use_features=["CEA", "CA242"],
+)
+```
+
+`from_dataframes()` 保持患者表顺序，按时间排序各患者的访视，将 NaN 转为零值和
+缺失 mask，并计算 `delta_time`；不会聚合重复时间点或拟合预处理。省略
+`use_features` 时使用观测表中除 ID、时间外的列，顺序保持不变。默认返回 aligned
+样本，也可设置 `return_kind="compact"`。患者 ID 和观测摘要自动写入 `metadata`。
+已有长格式 CSV 时使用 `load_from_csv()`：内部先透视为中格式，再调用
+`from_dataframes()`；CSV 入口保留观测文件中的患者首次出现顺序和列映射元数据。
+
 ## 命令
 
 MIMIC 比较流程以 `06_split` 生成的冻结划分为共同输入：`07_run` 和
@@ -274,3 +300,60 @@ uv run ruff check --fix
 UV_CACHE_DIR=/tmp/uv-cache uv run pyright
 UV_CACHE_DIR=/tmp/uv-cache uv run pytest
 ```
+
+
+## CRC 云南五阶段流程
+
+新产物使用 `v2`，旧目录不覆盖。观测表统一为中格式：
+`patient_id,time_days,特征1,特征2,...`；缺失观测保留 NaN。
+
+```bash
+uv run python -m scripts.crc_yunnan.01_cohort
+uv run python -m scripts.crc_yunnan.02_eda
+uv run python -m scripts.crc_yunnan.03_split
+uv run python -m scripts.crc_yunnan.04_preproc
+uv run python -m scripts.crc_yunnan.05_run
+```
+
+01 完成基础清洗与纳排，另存特征分组和中文排除汇总。02 输出中文
+`eda_summary.json`、`eda_tables.xlsx` 和七类图。03 只保存患者划分与原始尺度
+CSV；04 选择结局、窗口及固定面板，仅在训练观测上拟合变换，再保存中格式和
+建模张量。05 读取 04 的 `preproc_manifest.json`，只对存在的数据集输出结果。
+02 的 `outcome` 控制 landmark 人群、覆盖率分母和时间切点比较，默认与本轮
+建模一致使用 OS；完整队列生存曲线仍同时展示 DFS 和 OS。
+各命令的 YAML 位于 `configs/crc_yunnan/`，旧长格式和旧编号入口不再使用。
+
+默认 03 同时生成 random 和 temporal-2017，默认 04/05 使用 random。
+预处理时间划分时，同时设置输入和独立输出目录：
+
+```bash
+uv run python -m scripts.crc_yunnan.04_preproc \
+  inputs.split_dir=data/derived/crc_yunnan/splits/v2/temporal-2017/seed-20260908 \
+  paths.dir=data/derived/crc_yunnan/preproc/v2/os/landmark-24m/E60/auto-log1p-robust/temporal-2017/seed-20260908
+uv run python -m scripts.crc_yunnan.05_run split.strategy=temporal-2017
+```
+
+### 全样本固定 K 训练
+
+以下命令先仅保存完整基础队列，再按默认 OS、24 个月和 E60 规则形成全体合格
+患者。若同时需要普通划分，去掉第一条命令中的 `split.strategies=[]`。
+
+```bash
+uv run python -m scripts.crc_yunnan.03_split \
+  'split.strategies=[]' split.save_full_dataset=true
+uv run python -m scripts.crc_yunnan.04_preproc \
+  inputs.train_dir=data/derived/crc_yunnan/splits/v2/full \
+  'inputs.test_dirs=[]' paths.dir=data/derived/crc_yunnan/preproc/v2/full-e60
+uv run python -m scripts.crc_yunnan.05_run \
+  split.dir=data/derived/crc_yunnan/preproc/v2/full-e60 n_clusters=3
+```
+
+04 的 `inputs.test_dirs` 可包含一个或多个目录，例如 validation 与 test；省略该
+字段或设置空列表时只处理训练集。其他数据集沿用输入目录末级名称，`validation`
+专用于早停和模型选择。每个目录必须是 03 的产物，且输入患者互斥。
+无独立 validation 时，05 要求固定 K，关闭内部划分，并按训练指标早停；其结果
+是训练数据上的描述，不是独立验证。更换预处理方案时选择新的 `paths.dir`，
+随后将该目录传给 05 的 `split.dir`。
+
+探索入口顺延为 `05_explore.sh` 和 `05_explore_preprocessing.sh`；后者先运行一次
+03，再对同一划分运行 36 套预处理和各两个训练 seed，测试预测不进入探索汇总。

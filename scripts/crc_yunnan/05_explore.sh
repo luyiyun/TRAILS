@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 在项目根目录运行：bash scripts/crc_yunnan/04_explore.sh <全新输出目录>
-# 仅通过CLI重复调用原版04_run.py；test产物会生成，但不进入调参汇总。
+# 在项目根目录运行：bash scripts/crc_yunnan/05_explore.sh <全新输出目录>
+# 仅通过CLI重复调用原版05_run.py；test产物会生成，但不进入调参汇总。
 set -euo pipefail
 
 output_root="${1:?请指定全新输出目录}"
@@ -12,8 +12,8 @@ if [[ -e "$output_root" ]]; then
 fi
 mkdir -p "$output_root"
 output_root="$(cd "$output_root" && pwd)"
-p0="${CRC_P0_SPLIT:-data/derived/crc_yunnan/splits/v1/dfs/landmark-12m/D20/random/seed-20260908}"
-p1="${CRC_P1_SPLIT:-data/derived/crc_yunnan/splits/v1/dfs/landmark-12m/D20/auto-log1p-robust/random/seed-20260908}"
+p0="${CRC_P0_SPLIT:-data/derived/crc_yunnan/preproc/v2/dfs/landmark-12m/D20/none-robust/random/seed-20260908}"
+p1="${CRC_P1_SPLIT:-data/derived/crc_yunnan/preproc/v2/dfs/landmark-12m/D20/auto-log1p-robust/random/seed-20260908}"
 reference_args=(n_clusters=3)
 groups=()
 completed=0
@@ -29,7 +29,7 @@ fit_group() {
             "$completed" "$stage" "$label" "$seed" > "$output_root/current_run.txt"
         printf '探索进度 %s/38：%s %s seed=%s\n' "$completed" "$stage" "$label" "$seed"
         started=$(date +%s)
-        uv run python -m scripts.crc_yunnan.04_run model=base trainer=full \
+        uv run python -m scripts.crc_yunnan.05_run model=base trainer=full \
             trainer.valid_size=0.0 trainer.cindex_risk_score=median_survival \
             swanlab.enabled=false "${reference_args[@]}" "$@" "${smoke_overrides[@]}" \
             n_clusters=3 "trainer.seed=$seed" "paths.dir=$group/seed-$seed"
@@ -46,7 +46,7 @@ fit_group() {
 summarize() {
     local summary="$1" reference="$2"
     shift 2
-    # 此处仅汇总04的既有输出，不训练模型、不读取test指标或test预测。
+    # 此处仅汇总05的既有输出，不训练模型、不读取test指标或test预测。
     uv run python - "$output_root/$summary" "$reference" "$@" <<'PY'
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ for directory in sys.argv[3:]:
             assert left == right and previous.model == cfg.model and previous.split == cfg.split
         else:
             configs[directory] = cfg
-        # 原04按train/validation/test写表；只解析前两行，test行不读取。
+        # 05按train/validation/test写表；只解析前两行，test行不读取。
         metrics = pd.read_csv(run_dir / "metrics.csv", nrows=2).set_index("split")
         assert metrics.index.tolist() == ["train", "validation"]
         valid = metrics.loc["validation"]

@@ -1,11 +1,13 @@
 # @package _global_
 dataset: crc_yunnan
-version: v1
+version: v2
+outcome: os
 
 paths:
-  preprocessed_root: data/derived/crc_yunnan/preprocessed/${version}
-  patients_csv: ${paths.preprocessed_root}/patients.csv
-  observations_csv: ${paths.preprocessed_root}/observations.csv
+  cohort_root: data/derived/crc_yunnan/cohort/${version}
+  patients_csv: ${paths.cohort_root}/patients.csv
+  observations_csv: ${paths.cohort_root}/observations.csv
+  feature_metadata_csv: ${paths.cohort_root}/feature_metadata.csv
   output_dir: outputs/crc_yunnan/eda/${version}
   run_dir: outputs/crc_yunnan/eda_runs/${version}
 
@@ -25,7 +27,7 @@ trajectory:
 
 plot:
   dpi: 220
-  font_families: ["Noto Sans CJK JP", "DejaVu Sans"]
+  font_families: ["Noto Sans CJK SC", "Noto Sans CJK JP", "PingFang SC", "Songti SC", "Microsoft YaHei", "SimHei"]
 
 hydra:
   job:

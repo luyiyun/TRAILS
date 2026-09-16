@@ -4,16 +4,16 @@ defaults:
   - /trainer: full
   - _self_
 
-description: "CRC Yunnan DFS TRAILS analysis on frozen splits"
+description: "CRC Yunnan TRAILS analysis on preprocessed datasets"
 split:
   seed: 20260908
   # 改为 temporal-2017 即读取同版本的时间划分；每次只运行一套。
   strategy: random
-  dir: data/derived/crc_yunnan/splits/v1/dfs/landmark-12m/E60/auto-log1p-robust/${split.strategy}/seed-${split.seed}
+  dir: data/derived/crc_yunnan/preproc/v2/os/landmark-24m/E60/auto-log1p-robust/${split.strategy}/seed-${split.seed}
 
-# 使用选定的E60、auto-log1p、robust预处理方案，固定K=3。
-# 设为null时才启用下面的K选择；整数使用trainer.seed训练固定K。
-n_clusters: 3
+# 使用OS、24个月landmark、E60、auto-log1p、robust预处理方案。
+# null启用下面的K选择；整数使用trainer.seed训练固定K。
+n_clusters: null
 k_selection:
   enabled: true
   candidate_clusters: [2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -39,7 +39,7 @@ trainer:
   learning_rate: 1e-3
   warmup_epochs: 10
   gmm_init_iters: 5
-  # 使用负对数预测中位DFS时间排序；不使用risk_horizon，也不截断随访。
+  # 使用负对数预测中位OS时间排序；不使用risk_horizon，也不截断随访。
   cindex_risk_score: median_survival
 artifacts:
   names: [history]
@@ -48,7 +48,7 @@ swanlab:
 outputs:
   summary: run_manifest.json
 paths:
-  dir: outputs/crc_yunnan/modeling/dfs12-e60-${split.strategy}-${now:%Y%m%d-%H%M%S-%f}
+  dir: outputs/crc_yunnan/modeling/run-${now:%Y%m%d-%H%M%S-%f}
 
 hydra:
   job:

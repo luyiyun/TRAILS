@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# 在项目根目录运行：bash scripts/crc_yunnan/04_explore_preprocessing.sh <全新输出目录>
-# 36套预处理、固定K=3、两个训练seed；失败后继续，test产物不进入探索汇总。
+# 在项目根目录运行：bash scripts/crc_yunnan/05_explore_preprocessing.sh <全新输出目录>
+# 一次划分、36套预处理、固定K=3、两个训练seed；失败后继续，test产物不进入探索汇总。
 set -euo pipefail
 umask 077
 
 # 一、检查入口并隔离本轮输出；保留既有源数据、主划分和探索结果。
 if [[ "$#" -ne 1 ]]; then
-    printf '用法：bash scripts/crc_yunnan/04_explore_preprocessing.sh <全新输出目录>\n' >&2
+    printf '用法：bash scripts/crc_yunnan/05_explore_preprocessing.sh <全新输出目录>\n' >&2
     exit 1
 fi
-if [[ ! -f scripts/crc_yunnan/03_split.py || ! -f scripts/crc_yunnan/04_run.py ]]; then
+if [[ ! -f scripts/crc_yunnan/03_split.py || ! -f scripts/crc_yunnan/04_preproc.py || ! -f scripts/crc_yunnan/05_run.py ]]; then
     printf '请在TRAILS项目根目录运行。\n' >&2
     exit 1
 fi
@@ -22,7 +22,7 @@ fi
 mkdir -p -- "$(dirname -- "$output_root")"
 mkdir -- "$output_root"
 output_root="$(cd -- "$output_root" && pwd -P)"
-mkdir -- "$output_root/splits" "$output_root/split_summaries" "$output_root/runs" \
+mkdir -- "$output_root/preproc" "$output_root/runs" \
     "$output_root/logs" "$output_root/summary"
 panels=(A2 B8 C12 D20 E60 F88)
 transforms=(none auto-log1p)
@@ -77,7 +77,7 @@ run_logged() {
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$stage" "$panel" "$transform" "$scaling" "$seed" "$status" "$call_exit" \
         "$elapsed" "$log_path" "$output_path" "$reason" >> "$output_root/progress.csv"
-    if [[ "$stage" == split ]]; then
+    if [[ "$stage" == preproc ]]; then
         splits_finished=$((splits_finished + 1))
     else
         runs_finished=$((runs_finished + 1))
@@ -88,26 +88,30 @@ run_logged() {
         "$stage" "$group" "$seed" "$status" "$call_exit" "$elapsed"
 }
 
-# 二、逐组合冻结random数据，再串行训练两个seed；只改变预处理与训练seed。
+# 二、基础队列仅划分一次；随后复用同一患者归属生成一次划分、36套预处理产物。
+uv run python -m scripts.crc_yunnan.03_split \
+    'split.strategies=[random]' 'split.seeds=[20260908]' \
+    "paths.dir=$(hydra_string "$output_root/raw_splits")" \
+    "paths.run_dir=$(hydra_string "$output_root/logs/split_hydra")"
+raw_split="$output_root/raw_splits/random/seed-20260908"
 for panel in "${panels[@]}"; do
     for transform in "${transforms[@]}"; do
         for scaling in "${scalings[@]}"; do
             variant="$transform-$scaling"
             group="$panel/$variant"
-            split_path="splits/$group/random/seed-20260908"
+            split_path="preproc/$group/random/seed-20260908"
             split_log="logs/$group/split.log"
-            run_logged split 20260908 "$split_path" "$split_log" \
-                uv run python -m scripts.crc_yunnan.03_split \
+            run_logged preproc 20260908 "$split_path" "$split_log" \
+                uv run python -m scripts.crc_yunnan.04_preproc \
                 outcome=dfs landmark_months=12 "features.panel=$panel" \
                 "preprocessing.name=$variant" "preprocessing.log_transform=$transform" \
                 preprocessing.skew_threshold=1.0 "preprocessing.scaling=$scaling" \
-                'split.strategies=[random]' 'split.seeds=[20260908]' \
-                "paths.dir=$(hydra_string "$output_root/splits/$group")" \
-                "paths.output_dir=$(hydra_string "$output_root/split_summaries/$group")" \
-                "paths.run_dir=$(hydra_string "$output_root/logs/$group/split_hydra")"
+                "inputs.split_dir=$(hydra_string "$raw_split")" \
+                "paths.dir=$(hydra_string "$output_root/$split_path")" \
+                "paths.run_dir=$(hydra_string "$output_root/logs/$group/preproc_hydra")"
             if [[ "$call_exit" -ne 0 ]]; then
                 for seed in "${seeds[@]}"; do
-                    printf 'run,%s,%s,%s,%s,skipped,,,%s,%s,split_failed\n' \
+                    printf 'run,%s,%s,%s,%s,skipped,,,%s,%s,preproc_failed\n' \
                         "$panel" "$transform" "$scaling" "$seed" "$split_log" \
                         "runs/$group/seed-$seed" >> "$output_root/progress.csv"
                     skipped_runs=$((skipped_runs + 1))
@@ -117,7 +121,7 @@ for panel in "${panels[@]}"; do
             fi
             for seed in "${seeds[@]}"; do
                 run_logged run "$seed" "runs/$group/seed-$seed" "logs/$group/seed-$seed.log" \
-                    uv run python -m scripts.crc_yunnan.04_run model=base trainer=full \
+                    uv run python -m scripts.crc_yunnan.05_run model=base trainer=full \
                     n_clusters=3 split.strategy=random split.seed=20260908 \
                     "split.dir=$(hydra_string "$output_root/$split_path")" \
                     model.latent_dim=32 trainer.batch_size=128 trainer.learning_rate=1e-3 \
@@ -147,7 +151,7 @@ from sklearn.metrics import adjusted_rand_score
 root = Path(sys.argv[1]).resolve()
 output = root / "summary"
 progress = pd.read_csv(root / "progress.csv", dtype={"exit_code": "Int64", "wall_seconds": "Int64"})
-split_steps = progress.loc[progress.stage.eq("split")]
+split_steps = progress.loc[progress.stage.eq("preproc")]
 run_steps = progress.loc[progress.stage.eq("run")]
 assert len(split_steps) == 36 and len(run_steps) == 72
 failure_steps = progress.loc[~progress.status.eq("success")]
@@ -163,22 +167,22 @@ training_config: dict[str, Any] | None = None
 for step in split_steps.loc[split_steps.status.eq("success")].to_dict(orient="records"):
     group = f"{step['panel']}/{step['log_transform']}-{step['scaling']}"
     bundle = root / step["output_path"]
-    manifest = json.loads((bundle / "split_manifest.json").read_text())
+    manifest = json.loads((bundle / "preproc_manifest.json").read_text())
     assert manifest["panel"] == step["panel"] and len(manifest["feature_order"]) == int(
         step["panel"][1:]
     )
-    assert manifest["strategy"] == "random" and manifest["seed"] == 20260908
+    assert Path(manifest["source_datasets"]["train"]).parent == root / "raw_splits/random/seed-20260908"
     assert manifest["outcome"] == "dfs" and manifest["landmark_days"] == 360
     preprocessing = manifest["preprocessing"]
     assert preprocessing["log_transform"] == step["log_transform"]
     assert preprocessing["scaling"] == step["scaling"] and preprocessing["skew_threshold"] == 1.0
     if assignment_manifest is None:
-        assignment_manifest = manifest["assignment_manifest"]
-    assert manifest["assignment_manifest"] == assignment_manifest, "须复用相同患者主划分"
+        assignment_manifest = manifest["assignment_manifests"][0]
+    assert manifest["assignment_manifests"][0] == assignment_manifest, "须复用相同患者主划分"
     for name in ("train", "validation", "test"):
         ids = cast(
             pd.Series,
-            pd.read_csv(bundle / f"{name}_ids.csv", dtype={"patient_id": "string"})["patient_id"],
+            pd.read_csv(bundle / name / "ids.csv", dtype={"patient_id": "string"})["patient_id"],
         )
         assert ids.notna().all() and ids.is_unique
         ordered = pd.Index(ids).sort_values()
@@ -219,7 +223,7 @@ for step in run_steps.to_dict(orient="records"):
         assert manifest["selected_k"] == 3 and manifest["selected_seed"] == step["seed"]
         assert (
             Path(manifest["split_dir"]).resolve()
-            == root / "splits" / group / "random/seed-20260908"
+            == root / "preproc" / group / "random/seed-20260908"
         )
         cfg = OmegaConf.load(run_dir / ".hydra/config.yaml")
         assert isinstance(cfg, DictConfig)
@@ -231,7 +235,7 @@ for step in run_steps.to_dict(orient="records"):
         if training_config is None:
             training_config = cast(dict[str, Any], protocol)
         assert protocol == training_config, "各组须使用同一模型与训练配置，只有seed不同"
-        # 原04按train/validation/test写表；限定解析前两行，test行不进入数据框。
+        # 05按train/validation/test写表；限定解析前两行，test行不进入数据框。
         metrics = pd.read_csv(run_dir / "metrics.csv", nrows=2).set_index("split")
         assert metrics.index.tolist() == ["train", "validation"]
         for name in ("train", "validation"):
