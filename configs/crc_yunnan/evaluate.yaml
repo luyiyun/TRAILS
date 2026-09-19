@@ -1,0 +1,34 @@
+# @package _global_
+inputs:
+  run_dir: ???
+datasets: [train, validation, test]
+columns:
+  numeric_baseline: [Preoperative_CEA, Preoperative_CA242, Age]
+  categorical_baseline: [Sex, Primary_site, Surgical_approach, Tumor_differentiation,
+    AJCC_8th_ed_Stage, Lymph_node_yield, Mucinous_colloid_type, Lymphovascular_invasion,
+    Perineural_invasion, Adjuvant_chemotherapy]
+umap:
+  n_neighbors: 15
+  min_dist: 0.1
+  metric: euclidean
+  seed: 20260908
+survival:
+  months: [12, 36, 60]
+  curve_step_months: 1
+  calibration_bins: 5
+trajectory_bin_days: 90
+trajectory_panels_per_page: 12
+fisher_resamples: 10000
+seed: 20260908
+device: cuda:0
+plot:
+  dpi: 220
+  font_families: ["Noto Sans CJK SC", "Noto Sans CJK JP", "PingFang SC", "Songti SC", "Microsoft YaHei", "SimHei"]
+paths:
+  dir: ${inputs.run_dir}/../evaluation
+  run_dir: ${inputs.run_dir}/../logs/06_evaluate
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.run_dir}

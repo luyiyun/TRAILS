@@ -302,7 +302,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run pytest
 ```
 
 
-## CRC 云南五阶段流程
+## CRC 云南六阶段流程
 
 新产物使用 `v2`，旧目录不覆盖。观测表统一为中格式：
 `patient_id,time_days,特征1,特征2,...`；缺失观测保留 NaN。
@@ -313,6 +313,7 @@ uv run python -m scripts.crc_yunnan.02_eda
 uv run python -m scripts.crc_yunnan.03_split
 uv run python -m scripts.crc_yunnan.04_preproc
 uv run python -m scripts.crc_yunnan.05_run
+uv run python -m scripts.crc_yunnan.06_evaluate inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling
 ```
 
 01 完成基础清洗与纳排，另存特征分组和中文排除汇总。02 输出中文
@@ -357,3 +358,121 @@ uv run python -m scripts.crc_yunnan.05_run \
 
 探索入口顺延为 `05_explore.sh` 和 `05_explore_preprocessing.sh`；后者先运行一次
 03，再对同一划分运行 36 套预处理和各两个训练 seed，测试预测不进入探索汇总。
+
+### OS 分阶段探索（测试集参与选优）
+
+`05_explore_os.sh` 复用现有 random 划分，通过 04/05/06 的 Hydra 参数探索，
+不改默认配置。OS 固定，比较 12/24 个月 landmark、六套面板、log 与缩放方式，
+随后比较训练参数、少量结构及组合，最后对四个入围方案补齐三个 seed。
+阶段 A/B/C/D/E 最多新增 48/8/26/6/8 次完整训练；已有相同配置复用。
+每次训练保持主训练最多 300 epoch、最少 100 epoch、patience=30，验证集用于早停。
+
+```bash
+bash scripts/crc_yunnan/05_explore_os.sh outputs/crc_yunnan/<探索名> --dry-run
+bash scripts/crc_yunnan/05_explore_os.sh outputs/crc_yunnan/<探索名>
+# 中断后使用完全相同的脚本、配置、路径和预算继续：
+bash scripts/crc_yunnan/05_explore_os.sh outputs/crc_yunnan/<探索名> --resume
+```
+
+默认输入 `data/derived/crc_yunnan/splits/v2/random/seed-20260908`，可用
+`--split-dir` 指定另一份既有 random 划分。默认预算 15 小时，可用
+`--budget-hours` 缩短；达到重复训练和评价的预留边界后，不再启动新的探索组合，
+保留完整单次训练预算。实际时长会受 GPU、面板及早停影响，当前训练不会被强行终止。
+`--dry-run` 只验证全部参数模板，不创建结果目录；自适应阶段的入围名单由实际指标决定。
+
+本轮明确以测试集参与选优，结果属于探索证据。预测榜按**术后**3/5年平均 AUC 排序，
+并列时比较 C-index、较低 Brier；综合榜在每个 landmark 内将 AUC 与
+`−log10(log-rank p)` 百分位等权评分。12个月窗口预测未来24/48个月，24个月窗口
+预测未来12/36个月。缺失指标保留原因并排末位；空簇、小簇只标记，不排除预测结果。
+同一模型同时评价两个时间点，不因预测时点重复训练。
+
+输出目录包含 `preproc/`、`runs/`、`evaluation/`、`logs/` 和 `summary/`。
+`progress.csv`、`current_run.txt` 显示任务、命令、状态和当前日志；`plan.json`
+冻结各阶段实际入围名单。失败组合保留 traceback，其他组合继续；续跑复用完成产物，
+未完成尝试另存目录。中文 `summary/exploration_tables.xlsx` 汇总全部指标、校准、
+簇人数、排行榜、跨 seed ARI、重复结果及运行记录，摘要说明缺失和预算跳过项。
+四个最终方案各选择综合表现最好的 seed 运行完整 06，三个 seed 的统计全部保留。
+06 原有图的月份仍从 landmark 起算，探索汇总另列对应术后月份；06 中的“独立评价集”
+仅描述输入来源，本轮 test 已参与选优。取回仅限聚合表、图、摘要和安全日志，
+模型、患者表和预测留在远端。
+
+### OS 三因素并行探索
+
+`05_explore_os_training.sh` 固定 OS、12个月 landmark、D20、auto-log1p/robust，
+复用同一份 random 划分，只预处理一次。batch size 固定128，learning rate继承
+默认配置（当前0.001），主训练保持100–300轮、验证损失早停、patience=30。
+原有 `05_explore_os.sh` 保留。
+
+```bash
+bash scripts/crc_yunnan/05_explore_os_training.sh outputs/crc_yunnan/<新探索名> --dry-run
+bash scripts/crc_yunnan/05_explore_os_training.sh outputs/crc_yunnan/<新探索名> --workers 3
+# 续跑可调整并发数；实验参数、脚本、目录和预算必须保持一致。
+bash scripts/crc_yunnan/05_explore_os_training.sh outputs/crc_yunnan/<新探索名> --resume --workers 2
+```
+
+默认 `--split-dir` 为 `data/derived/crc_yunnan/splits/v2/random/seed-20260908`，
+`--workers` 支持1/2/3，默认3，同一张 `cuda:0` 上运行独立进程。
+默认 `--budget-hours 15`，可缩短；按并发下实测耗时预留最终K选择及评价时间。
+已开始的任务不因预算缩短训练。并行提速取决于GPU利用率和资源竞争，
+内存不足时可保留结果并以较低并发续跑，不会自动改batch size。
+
+探索分为四阶段，每个阶段完成后统一排序并冻结下一阶段，完成顺序不影响选优：
+
+| 阶段 | 探索内容 | 新增训练上限 |
+| --- | --- | ---: |
+| A | `uncertainty`/`fixed`各比较9个权重比例；重建=1，生存=0.05/0.2/1，聚类=0.02/0.1/0.5 | 18 |
+| B | 每种方式选出最佳比例，分别比较warmup=5/10/30、初始化迭代=5/20/50；基准复用 | 8 |
+| C | 每种方式组合较优warmup与初始化设置；相同配置复用 | 2 |
+| D | 每种方式选一个方案，以K=2–10和三个seed执行现有05选择 | 54 |
+
+正常完成最多82次训练，不含失败或中断后的重新尝试。A–C固定K=3、seed=20260909，
+A阶段warmup=10、初始化迭代=5。`uncertainty` 的比例只是初始值，实际权重继续学习；
+`gmm_init_iters` 指一次K-means初始化的迭代轮数，不是独立重启次数。
+D使用seed 20260909/20260908/20260910，最多同时运行两个K选择进程，各自内部串行，
+沿用one-standard-error及三个seed均无空簇、最小簇比例至少5%的门槛。
+计算验证集跨seed ARI但不增加ARI门槛。没有合格K时保留科学结论，不放宽门槛。
+
+A–C沿用test参与选优的综合榜：术后3/5年平均AUC和`−log10(log-rank p)`百分位等权，
+并列比较AUC、C-index、较低Brier及稳定方案ID，缺失百分位为0。
+K本身只用train/validation选择，代表seed沿用05的验证指标排序。
+入选K的三个已保存模型用于重复统计，无额外训练；每个成功方案的代表模型运行完整06。
+全部结果属于探索证据，不是独立测试评价。
+
+`plan.json`冻结阶段名单并保存续跑状态，`progress.csv`记录每次尝试，
+`current_run.txt`以JSON列出当前所有任务及PID、日志。普通任务错误停止新任务派发，
+已运行任务收尾，原始traceback保留。续跑复用完整产物，未完成尝试另开目录。
+`summary/`提供中文Excel、JSON摘要及PNG/PDF图，包含预测、簇占用、K选择、
+跨seed ARI、逐轮原始损失与实际权重，以及相对同加权方式默认K3基准的差异。
+单seed筛选与三seed结果分开报告，预算跳过阶段明确标记。核心汇总先于完整06保存，
+即使06遇到Cox收敛等错误，已有探索结果仍保留，原始错误继续上抛。
+模型、预测及患者表留在执行服务器。
+`--dry-run`只解析候选配置，不读取真实数据、创建结果目录或启动训练。
+
+### 评价与可视化
+
+06 用 `CRCEvaluationConfig` 解析 Hydra 配置，只需指定 `inputs.run_dir`。它从 05
+运行清单追溯 04 数据、01 特征分组及候选模型，沿用已锁定的 K、seed、结局、
+面板和 landmark。默认评价 train、validation、test；单集使用 `'datasets=[train]'`。
+默认输出建模目录同级的 `evaluation/`，日志位于 `logs/06_evaluate/`，拒绝覆盖旧结果。
+
+产物包括中文 `evaluation_summary.json`、一个 `evaluation_tables.xlsx`，以及 PNG/PDF
+图：簇规模、后验置信度/熵、UMAP、KM及风险人数、校正Cox、全部基线变量、全部面板
+特征的轨迹和覆盖率、生存预测/校准、训练过程、K选择和跨seed ARI。单张长绘图封装
+于 `evaluation_plots.py`；各数据集复用的统计位于 `evaluation.py`。
+
+- UMAP仅在训练embedding上拟合，其他集调用同一投影器的transform；二维形状不作为
+  聚类质量证明。所有图沿用05簇编号，按簇着色时保持一致。
+- Cox调整年龄（每10岁）、性别、AJCC分期及原发部位；参考簇由训练平均预测风险
+  最低者确定。结果属于调整后的描述性关联，不自动删协变量或增加惩罚。
+- 临床变量报告缺失人数、连续变量中位数/IQR和分类人数/比例；总体检验使用
+  Kruskal–Wallis、χ²或稀疏表Monte Carlo Fisher，每个数据集内作BH校正。
+- 轨迹按04保存的参数逆变换到原始尺度，术后至landmark每90天分箱，末箱包含
+  landmark。先取患者箱内中位数再取簇中位数/IQR；覆盖率分母为该集该簇全部患者。
+- 生存时间从landmark起算，每月30天。报告05同口径Harrell C-index、60个月截断
+  IPCW C-index、1–60个月动态AUC/Brier/IBS，以及12/36/60个月的分位组KM校准。
+  删失分布仅来自训练集；不支持的时间点保留并标记原因，不自动缩短积分区间。
+- ARI在同一冻结验证集上逐个加载全部候选模型推理，不重训、不重新选择K或seed。
+  固定K无候选结果时跳过该部分；ARI结合空簇和最小簇比例解释。
+
+输出仅含聚合结果，不导出患者级embedding坐标。真实数据评价在远端运行；模型、
+预测和患者表留在远端，结果取回范围遵守该轮分析的授权。

@@ -6,6 +6,22 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator
 
+BASELINE_LABELS = {
+    "Preoperative_CEA": "术前CEA",
+    "Preoperative_CA242": "术前CA242",
+    "Age": "年龄",
+    "Sex": "性别",
+    "Primary_site": "原发部位",
+    "Surgical_approach": "手术方式",
+    "Tumor_differentiation": "肿瘤分化",
+    "AJCC_8th_ed_Stage": "AJCC第8版分期",
+    "Lymph_node_yield": "淋巴结检出数",
+    "Mucinous_colloid_type": "黏液胶样类型",
+    "Lymphovascular_invasion": "淋巴血管侵犯",
+    "Perineural_invasion": "神经侵犯",
+    "Adjuvant_chemotherapy": "辅助化疗",
+}
+
 
 class CohortPathsConfig(BaseModel):
     """将Hydra解析后的路径统一转换为相对启动目录的绝对路径。"""
@@ -331,3 +347,69 @@ class CRCPreprocConfig(BaseModel):
     preprocessing: PreprocessingConfig
     paths: PreprocPathsConfig
     features: FeaturePanelsConfig
+
+
+class EvaluationInputsConfig(BaseModel):
+    """05建模目录；沿清单追溯04和01的产物。"""
+
+    model_config = ConfigDict(extra="forbid")
+    run_dir: Path
+
+
+class EvaluationUMAPConfig(BaseModel):
+    """仅在训练潜表示上拟合的二维UMAP。"""
+
+    model_config = ConfigDict(extra="forbid")
+    n_neighbors: int = Field(ge=2)
+    min_dist: FiniteFloat = Field(ge=0, le=1)
+    metric: Literal["euclidean"]
+    seed: int = Field(ge=0, lt=2**32)
+
+
+class EvaluationSurvivalConfig(BaseModel):
+    """所有时间均从landmark起算，每月30天。"""
+
+    model_config = ConfigDict(extra="forbid")
+    months: list[Annotated[int, Field(gt=0)]] = Field(min_length=1)
+    curve_step_months: int = Field(gt=0)
+    calibration_bins: int = Field(ge=2)
+
+    @model_validator(mode="after")
+    def validate_grid(self) -> Self:
+        if self.months != sorted(set(self.months)):
+            raise ValueError("survival.months须严格递增且不重复")
+        if any(month % self.curve_step_months for month in self.months):
+            raise ValueError("评价月份须落在曲线网格上")
+        if self.months[-1] // self.curve_step_months < 2:
+            raise ValueError("IBS至少需要两个曲线时间点")
+        return self
+
+
+class CRCEvaluationConfig(BaseModel):
+    """06的统计和绘图选项；结局、landmark及面板沿用05。"""
+
+    model_config = ConfigDict(extra="forbid")
+    inputs: EvaluationInputsConfig
+    datasets: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
+    columns: EDAColumnsConfig
+    umap: EvaluationUMAPConfig
+    survival: EvaluationSurvivalConfig
+    trajectory_bin_days: int = Field(gt=0)
+    trajectory_panels_per_page: int = Field(ge=1, le=24)
+    fisher_resamples: int = Field(ge=100)
+    seed: int = Field(ge=0, lt=2**32)
+    device: str = Field(min_length=1)
+    plot: EDAPlotConfig
+    paths: PreprocPathsConfig
+
+    @model_validator(mode="after")
+    def validate_requests(self) -> Self:
+        if len(set(self.datasets)) != len(self.datasets):
+            raise ValueError("datasets不能重复")
+        output, logs = self.paths.dir.resolve(), self.paths.run_dir.resolve()
+        source = self.inputs.run_dir.resolve()
+        if output == source or source in output.parents or output in source.parents:
+            raise ValueError("评价输出须独立于05建模目录")
+        if logs == output or output in logs.parents:
+            raise ValueError("Hydra日志目录须独立于评价输出目录")
+        return self

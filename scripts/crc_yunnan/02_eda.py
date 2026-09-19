@@ -11,7 +11,7 @@ import matplotlib
 import numpy as np
 import pandas as pd
 from omegaconf import DictConfig, OmegaConf
-from scripts.crc_yunnan.config import CRCEDAConfig
+from scripts.crc_yunnan.config import BASELINE_LABELS, CRCEDAConfig
 
 matplotlib.use("Agg")
 import seaborn as sns  # noqa: E402
@@ -20,22 +20,6 @@ from lifelines.plotting import add_at_risk_counts  # noqa: E402
 from matplotlib import font_manager  # noqa: E402
 from matplotlib import pyplot as plt
 from matplotlib.figure import Figure  # noqa: E402
-
-BASELINE_LABELS = {
-    "Preoperative_CEA": "术前CEA",
-    "Preoperative_CA242": "术前CA242",
-    "Age": "年龄",
-    "Sex": "性别",
-    "Primary_site": "原发部位",
-    "Surgical_approach": "手术方式",
-    "Tumor_differentiation": "肿瘤分化",
-    "AJCC_8th_ed_Stage": "AJCC第8版分期",
-    "Lymph_node_yield": "淋巴结检出数",
-    "Mucinous_colloid_type": "黏液胶样类型",
-    "Lymphovascular_invasion": "淋巴血管侵犯",
-    "Perineural_invasion": "神经侵犯",
-    "Adjuvant_chemotherapy": "辅助化疗",
-}
 
 
 def _percent(numerator: int | float, denominator: int | float) -> float:

@@ -66,6 +66,7 @@ clean reusable method library.
 - Split CRC Yunnan patients and middle-format observations: `uv run python -m scripts.crc_yunnan.03_split`
 - Prepare CRC Yunnan model datasets: `uv run python -m scripts.crc_yunnan.04_preproc`
 - Run CRC Yunnan K selection and TRAILS on one frozen split: `uv run python -m scripts.crc_yunnan.05_run`
+- Evaluate a completed CRC Yunnan run: `uv run python -m scripts.crc_yunnan.06_evaluate inputs.run_dir=outputs/crc_yunnan/<run>/modeling`
 - Run MIMIC modeling with configured or automatically selected K: `uv run python -m scripts.mimic.07_run`
 - Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517`
 - Evaluate frozen MIMIC predictions: `uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<primary-run>,outputs/mimic_case/<other-runs>]' 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
@@ -333,8 +334,8 @@ clean reusable method library.
   only for internal early stopping, and saves the converted dataset, model,
   history, predictions, patient-level clusters, cluster summaries, feature
   summaries, and `case_summary.json` under `paths.dir`.
-- CRC Yunnan uses `01_cohort -> 02_eda -> 03_split -> 04_preproc -> 05_run`,
-  with Hydra configs `cohort`, `eda`, `split`, `preproc`, and `run` under
+- CRC Yunnan uses `01_cohort -> 02_eda -> 03_split -> 04_preproc -> 05_run -> 06_evaluate`,
+  with Hydra configs `cohort`, `eda`, `split`, `preproc`, `run`, and `evaluate` under
   `configs/crc_yunnan`. New cohort/split/preproc artifacts use v2; historical v1
   artifacts remain unchanged and are not accepted by the new workflow.
   Downstream commands trust upstream schemas, keys, outcome values and dataset
@@ -392,9 +393,23 @@ clean reusable method library.
   selection score, C-index, BIC, then seed. Without validation, fixed K is mandatory
   and early stopping monitors training data. Full-cohort preprocessing/training uses
   all eligible patients and reports no independent validation/test when absent.
-  Current defaults remain E60, auto-log1p/robust, fixed K=3, seed 20260909 and no SwanLab.
+  Current defaults use OS/24 months, E60, auto-log1p/robust, K=2–10 across seeds
+  20260908/09/10 and no SwanLab.
   Model, history, available-set predictions/metrics and a short provenance manifest
   are saved without copying datasets. Patient-level artifacts stay remote.
+- `06_evaluate.py` resolves `CRCEvaluationConfig`, follows 05/04/03 manifests back to
+  the frozen data and cohort metadata, and writes Chinese aggregate JSON, one Excel
+  workbook, and PNG/PDF figures to a separate evaluation directory. It preserves
+  cluster labels and colors, fits UMAP only on train, and computes clinical summaries,
+  KM/log-rank, unpenalized adjusted Cox, original-scale patient-weighted trajectories,
+  confidence, prediction/calibration metrics, training and K-selection diagnostics.
+  Survival times use 30-day months after landmark; trajectory times start at surgery.
+  Censoring weights come only from train. Unsupported metrics retain their configured
+  time points with null values and reasons; genuine computation errors propagate.
+  Cross-seed ARI uses all saved candidate models on frozen validation, without fitting
+  or changing model selection. Fixed-K runs without candidates skip ARI explicitly.
+  No patient-level embedding coordinates or new manifests are exported. Shared CRC
+  statistics and single-figure functions live in `evaluation.py` and `evaluation_plots.py`.
 - MIMIC concept preprocessing is executed directly from the pinned external
   mimic-code SQL files by `01_build_sepsis.py`; downstream extraction reads the
   resulting official tables and adds study-specific cohort/window aggregation.
