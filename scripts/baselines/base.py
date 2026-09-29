@@ -28,6 +28,7 @@ class BaselinePrediction:
     risk_horizon: float | None = None
     survival_times: NDArray[np.float64] | None = None
     survival_probabilities: NDArray[np.float64] | None = None
+    risk_method: Literal["event_probability", "log_hazard"] = "event_probability"
 
     def __post_init__(self) -> None:
         """在写盘前固定评价脚本依赖的形状与数值语义。"""
@@ -63,7 +64,7 @@ class BaselinePrediction:
             assert risk is not None and times is not None and probabilities is not None
             if risk.shape != (n_patients,) or not np.isfinite(risk).all():
                 raise ValueError("risk_score必须有限且与患者数一致")
-            if np.any((risk < 0.0) | (risk > 1.0)):
+            if self.risk_method == "event_probability" and np.any((risk < 0.0) | (risk > 1.0)):
                 raise ValueError("risk_score必须表示固定时间窗事件概率")
             if self.risk_horizon is None or self.risk_horizon <= 0.0:
                 raise ValueError("risk_horizon必须为正数")
@@ -99,6 +100,7 @@ class BaselinePrediction:
             "format_version": np.asarray(1, dtype=np.int64),
             "method_name": np.asarray(self.method_name, dtype=np.str_),
             "patient_ids": np.asarray(self.patient_ids, dtype=np.str_),
+            "risk_method": np.asarray(self.risk_method, dtype=np.str_),
         }
         for name in (
             "cluster_labels",
@@ -130,6 +132,9 @@ class BaselinePrediction:
                 cluster_labels=optional_array("cluster_labels", np.int64),
                 n_clusters=(int(payload["n_clusters"].item()) if "n_clusters" in files else None),
                 risk_score=optional_array("risk_score", np.float64),
+                risk_method=payload["risk_method"].item()
+                if "risk_method" in files
+                else "event_probability",
                 risk_horizon=(
                     float(payload["risk_horizon"].item()) if "risk_horizon" in files else None
                 ),

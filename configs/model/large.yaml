@@ -1,3 +1,4 @@
+survival_loss: weibull
 # 保持base的结构类型，按约2倍宽度和更深主干扩大容量。
 latent_dim: 64
 n_clusters: 4

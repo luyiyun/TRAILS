@@ -284,8 +284,9 @@ def test_prediction_median_risk_preserves_time_ranking() -> None:
     prediction = TrailsPrediction(
         latent_representation=torch.zeros(3, 2),
         cluster_probabilities=torch.full((3, 2), 0.5),
-        weibull_shape=torch.tensor([1.0, 2.0, 0.001]),
-        weibull_scale=torch.tensor([100.0, 200.0, 1.0]),
+        survival_log_params=torch.stack(
+            [torch.tensor([100.0, 200.0, 1.0]).log(), torch.tensor([1.0, 2.0, 0.001]).log()], dim=1
+        ),
     )
     risk = prediction.risk_score(method="median_survival")
     median = torch.exp(-risk)

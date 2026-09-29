@@ -126,7 +126,7 @@ for panel in "${panels[@]}"; do
                     "split.dir=$(hydra_string "$output_root/$split_path")" \
                     model.latent_dim=32 trainer.batch_size=128 trainer.learning_rate=1e-3 \
                     trainer.warmup_epochs=10 trainer.gmm_init_iters=5 trainer.valid_size=0.0 \
-                    trainer.cindex_risk_score=median_survival trainer.device=cuda:0 \
+                    model.survival_loss=weibull trainer.cindex_risk_score=median_survival trainer.device=cuda:0 \
                     swanlab.enabled=false "trainer.seed=$seed" \
                     "paths.dir=$(hydra_string "$output_root/runs/$group/seed-$seed")"
             done

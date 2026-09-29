@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,11 @@ from .config import TrailsConfig
 from .data import ClinicalTimeSeriesDataset, infer_data_config
 from .model import TrailsSurvVaderModel
 from .prediction import TrailsPrediction
+from .survival import SURVIVAL_FORMAT_VERSION, CoxBaseline
 from .trainer import HistoryEntry, TrailsTrainer
 
 HistoryCallback = Callable[[HistoryEntry], None]
+LOGGER = logging.getLogger(__name__)
 
 
 class TrailsEstimator:
@@ -52,7 +55,7 @@ class TrailsEstimator:
         """拟合 TRAILS 模型并返回当前估计器。
 
         训练前根据数据设置特征均值；mTAN 输入还会根据训练数据的真实观测范围
-        设置全局参考时间网格。显式验证集会直接传给训练器。
+        设置全局参考时间网格。在入口完成验证划分及事件校验，再将数据交给训练器。
 
         参数：
             data: 用于拟合的临床时间序列数据集。
@@ -72,6 +75,21 @@ class TrailsEstimator:
         if self.config.model.encoder.input.kind in {"mtan", "mtan2"}:
             min_time, max_time = observed_time_range(data)
             self.model.set_reference_time_range(min_time, max_time)
+        if validation_data is not None:
+            if self.config.trainer.valid_size > 0:
+                LOGGER.warning(
+                    "Explicit validation_data was provided; trainer.valid_size=%s is ignored "
+                    "for this fit call.",
+                    self.config.trainer.valid_size,
+                )
+        elif self.config.trainer.valid_size > 0:
+            data, validation_data = data.split(
+                [1 - self.config.trainer.valid_size, self.config.trainer.valid_size]
+            )
+        # 必须检查实际划分后的集合；原始数据有事件不保证训练子集有事件。
+        self._validate_events(data, "Training")
+        if validation_data is not None:
+            self._validate_events(validation_data, "Validation")
         self.history = self.trainer.fit(
             data,
             history_callback=history_callback,
@@ -86,15 +104,16 @@ class TrailsEstimator:
             data: 特征维度与估计器配置一致的数据集。
 
         返回：
-            CPU 上的 :class:`TrailsPrediction`，包含潜表示、簇后验和 Weibull 参数。
+            CPU 上的 :class:`TrailsPrediction`，包含潜表示、簇后验和生存 log 参数。
         """
         self._validate_data_config(data)
         outputs, batch = self.trainer._collect_outputs(data)
         return TrailsPrediction(
             latent_representation=outputs.latent_mean.detach().cpu(),
             cluster_probabilities=outputs.cluster_probabilities.detach().cpu(),
-            weibull_shape=outputs.weibull_shape.detach().cpu(),
-            weibull_scale=outputs.weibull_scale.detach().cpu(),
+            survival_log_params=outputs.survival_log_params.detach().cpu(),
+            survival_kind=self.config.model.survival_loss,
+            cox_baseline=self.trainer.cox_baseline,
             true_cluster=(
                 batch["cluster_label"].detach().cpu().long() if "cluster_label" in batch else None
             ),
@@ -110,6 +129,7 @@ class TrailsEstimator:
             指标名称到浮点值的字典；参考簇标签存在时包含 ACC、ARI 和 NMI。
         """
         self._validate_data_config(data)
+        self._validate_events(data, "Test")
         return self.trainer.test(data)
 
     def save(self, path: str | Path) -> None:
@@ -119,6 +139,10 @@ class TrailsEstimator:
             path: PyTorch 检查点目标路径。
         """
         checkpoint = {
+            "survival_format_version": SURVIVAL_FORMAT_VERSION,
+            "cox_baseline": self.trainer.cox_baseline.payload()
+            if self.trainer.cox_baseline is not None
+            else None,
             "config": self.config.model_dump(mode="json"),
             "history": self.history,
             "model_state": self.model.state_dict(),
@@ -142,6 +166,10 @@ class TrailsEstimator:
             恢复配置、参数和历史的 :class:`TrailsEstimator`。
         """
         checkpoint: dict[str, Any] = torch.load(Path(path), map_location="cpu", weights_only=False)
+        if checkpoint.get("survival_format_version") != SURVIVAL_FORMAT_VERSION:
+            raise ValueError(
+                "Unsupported survival format; load legacy checkpoints with the original code."
+            )
         config = TrailsConfig.model_validate(checkpoint["config"])
         if device is not None:
             config = config.model_copy(
@@ -150,6 +178,8 @@ class TrailsEstimator:
         estimator = cls(config)
         estimator.model.load_state_dict(checkpoint["model_state"])
         estimator.history = list(checkpoint.get("history", []))
+        baseline = checkpoint["cox_baseline"]
+        estimator.trainer.cox_baseline = CoxBaseline(**baseline) if baseline is not None else None
         return estimator
 
     def _validate_data_config(self, data: ClinicalTimeSeriesDataset) -> None:
@@ -160,6 +190,12 @@ class TrailsEstimator:
                 "Data shape does not match estimator config: "
                 f"expected {self.config.data}, got {inferred}."
             )
+
+    @staticmethod
+    def _validate_events(data: ClinicalTimeSeriesDataset, name: str) -> None:
+        """训练与评价入口要求至少一个事件；纯预测不依赖结局标签。"""
+        if not any(bool(sample.event) for sample in data.samples):
+            raise ValueError(f"{name} data must contain at least one observed event.")
 
 
 def observed_time_range(data: ClinicalTimeSeriesDataset) -> tuple[float, float]:

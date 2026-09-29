@@ -24,8 +24,8 @@ from .metrics import (
     cluster_assignment_diagnostics,
     concordance_index,
     gaussian_log_prob,
-    weibull_risk_score,
 )
+from .survival import survival_risk
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -423,16 +423,14 @@ class ClusterNumberSelector:
         return {
             "cindex": float(
                 concordance_index(
-                    weibull_risk_score(
-                        outputs.weibull_shape,
-                        outputs.weibull_scale,
+                    survival_risk(
+                        outputs.survival_log_params,
+                        estimator.config.model.survival_loss,
                         estimator.config.trainer.risk_horizon,
                         method=estimator.config.trainer.cindex_risk_score,
-                    )
-                    .detach()
-                    .cpu(),
-                    batch["survival_time"].detach().cpu().float(),
-                    batch["event"].detach().cpu().float(),
+                    ).detach(),
+                    batch["survival_time"],
+                    batch["event"],
                 )
             ),
             "latent_mixture_bic": float(latent_mixture_bic),

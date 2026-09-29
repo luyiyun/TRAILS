@@ -19,10 +19,10 @@ from .metrics import (
     Cindex,
     ClusteringAccuracy,
     cluster_assignment_diagnostics,
-    weibull_risk_score,
 )
 from .model import TrailsLossBreakdown, TrailsModelOutput, TrailsSurvVaderModel
 from .progress import ProgressBar
+from .survival import CoxBaseline, survival_loss, survival_risk
 
 LOGGER = logging.getLogger(__name__)
 
@@ -169,6 +169,7 @@ class TrailsTrainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
 
         self.losses = LossAccumulator()
+        self.cox_baseline: CoxBaseline | None = None
 
     def fit(
         self,
@@ -178,7 +179,7 @@ class TrailsTrainer:
     ) -> list[HistoryEntry]:
         """拟合模型并返回逐轮训练历史。
 
-        显式验证集优先于 ``trainer.valid_size``；否则从训练数据内部留出验证集。
+        训练及验证数据由 estimator 完成划分和事件校验。
         warmup 阶段不包含 VaDE KL，结束后初始化混合先验；正式阶段包含全部损失
         并在达到 ``min_epochs`` 后应用可选早停。训练结束时恢复最佳模型状态。
 
@@ -193,22 +194,18 @@ class TrailsTrainer:
         # 根据我们使用的input调整数据格式
         data = data.with_return_kind(self._model_return_kind())
         if validation_data is not None:
-            if self.config.valid_size > 0:
-                LOGGER.warning(
-                    "Explicit validation_data was provided; trainer.valid_size=%s is ignored "
-                    "for this fit call.",
-                    self.config.valid_size,
-                )
             validation_data = validation_data.with_return_kind(self._model_return_kind())
             valid_loader = make_data_loader(validation_data, self.config, shuffle=False)
-        elif self.config.valid_size > 0:
-            data, validation_data = data.split([1 - self.config.valid_size, self.config.valid_size])
-            valid_loader = make_data_loader(validation_data, self.config, shuffle=False)
         else:
-            validation_data = None
             valid_loader = None
 
-        loader = make_data_loader(data, self.config, shuffle=True)
+        self.cox_baseline = None
+        loader = make_data_loader(
+            data,
+            self.config,
+            shuffle=True,
+            ensure_event=self.model.model_config.survival_loss == "cox",
+        )
 
         history: list[HistoryEntry] = []
 
@@ -301,7 +298,22 @@ class TrailsTrainer:
 
         if early_stopper is not None and early_stopper.best_state is not None:
             self.model.load_state_dict(early_stopper.best_state)
+        if self.model.model_config.survival_loss == "cox":
+            log_params, events, times = self._collect_survival(data)
+            self.cox_baseline = CoxBaseline.fit(log_params, events, times)
         return history
+
+    def _collect_survival(self, data: ClinicalTimeSeriesDataset) -> tuple[Tensor, Tensor, Tensor]:
+        """拟合基线只收集实际训练子集的标量输出，不留存重建张量。"""
+        params, events, times = [], [], []
+        self.model.eval()
+        with torch.no_grad():
+            for batch in make_data_loader(data, self.config, shuffle=False):
+                output = self._model_output(self._move_batch(batch))
+                params.append(output.survival_log_params.cpu())
+                events.append(batch["event"].cpu())
+                times.append(batch["survival_time"].cpu())
+        return torch.cat(params), torch.cat(events), torch.cat(times)
 
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
         """在完整数据集上计算损失、预测指标和簇占用诊断。
@@ -359,6 +371,11 @@ class TrailsTrainer:
     ) -> tuple[dict[str, float], dict[str, float]]:
         """执行一次训练或验证循环并返回平均损失与指标。"""
         self.losses.reset()
+        full_cox = phase == "valid" and self.model.model_config.survival_loss == "cox"
+        survival_params: list[Tensor] = []
+        survival_events: list[Tensor] = []
+        survival_times: list[Tensor] = []
+        cox_loss_sum, cox_event_count = 0.0, 0
         if survival_metrics is not None:
             for m in survival_metrics.values():
                 m.reset()
@@ -379,26 +396,38 @@ class TrailsTrainer:
                     output,
                     device_batch,
                     include_vade_kl=include_vade_kl,
+                    include_survival=not full_cox,
                 )
 
                 if phase == "train":
                     self.optimizer.zero_grad()
+                    if not bool(torch.isfinite(loss.loss)):
+                        raise FloatingPointError("Non-finite training loss.")
                     loss.loss.backward()
                     if self.config.gradient_clip_norm is not None:
                         torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(),
                             self.config.gradient_clip_norm,
+                            error_if_nonfinite=True,
                         )
                     self.optimizer.step()
 
                 self.losses.update(device_batch["x"].size(0), loss)
+                if full_cox:
+                    survival_params.append(output.survival_log_params.detach())
+                    survival_events.append(device_batch["event"])
+                    survival_times.append(device_batch["survival_time"])
+                elif self.model.model_config.survival_loss == "cox":
+                    count = int(device_batch["event"].sum())
+                    cox_loss_sum += float(loss.survival_loss.detach()) * count
+                    cox_event_count += count
 
                 if survival_metrics is not None:
                     for m in survival_metrics.values():
                         m.update(
-                            weibull_risk_score(
-                                output.weibull_shape,
-                                output.weibull_scale,
+                            survival_risk(
+                                output.survival_log_params,
+                                self.model.model_config.survival_loss,
                                 self.config.risk_horizon,
                                 method=self.config.cindex_risk_score,
                             ),
@@ -412,7 +441,27 @@ class TrailsTrainer:
                             device_batch["cluster_label"],
                         )
 
-        return self.losses.compute(), {
+        losses = self.losses.compute()
+        if full_cox:
+            events = torch.cat(survival_events)
+            active = self.model.model_config.loss.survival_weight > 0 and len(events) > 1
+            params = torch.cat(survival_params)
+            survival = (
+                survival_loss(params, events, torch.cat(survival_times), "cox")
+                if active
+                else params.sum() * 0.0
+            )
+            combined = self.model.combine_losses(
+                params.new_tensor(losses["reconstruction_loss"]),
+                survival,
+                params.new_tensor(losses["vade_kl_loss"]),
+                include_vade_kl=include_vade_kl,
+                survival_active=active,
+            )
+            losses = {key: float(value.detach()) for key, value in combined.items()}
+        elif self.model.model_config.survival_loss == "cox":
+            losses["survival_loss"] = cox_loss_sum / max(cox_event_count, 1)
+        return losses, {
             **(
                 {}
                 if survival_metrics is None
@@ -525,8 +574,7 @@ def concatenate_outputs(outputs: list[TrailsModelOutput]) -> TrailsModelOutput:
             [output.cluster_probabilities for output in outputs],
             dim=0,
         ),
-        weibull_shape=torch.cat([output.weibull_shape for output in outputs], dim=0),
-        weibull_scale=torch.cat([output.weibull_scale for output in outputs], dim=0),
+        survival_log_params=torch.cat([output.survival_log_params for output in outputs], dim=0),
     )
 
 

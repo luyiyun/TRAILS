@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from logging import getLogger
 from pathlib import Path
@@ -13,7 +13,7 @@ import pandas as pd
 import torch
 from sklearn.preprocessing import LabelEncoder
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .config import DataConfig, TrainerConfig, resolve_batch_size
 
@@ -1152,11 +1152,51 @@ def infer_data_config(dataset: ClinicalTimeSeriesDataset) -> DataConfig:
     return DataConfig(n_features=dataset.n_features)
 
 
+class EventBatchSampler(Sampler[list[int]]):
+    """先均分事件患者，再补入删失患者；每轮无重复、无遗漏，批大小不超过上限。"""
+
+    def __init__(self, data: ClinicalTimeSeriesDataset, batch_size: int, seed: int) -> None:
+        events = torch.stack([sample.event for sample in data.samples]).bool()
+        self.event_indices = torch.where(events)[0]
+        self.censored_indices = torch.where(~events)[0]
+        self.n_batches = (len(data) + batch_size - 1) // batch_size
+        if len(self.event_indices) < self.n_batches:
+            raise ValueError(
+                f"Cox training has {len(self.event_indices)} events for {self.n_batches} batches "
+                f"at batch_size={batch_size}; increase batch_size so every batch can contain "
+                "an event without repeating patients."
+            )
+        # 均衡批次容量可避免末批过小；事件和容量的余数均优先分给前面的批次。
+        size, remainder = divmod(len(data), self.n_batches)
+        self.batch_sizes = [size + (index < remainder) for index in range(self.n_batches)]
+        self.generator = torch.Generator().manual_seed(seed)
+
+    def __len__(self) -> int:
+        return self.n_batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        events = self.event_indices[
+            torch.randperm(len(self.event_indices), generator=self.generator)
+        ]
+        censored = self.censored_indices[
+            torch.randperm(len(self.censored_indices), generator=self.generator)
+        ]
+        offset = 0
+        for event_group, size in zip(
+            torch.tensor_split(events, self.n_batches), self.batch_sizes, strict=True
+        ):
+            count = size - len(event_group)
+            indices = torch.cat((event_group, censored[offset : offset + count]))
+            offset += count
+            yield indices.tolist()
+
+
 def make_data_loader(
     data: ClinicalTimeSeriesDataset,
     trainer_config: TrainerConfig,
     *,
     shuffle: bool,
+    ensure_event: bool = False,
 ) -> DataLoader[Batch]:
     """使用训练配置中的批大小规则创建临床数据加载器。
 
@@ -1164,15 +1204,26 @@ def make_data_loader(
         data: 要迭代的临床时间序列数据集。
         trainer_config: 提供显式或自动批大小的训练配置。
         shuffle: 是否在每轮迭代前打乱患者顺序。
+        ensure_event: Cox 训练使用先分配事件的分批器，保证每批至少一个事件。
 
     返回：
         使用 :func:`clinical_collate_fn` 的 PyTorch 数据加载器。
     """
+    batch_size = resolve_batch_size(len(data), trainer_config.batch_size)
+    if ensure_event:
+        return cast(
+            DataLoader[Batch],
+            DataLoader(
+                data,
+                batch_sampler=EventBatchSampler(data, batch_size, trainer_config.seed),
+                collate_fn=clinical_collate_fn,
+            ),
+        )
     return cast(
         DataLoader[Batch],
         DataLoader(
             data,
-            batch_size=resolve_batch_size(len(data), trainer_config.batch_size),
+            batch_size=batch_size,
             shuffle=shuffle,
             collate_fn=clinical_collate_fn,
         ),

@@ -163,6 +163,20 @@ clean reusable method library.
   保存、关闭操作；优先复用主流程已计算的统计结果。`run()` 保留分析步骤和清晰的
   绘图函数调用，不展开逐轴绘制细节。
 
+### 任务执行与复现
+
+- 训练和数据分析任务优先复用 `scripts/` 下的现有脚本，通过命令行参数调整配置。
+  若现有脚本无法完成任务，应先说明缺口并询问用户，不自行新增正式脚本或另写
+  一套执行流程。
+- 不使用大段 `python -c`、Shell 内嵌 Python 等方式组织实验。经确认的一次性处理
+  或探索性汇总可使用临时脚本；复现所需的临时脚本应随该次任务记录保留。
+- 每次实际执行训练或分析前，将可复现的命令追加到根目录 `history.sh`。每个任务块
+  上方使用不超过 3 行的注释，简述执行日期、任务内容及目的，同时分隔不同任务。
+- 命令应明确输入、输出、seed 和关键参数，避免依赖交互状态、临时环境变量或不断
+  变化的默认配置。远程任务注明执行主机与工作目录。
+- `history.sh` 用于按任务块查阅和复现，不作为一次性重跑全部历史任务的脚本。
+  不将未执行的备选方案写成已执行历史，不修改或覆盖已有任务记录。
+
 ### 测试与版本管理
 
 - 运行现有检查与新增测试代码是两回事；代码修改后按下方 Verification 执行检查，
@@ -235,6 +249,15 @@ clean reusable method library.
   not saved as a separate `val.pt`, and is used for early stopping; if no validation
   split is requested, early stopping monitors the training metric instead. The
   monitor can be total loss, survival loss, or C-index.
+- `TrailsEstimator.fit()` owns the internal split and checks the actual training
+  and validation subsets for at least one observed event; `test()` checks its
+  evaluation dataset at entry. This applies to both survival heads. The trainer,
+  loss adapter and Cox baseline trust those dataset checks. Cox training uses
+  `EventBatchSampler`: shuffle and evenly distribute event patients first, then
+  fill balanced batches with censored patients, once per patient per epoch and
+  never above batch size. Too few events for the batch count fails before training.
+  Model/loss code does not repeat event-existence checks; evaluation, prediction
+  and baseline loaders retain normal ordering. Pure `predict()` does not require events.
 - Hydra metadata and command outputs go under the single user-visible `paths.dir`
   directory. Each command root config sets `hydra.run.dir: ${paths.dir}` and
   defines `paths.root`, `paths.prefix`, and `paths.suffix`, which compose the
@@ -280,19 +303,39 @@ clean reusable method library.
   repeated latent plus visit-time input.
 - Clustering uses a VaDE-style learnable Gaussian mixture latent prior,
   initialized by deterministic k-means after warmup.
-- The survival head maps each patient's latent mean to one Weibull shape/scale
-  pair, with a configurable number of latent-width hidden layers before the
-  Weibull output; survival likelihood and curves are not mixed across clusters.
-- Validation and test metrics include ACC/ARI/NMI only when true cluster labels are
-  available; test metrics also report predicted-cluster occupancy diagnostics.
-- `TrailsEstimator.predict()` performs one forward pass and returns a
-  `TrailsPrediction`. Its ordinary methods `predict()`, `predict_proba()`,
-  `risk_score(horizon)`, and `survival()` derive cluster labels, posterior probabilities,
-  fixed-horizon event risks, and survival curves from the saved latent and
-  patient-specific Weibull parameters. `trainer.risk_horizon` supplies the
-  configurable horizon when `trainer.cindex_risk_score=event_probability` (the default).
-  `risk_score(method="median_survival")` returns negative log predicted median survival
-  time without a horizon. The trainer and K selector honor the same configured risk method.
+- The survival head maps latent means directly to `[log(scale), log(shape)]`
+  for `model.survival_loss=weibull` (generic default), or one Cox log-risk for
+  `cox` (CRC default). Both retain configurable hidden layers; base uses one.
+  TorchSurv computes both likelihoods; Cox uses Efron ties and event-normalized
+  mini-batch partial likelihood. Weibull uses the library scripted loss path because
+  its eager validator incorrectly rejects all-censored batches with valid likelihood.
+  Cox mini-batches are assumed to contain events; singleton batches skip the survival
+  uncertainty term. Validation/test Cox losses use the full evaluation risk set.
+  Loss calls order censoring after events at tied times using order-preserving
+  rank times, avoiding the TorchSurv 0.2 no-tied-deaths fast-path ambiguity.
+- After restoring the best model, Cox Breslow baseline estimation uses only the
+  actual optimized training subset, excluding internally held-out validation.
+  The baseline is saved with the model and predictions. Cox curves are right-continuous
+  steps with flat tails; absolute-risk evaluation outside training support is unavailable.
+- `TrailsPrediction` stores survival kind and log parameters. `risk_score(method="auto")`
+  returns Cox log-risk or Weibull `1-S(horizon)`; explicit `event_probability`
+  requires a positive horizon. Weibull alone supports `median_survival` risk.
+  `median_survival_time()` returns NaN for Cox when the training-supported curve
+  does not reach 0.5. Derived Weibull shape/scale remain available as properties.
+  Checkpoints/predictions use survival format 2; legacy softplus artifacts are
+  rejected and must be evaluated with their original code version.
+- TorchSurv supplies Harrell/Uno C-index, cumulative/dynamic AUC, Brier and their
+  integrals across training, K selection, CRC/MIMIC and baseline selection.
+  `trails.metrics.SurvivalMetrics` supplies train-only IPCW and support checks; it
+  accepts same-device tensors and returns tensors without forcing CPU or float64.
+  NumPy conversion belongs to report callers. Training/K-selection C-index stays on
+  the model device until scalar output. It does not implement metric formulas.
+  Epoch C-index pools all batches. Unsupported report
+  points retain null/reasons; integration windows are never silently shortened.
+  CRC two-horizon mean AUC remains an arithmetic mean, separate from integrated AUC.
+- Validation and test report ACC/ARI/NMI only with true labels; occupancy
+  diagnostics remain available regardless of reference labels. Cox uses log-risk
+  for C-index throughout; shared baseline predictions label their risk method.
 - Train and baseline commands recursively discover all sibling `train.pt`/`test.pt`
   directories under `paths.data_root`, infer K from dataset metadata when present,
   and save unified prediction payloads under mirrored run directories plus

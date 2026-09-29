@@ -69,6 +69,7 @@ PROFILES: dict[str, tuple[str, dict[str, Any]]] = {
 }
 BASE_OVERRIDES: dict[str, Any] = {
     "model": "base",
+    "model.survival_loss": "weibull",
     "trainer": "full",
     "k_selection.enabled": False,
     "split.strategy": "random",
@@ -396,6 +397,7 @@ def main() -> int:
         "preproc", preproc_values(base, split, root / "preproc", root / "logs")
     )
     contract = {
+        "survival_format_version": 2,
         "脚本SHA256": script_hash,
         "预算小时": args.budget_hours,
         "run": run_config,

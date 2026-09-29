@@ -10,6 +10,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 LOGGER = logging.getLogger(__name__)
 
+SurvivalKind = Literal["weibull", "cox"]
+RiskMethod = Literal["auto", "log_hazard", "event_probability", "median_survival"]
+
 AUTO_BATCH_TARGET_UPDATES = 20
 AUTO_BATCH_MIN_SIZE = 16
 AUTO_BATCH_MAX_SIZE = 256
@@ -205,8 +208,8 @@ class ModelConfig(BaseModel):
         latent_dim: 患者变分表示的宽度。
         n_clusters: 高斯混合分量及患者亚型的数量。
         dropout: 支持该操作的网络层所使用的 dropout 概率。
-        survival_head_hidden_layers: 输出患者 Weibull 参数前使用的潜空间等宽
-            隐藏层数量。
+        survival_head_hidden_layers: 输出生存 log 参数前使用的潜空间等宽隐藏层数量。
+        survival_loss: Weibull 完整似然或 Cox 部分似然。
         loss: 多任务损失加权配置。
         encoder: 异步输入和时序映射配置。
         decoder: 纵向重建配置。
@@ -220,6 +223,7 @@ class ModelConfig(BaseModel):
     n_clusters: int = Field(default=3, gt=1)
     dropout: float = Field(default=0.0, ge=0.0, lt=1.0)
     survival_head_hidden_layers: int = Field(default=0, ge=0)
+    survival_loss: SurvivalKind = "weibull"
     loss: LossConfig = Field(default_factory=LossConfig)
     encoder: EncoderConfig = Field(default_factory=EncoderConfig)
     decoder: DecoderConfig = Field(default_factory=DecoderConfig)
@@ -234,7 +238,7 @@ class TrainerConfig(BaseModel):
         max_epochs: 最大训练轮数。
         batch_size: 显式批大小；``None`` 表示自动解析。
         learning_rate: 优化器学习率。
-        warmup_epochs: 初始化混合模型前仅优化重建目标的轮数。
+        warmup_epochs: 初始化混合模型前优化重建及启用的生存目标的轮数。
         gmm_init_iters: 初始化潜空间混合模型时使用的 K-means 迭代次数。
         gradient_clip_norm: 最大梯度范数；``None`` 表示不裁剪。
         device: 执行模型优化的 Torch 设备。
@@ -245,7 +249,7 @@ class TrainerConfig(BaseModel):
         early_stopping_min_delta: 被视为改善所需的最小变化量。
         early_stopping_monitor: 监控总损失、生存损失或 C-index。
         risk_horizon: 计算 C-index 风险排序所用的固定结局时间窗。
-        cindex_risk_score: C-index 的排序分数；中位生存时间方式不使用 risk_horizon。
+        cindex_risk_score: auto 对 Cox 使用 log-risk，对 Weibull 使用时间窗事件概率。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -265,7 +269,7 @@ class TrainerConfig(BaseModel):
     early_stopping_min_delta: float = Field(default=0.0, ge=0.0)
     early_stopping_monitor: Literal["loss", "survival_loss", "cindex"] = "loss"
     risk_horizon: float = Field(default=1.0, gt=0.0)
-    cindex_risk_score: Literal["event_probability", "median_survival"] = "event_probability"
+    cindex_risk_score: RiskMethod = "auto"
 
 
 class TrailsConfig(BaseModel):
@@ -284,6 +288,16 @@ class TrailsConfig(BaseModel):
     model: ModelConfig = Field(default_factory=ModelConfig)
     trainer: TrainerConfig = Field(default_factory=TrainerConfig)
     seed: int = 2026
+
+    @model_validator(mode="after")
+    def validate_survival_risk(self) -> TrailsConfig:
+        """训练中 Cox 始终用 log-risk 排序，不依赖尚未拟合的基线。"""
+        if self.model.survival_loss == "cox":
+            if self.trainer.cindex_risk_score not in {"auto", "log_hazard"}:
+                raise ValueError("Cox C-index requires cindex_risk_score=auto or log_hazard.")
+        elif self.trainer.cindex_risk_score == "log_hazard":
+            raise ValueError("log_hazard risk scoring requires survival_loss=cox.")
+        return self
 
 
 class ClusterNumberSelectorConfig(BaseModel):

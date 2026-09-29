@@ -1,3 +1,4 @@
+survival_loss: weibull
 latent_dim: 32
 n_clusters: 4
 dropout: 0.0

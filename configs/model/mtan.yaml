@@ -1,3 +1,4 @@
+survival_loss: weibull
 # 除异步输入层外与base保持一致，用于隔离GRU-D与mTAN的影响。
 latent_dim: 32
 n_clusters: 4

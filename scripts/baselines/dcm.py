@@ -5,11 +5,11 @@ from typing import Any, Self, cast
 
 import joblib
 import numpy as np
+import torch
 from numpy.typing import NDArray
-from sksurv.metrics import integrated_brier_score
-from sksurv.util import Surv
 
 from trails import ClinicalTimeSeriesDataset
+from trails.metrics import SurvivalMetrics
 
 from .base import BaselineCapability, BaselinePrediction
 from .features import dataset_patient_ids, dataset_survival_arrays
@@ -104,13 +104,11 @@ class DeepCoxMixturesBaseline:
         valid_event, valid_time = dataset_survival_arrays(validation)
         if len(times) < 2 or times[0] <= valid_time.min() or times[-1] >= valid_time.max():
             raise ValueError("prediction_times必须位于validation随访时间的开区间内")
-        train_survival = Surv.from_arrays(train_event, train_time)
-        valid_survival = Surv.from_arrays(valid_event, valid_time)
-        score = integrated_brier_score(
-            train_survival,
-            valid_survival,
-            probabilities,
-            times,
+        _, score = SurvivalMetrics(torch.tensor(train_event), torch.tensor(train_time)).brier(
+            torch.tensor(probabilities),
+            torch.tensor(valid_event),
+            torch.tensor(valid_time),
+            torch.tensor(times),
         )
         return {"ibs": float(score)}
 

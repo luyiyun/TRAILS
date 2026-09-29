@@ -1817,6 +1817,22 @@ wheels = [
 ]
 
 [[package]]
+name = "torchsurv"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "pydantic" },
+    { name = "scipy" },
+    { name = "torch" },
+    { name = "torchmetrics" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d2/43/18421001a2a4bb307d12603f86e119785325daf4c9fea4feb5af20650638/torchsurv-0.2.0.tar.gz", hash = "sha256:564445364b79e8911d6c8aa46d30c94e1c2c4c0230d42fb1e993edbbb48f4729", size = 4496060, upload-time = "2026-06-17T19:02:18.28Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ff/57/155e61139298c12c4ae84ed173a481ef749faebf836d046990115fd141f7/torchsurv-0.2.0-py3-none-any.whl", hash = "sha256:7d682e383e3d76264d5aae5c6da50d78f3b40593a0bd83d901915a472c34816a", size = 64248, upload-time = "2026-06-17T19:02:16.798Z" },
+]
+
+[[package]]
 name = "tqdm"
 version = "4.67.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1842,6 +1858,7 @@ dependencies = [
     { name = "scipy" },
     { name = "torch" },
     { name = "torchmetrics" },
+    { name = "torchsurv" },
     { name = "tqdm" },
     { name = "umap-learn" },
 ]
@@ -1876,6 +1893,7 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.17.1" },
     { name = "torch", specifier = ">=2.12.0" },
     { name = "torchmetrics", specifier = ">=1.9.0" },
+    { name = "torchsurv", specifier = ">=0.2,<0.3" },
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "umap-learn", specifier = ">=0.5.12" },
 ]

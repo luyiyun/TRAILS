@@ -6,20 +6,13 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import torch
 from lifelines import CoxPHFitter, KaplanMeierFitter
 from lifelines.statistics import multivariate_logrank_test
 from scipy import stats
-from sksurv.metrics import (
-    brier_score,
-    concordance_index_censored,
-    concordance_index_ipcw,
-    cumulative_dynamic_auc,
-    integrated_brier_score,
-)
-from sksurv.nonparametric import CensoringDistributionEstimator
-from sksurv.util import Surv
 
 from trails import TrailsPrediction
+from trails.metrics import SurvivalMetrics, concordance_index
 
 from .config import BASELINE_LABELS, CRCEvaluationConfig
 
@@ -312,11 +305,15 @@ def survival_evaluation(
     # 05从float32张量计算指标，沿用同一精度以保留相同的并列时间定义。
     time = frame["survival_time"].to_numpy(dtype=np.float32).astype(float)
     risk = frame["risk_score"].to_numpy(dtype=float)
-    y_train = Surv.from_arrays(
-        train["event"].to_numpy(dtype=bool),
-        train["survival_time"].to_numpy(dtype=np.float32).astype(float),
+    event_tensor, time_tensor, risk_tensor = (
+        torch.tensor(event),
+        torch.tensor(time),
+        torch.tensor(risk),
     )
-    target = Surv.from_arrays(event, time)
+    metrics = SurvivalMetrics(
+        torch.tensor(train["event"].to_numpy(dtype=bool)),
+        torch.tensor(train["survival_time"].to_numpy(dtype=np.float32).astype(float)),
+    )
     months = np.arange(
         config.survival.curve_step_months,
         config.survival.months[-1] + 1,
@@ -324,6 +321,9 @@ def survival_evaluation(
     )
     times = months.astype(float) * 30
     probabilities = prediction.survival(times.tolist()).numpy().astype(float)
+    prediction_limit = (
+        float(prediction.cox_baseline.time[-1]) if prediction.cox_baseline is not None else np.inf
+    )
     summary: dict[str, Any] = {
         "人数": len(frame),
         "事件数": int(event.sum()),
@@ -341,21 +341,23 @@ def survival_evaluation(
         or ((~event).any() and time[event].min() <= time[~event].max())
     )
     if comparable:
-        summary["Harrell_C-index"] = float(concordance_index_censored(event, time, risk)[0])
+        summary["Harrell_C-index"] = float(
+            concordance_index(risk_tensor, time_tensor, event_tensor)
+        )
     else:
         reasons["Harrell_C-index"] = "无有效生存比较对"
     train_has_events = bool(train["event"].to_numpy().any())
-    censoring = CensoringDistributionEstimator().fit(y_train) if train_has_events else None
-    train_max = float(y_train["time"].max())
+    censoring = metrics if train_has_events else None
+    train_max = float(metrics.max_time)
     support = (times >= time.min()) & (times < time.max()) & (times < train_max)
     censor_positive = np.zeros(len(times), dtype=bool)
     if censoring is not None and support.any():
-        censor_positive[support] = np.asarray(censoring.predict_proba(times[support])) > 0
-    support &= censor_positive
+        censor_positive[support] = censoring.supported(torch.tensor(times[support])).numpy()
+    support &= censor_positive & (times <= prediction_limit)
     # AUC的库实现会为全部事件计算IPCW；不隐式截断不受支持的事件。
     event_support = censoring is not None and event.any() and time[event].max() <= train_max
     if event_support and censoring is not None:
-        event_support = bool((np.asarray(censoring.predict_proba(time[event])) > 0).all())
+        event_support = bool(censoring.supported(time_tensor[event_tensor]).all())
     in_tau = event & (time < times[-1])
     tau_comparable = in_tau.any() and (
         time[in_tau].min() < time.max()
@@ -363,7 +365,7 @@ def survival_evaluation(
     )
     if tau_comparable and support[-1] and censoring is not None:
         summary["IPCW_C-index"] = float(
-            concordance_index_ipcw(y_train, target, risk, tau=times[-1])[0]
+            metrics.cindex(risk_tensor, event_tensor, time_tensor, tau=float(times[-1]))
         )
     else:
         reasons["IPCW_C-index"] = "截断内无可比较事件或训练删失分布不支持"
@@ -378,18 +380,26 @@ def survival_evaluation(
             "Brier不可计算原因": "",
         }
     )
-    for index, t in enumerate(times):
-        if support[index] and event_support and (event & (time <= t)).any() and (time > t).any():
-            auc, _ = cumulative_dynamic_auc(y_train, target, 1 - probabilities[:, index], [t])
-            curve.loc[index, "动态AUC"] = float(auc[0])
-        else:
-            curve.loc[index, "AUC不可计算原因"] = "缺少病例/对照或训练事件及随访删失支持不足"
-    brier_supported = support & (time.max() <= train_max) & event.any()
-    if brier_supported.any():
-        _, scores = brier_score(
-            y_train, target, probabilities[:, brier_supported], times[brier_supported]
+    auc_supported = support & event_support & (curve["累积事件数"].to_numpy() > 0)
+    if auc_supported.any():
+        auc, _ = metrics.auc(
+            torch.tensor(1 - probabilities[:, auc_supported]),
+            event_tensor,
+            time_tensor,
+            torch.tensor(times[auc_supported]),
         )
-        curve.loc[brier_supported, "Brier"] = scores
+        curve.loc[auc_supported, "动态AUC"] = auc.numpy()
+    curve.loc[~auc_supported, "AUC不可计算原因"] = "缺少病例/对照或训练事件及随访删失支持不足"
+    brier_supported = support & (time.max() <= train_max) & event.any()
+    integrated_brier = None
+    if brier_supported.any():
+        scores, integrated_brier = metrics.brier(
+            torch.tensor(probabilities[:, brier_supported]),
+            event_tensor,
+            time_tensor,
+            torch.tensor(times[brier_supported]),
+        )
+        curve.loc[brier_supported, "Brier"] = scores.numpy()
     curve.loc[~brier_supported, "Brier不可计算原因"] = "当前集无事件或训练事件及随访删失支持不足"
     for metric in ("AUC", "Brier"):
         unavailable = curve.loc[curve[metric + "不可计算原因"].ne("")]
@@ -397,7 +407,7 @@ def survival_evaluation(
             reasons[metric] = "；".join(unavailable[metric + "不可计算原因"].unique())
             summary[metric + "不可计算月份"] = unavailable["月份"].tolist()
     if brier_supported.all():
-        summary["IBS"] = float(integrated_brier_score(y_train, target, probabilities, times))
+        summary["IBS"] = float(integrated_brier) if integrated_brier is not None else None
     else:
         reasons["IBS"] = "预设积分网格未全部得到支持，不缩短积分区间"
     calibration: list[dict[str, Any]] = []
@@ -426,11 +436,15 @@ def survival_evaluation(
                     "分位组": int(group) + 1,
                     "人数": int(selected.sum()),
                     "实际分组数": len(np.unique(bins)),
-                    "平均预测生存率": float(predicted[selected].mean()),
+                    "平均预测生存率": float(predicted[selected].mean())
+                    if month * 30 <= prediction_limit
+                    else np.nan,
                     "KM生存率": float(km.predict(month)) if supported else np.nan,
                     "95%CI下限": float(bounds.iloc[0]) if supported else np.nan,
                     "95%CI上限": float(bounds.iloc[1]) if supported else np.nan,
-                    "不可计算原因": "" if supported else "超过该组观察随访范围",
+                    "不可计算原因": "超过Cox训练支持范围"
+                    if month * 30 > prediction_limit
+                    else ("" if supported else "超过该组观察随访范围"),
                 }
             )
     km = KaplanMeierFitter().fit(time / 30, event)
@@ -447,4 +461,7 @@ def survival_evaluation(
     beyond = months > time.max() / 30
     overall.loc[beyond, ["KM生存率", "95%CI下限", "95%CI上限"]] = np.nan
     overall["不可计算原因"] = np.where(beyond, "超过观察随访范围", "")
+    beyond_prediction = times > prediction_limit
+    overall.loc[beyond_prediction, "平均预测生存率"] = np.nan
+    overall.loc[beyond_prediction, "不可计算原因"] = "超过Cox训练支持范围"
     return summary, curve, pd.DataFrame(calibration), overall

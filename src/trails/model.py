@@ -1,4 +1,4 @@
-"""TRAILS 的异步序列编码、重建、VaDE 聚类与 Weibull 生存模型。"""
+"""TRAILS 的异步序列编码、重建、VaDE 聚类与可选 Weibull/Cox 生存模型。"""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ from .data import Batch
 from .metrics import (
     masked_mse,
     vade_kl_loss,
-    weibull_negative_log_likelihood,
 )
+from .survival import survival_loss
 
 
 @dataclass(frozen=True)
@@ -30,8 +30,7 @@ class TrailsModelOutput:
         latent: 训练时重参数采样、评价时取均值的潜变量。
         cluster_logits: VaDE 高斯混合后验的未归一化对数分数。
         cluster_probabilities: 归一化后的后验簇概率。
-        weibull_shape: 每位患者的 Weibull 形状参数。
-        weibull_scale: 每位患者的 Weibull 尺度参数。
+        survival_log_params: Weibull 的 log(scale), log(shape)，或 Cox 的 log-risk。
     """
 
     reconstruction: Tensor
@@ -40,8 +39,7 @@ class TrailsModelOutput:
     latent: Tensor
     cluster_logits: Tensor
     cluster_probabilities: Tensor
-    weibull_shape: Tensor
-    weibull_scale: Tensor
+    survival_log_params: Tensor
 
 
 @dataclass(frozen=True)
@@ -995,11 +993,11 @@ class TransformerDecoder(nn.Module):
 
 
 class TrailsSurvVaderModel(nn.Module):
-    """联合纵向重建、VaDE 聚类和患者特异 Weibull 生存风险的核心模型。
+    """联合纵向重建、VaDE 聚类和患者特异 Weibull/Cox 生存风险的核心模型。
 
     编码器把异步纵向序列汇总为患者表示，变分层产生潜变量；高斯混合先验给出
-    后验簇概率，解码器重建纵向输入，生存头由潜均值输出正的 Weibull 形状与
-    尺度参数。损失可使用固定权重或可学习同方差不确定性权重。
+    后验簇概率，解码器重建纵向输入，生存头直接输出 Weibull log 参数或 Cox log-risk。
+    损失可使用固定权重或可学习同方差不确定性权重。
     """
 
     def __init__(self, data_config: DataConfig, model_config: ModelConfig) -> None:
@@ -1141,7 +1139,7 @@ class TrailsSurvVaderModel(nn.Module):
         模式直接使用潜空间均值。
 
         返回：
-            包含重建、潜变量、簇后验和 Weibull 参数的
+            包含重建、潜变量、簇后验和生存 log 参数的
             :class:`TrailsModelOutput`。
         """
         hidden, encoder_times, encoder_sequence_lengths = self.encoder(
@@ -1167,7 +1165,6 @@ class TrailsSurvVaderModel(nn.Module):
         cluster_logits = self._cluster_logits(latent)
         cluster_probabilities = torch.softmax(cluster_logits, dim=-1)
         survival_raw = self.survival_head(latent_mean)
-        weibull_params = F.softplus(survival_raw) + 1e-3
         return TrailsModelOutput(
             reconstruction=reconstruction,
             latent_mean=latent_mean,
@@ -1175,8 +1172,7 @@ class TrailsSurvVaderModel(nn.Module):
             latent=latent,
             cluster_logits=cluster_logits,
             cluster_probabilities=cluster_probabilities,
-            weibull_shape=weibull_params[..., 0],
-            weibull_scale=weibull_params[..., 1],
+            survival_log_params=survival_raw,
         )
 
     def _decode_reconstruction(
@@ -1221,6 +1217,7 @@ class TrailsSurvVaderModel(nn.Module):
         batch: Batch,
         *,
         include_vade_kl: bool,
+        include_survival: bool = True,
     ) -> TrailsLossBreakdown:
         """计算重建、生存、VaDE KL 及其固定或不确定性加权总损失。
 
@@ -1233,11 +1230,20 @@ class TrailsSurvVaderModel(nn.Module):
             原始损失、有效权重和总损失组成的 :class:`TrailsLossBreakdown`。
         """
         reconstruction = masked_mse(output.reconstruction, batch["x"], batch["mask"])
-        survival = weibull_negative_log_likelihood(
-            output.weibull_shape,
-            output.weibull_scale,
-            batch["survival_time"],
-            batch["event"],
+        survival_active = include_survival and self.model_config.loss.survival_weight > 0
+        survival = (
+            survival_loss(
+                output.survival_log_params,
+                batch["event"],
+                batch["survival_time"],
+                self.model_config.survival_loss,
+            )
+            if survival_active
+            else torch.tensor(
+                0.0,
+                device=output.survival_log_params.device,
+                dtype=output.survival_log_params.dtype,
+            )
         )
         if include_vade_kl:
             vade_kl = vade_kl_loss(
@@ -1252,11 +1258,30 @@ class TrailsSurvVaderModel(nn.Module):
         else:
             vade_kl = reconstruction.new_zeros(())
 
+        return self.combine_losses(
+            reconstruction,
+            survival,
+            vade_kl,
+            include_vade_kl=include_vade_kl,
+            survival_active=survival_active,
+        )
+
+    def combine_losses(
+        self,
+        reconstruction: Tensor,
+        survival: Tensor,
+        vade_kl: Tensor,
+        *,
+        include_vade_kl: bool,
+        survival_active: bool,
+    ) -> TrailsLossBreakdown:
+        """同一权重规则用于批次优化及完整验证风险集，零事件时不优化生存噪声。"""
         if self.model_config.loss.weighting == "fixed":
             return self._compute_fixed_loss_breakdown(
                 reconstruction=reconstruction,
                 survival=survival,
                 vade_kl=vade_kl,
+                survival_active=survival_active,
             )
 
         return self._compute_uncertainty_loss_breakdown(
@@ -1264,6 +1289,7 @@ class TrailsSurvVaderModel(nn.Module):
             survival=survival,
             vade_kl=vade_kl,
             include_vade_kl=include_vade_kl,
+            survival_active=survival_active,
         )
 
     def _sample_latent(self, mean: Tensor, log_variance: Tensor) -> Tensor:
@@ -1279,11 +1305,14 @@ class TrailsSurvVaderModel(nn.Module):
         reconstruction: Tensor,
         survival: Tensor,
         vade_kl: Tensor,
+        survival_active: bool,
     ) -> TrailsLossBreakdown:
         """使用配置中的固定权重组合三个损失分量。"""
         config = self.model_config.loss
         reconstruction_weight = reconstruction.new_tensor(config.reconstruction_weight)
-        survival_weight = reconstruction.new_tensor(config.survival_weight)
+        survival_weight = reconstruction.new_tensor(
+            config.survival_weight if survival_active else 0.0
+        )
         vade_kl_weight = reconstruction.new_tensor(config.cluster_weight)
         total = (
             reconstruction_weight * reconstruction
@@ -1307,12 +1336,13 @@ class TrailsSurvVaderModel(nn.Module):
         survival: Tensor,
         vade_kl: Tensor,
         include_vade_kl: bool,
+        survival_active: bool,
     ) -> TrailsLossBreakdown:
         """使用可学习对数方差组合启用的多任务损失。"""
         # 多任务不确定性加权：s=log(sigma^2)，用可学习噪声自动调节各 loss 贡献。
         reconstruction_term = self._uncertainty_weighted_loss("reconstruction", reconstruction)
         total = reconstruction_term
-        survival_enabled = self.model_config.loss.survival_weight > 0.0
+        survival_enabled = survival_active and self.model_config.loss.survival_weight > 0.0
         if survival_enabled:
             total = total + self._uncertainty_weighted_loss("survival", survival)
         if include_vade_kl:
@@ -1364,13 +1394,15 @@ class TrailsSurvVaderModel(nn.Module):
 
 
 def build_survival_head(model_config: ModelConfig) -> nn.Sequential:
-    """构建输出患者 Weibull 形状与尺度原始值的生存头。
+    """构建直接输出 Weibull log 参数或 Cox log-risk 的生存头。
 
-    可选隐藏层均保持 ``latent_dim`` 宽度并使用 ReLU，最终输出宽度为 2。
+    可选隐藏层均保持 ``latent_dim`` 宽度并使用 ReLU，最终宽度分别为 2 或 1。
     """
     layers: list[nn.Module] = []
     for _layer in range(model_config.survival_head_hidden_layers):
         layers.append(nn.Linear(model_config.latent_dim, model_config.latent_dim))
         layers.append(nn.ReLU())
-    layers.append(nn.Linear(model_config.latent_dim, 2))
+    layers.append(
+        nn.Linear(model_config.latent_dim, 2 if model_config.survival_loss == "weibull" else 1)
+    )
     return nn.Sequential(*layers)

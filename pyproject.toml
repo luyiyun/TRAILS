@@ -19,6 +19,7 @@ dependencies = [
     "torchmetrics>=1.9.0",
     "tqdm>=4.67.3",
     "umap-learn>=0.5.12",
+    "torchsurv>=0.2,<0.3",
 ]
 
 # 官方0.1.0的依赖上限停留在2023年；DCM已在本项目现代科学栈上完成运行探针。

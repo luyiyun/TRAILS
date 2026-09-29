@@ -9,12 +9,12 @@ import joblib
 import numpy as np
 import torch
 from numpy.typing import NDArray
-from sksurv.metrics import concordance_index_censored
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from trails import ClinicalTimeSeriesDataset
+from trails.metrics import concordance_index
 
 from .base import BaselineCapability, BaselinePrediction
 from .features import dataset_patient_ids, dataset_survival_arrays
@@ -240,7 +240,9 @@ class VaDeSCBaseline:
         if prediction.risk_score is None:
             raise RuntimeError("VaDeSC未返回计算C-index所需的风险分数")
         valid_event, valid_time = dataset_survival_arrays(validation)
-        cindex = concordance_index_censored(valid_event, valid_time, prediction.risk_score)[0]
+        cindex = concordance_index(
+            torch.tensor(prediction.risk_score), torch.tensor(valid_time), torch.tensor(valid_event)
+        )
         return {"bic": bic, "cindex": float(cindex)}
 
     def predict(

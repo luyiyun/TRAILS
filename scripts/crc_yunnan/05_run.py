@@ -36,7 +36,7 @@ def _save_split_outputs(
     labels = prediction.predict()
     trainer = estimator.config.trainer
     risk = prediction.risk_score(trainer.risk_horizon, method=trainer.cindex_risk_score)
-    median_time = torch.exp(-prediction.risk_score(method="median_survival"))
+    median_time = prediction.median_survival_time()
     survival_time = torch.stack([sample.survival_time for sample in dataset.samples])
     event = torch.stack([sample.event for sample in dataset.samples])
     split_dir = run_dir / split_name
@@ -61,7 +61,7 @@ def _save_split_outputs(
     return {
         "n_patients": len(dataset),
         "n_events": int(event.sum().item()),
-        "cindex": concordance_index(risk, survival_time, event),
+        "cindex": float(concordance_index(risk, survival_time, event)),
         **cluster_assignment_diagnostics(labels, n_clusters=estimator.config.model.n_clusters),
     }
 
@@ -195,7 +195,11 @@ def run(config: TrailsApplicationConfig) -> dict[str, object]:
         "panel": split_manifest["panel"],
         "selected_k": selected_k,
         "selected_seed": selected_seed,
-        "cindex_risk_score": estimator.config.trainer.cindex_risk_score,
+        "cindex_risk_score": "log_hazard"
+        if estimator.config.model.survival_loss == "cox"
+        else estimator.config.trainer.cindex_risk_score,
+        "survival_loss": estimator.config.model.survival_loss,
+        "survival_format_version": 2,
         "model": "model.pt",
         "training_history": "training_history.csv",
         "metrics": "metrics.csv",

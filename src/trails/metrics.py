@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import math
-from typing import Literal
 
 import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
 from scipy.stats import entropy
 from scipy.stats.contingency import crosstab
-from sksurv.exceptions import NoComparablePairException
-from sksurv.metrics import concordance_index_censored
 from torch import Tensor
 from torchmetrics import Metric
+from torchsurv.metrics.auc import Auc
+from torchsurv.metrics.brier_score import BrierScore
+from torchsurv.metrics.cindex import ConcordanceIndex
+from torchsurv.stats.ipcw import get_ipcw
+from torchsurv.stats.kaplan_meier import KaplanMeierEstimator
 
 
 def masked_mse(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
@@ -88,94 +90,127 @@ def gaussian_log_prob(value: Tensor, mean: Tensor, log_variance: Tensor) -> Tens
     return -0.5 * (log_two_pi + clamped_log_variance + (value - mean).pow(2) / variance)
 
 
-def weibull_negative_log_likelihood(
-    weibull_shape: Tensor,
-    weibull_scale: Tensor,
+def concordance_index(
+    risk_score: Tensor,
     survival_time: Tensor,
     event: Tensor,
-) -> Tensor:
-    """计算患者特异 Weibull 生存负对数似然。
-
-    已发生事件的样本使用密度项，删失样本使用生存函数项。
-
-    参数：
-        weibull_shape: 各患者的正 Weibull 形状参数。
-        weibull_scale: 各患者的正 Weibull 尺度参数。
-        survival_time: 每位患者的随访或事件时间。
-        event: 每位患者的事件指示。
-
-    返回：
-        批次平均的标量负对数似然。
-    """
-    time = survival_time.clamp_min(1e-4)
-    log_time = torch.log(time)
-    log_shape = torch.log(weibull_shape)
-    log_scale = torch.log(weibull_scale)
-    scaled_time = torch.pow(time / weibull_scale, weibull_shape)
-    log_density = (
-        log_shape - log_scale + (weibull_shape - 1.0) * (log_time - log_scale) - scaled_time
-    )
-    log_survival = -scaled_time
-    log_likelihood = event * log_density + (1.0 - event) * log_survival
-    return -log_likelihood.mean()
-
-
-def weibull_event_probability(
-    weibull_shape: Tensor,
-    weibull_scale: Tensor,
-    horizon: float,
-) -> Tensor:
-    """计算固定时间窗内的患者 Weibull 事件概率。"""
-    if not math.isfinite(horizon) or horizon <= 0.0:
-        raise ValueError("horizon must be finite and positive.")
-    time = weibull_scale.new_tensor(horizon)
-    cumulative_hazard = torch.pow(time / weibull_scale, weibull_shape)
-    return -torch.expm1(-cumulative_hazard)
-
-
-def weibull_risk_score(
-    weibull_shape: Tensor,
-    weibull_scale: Tensor,
-    horizon: float | None = None,
     *,
-    method: Literal["event_probability", "median_survival"] = "event_probability",
+    weight: Tensor | None = None,
+    tau: float | None = None,
 ) -> Tensor:
-    """将患者 Weibull 曲线转换成越大越危险的 C-index 排序分数。"""
-    if method == "median_survival":
-        # 在对数域计算负中位时间，保持排序并避免极短中位时间产生数值并列。
-        return -(weibull_scale.double().log() + math.log(math.log(2.0)) / weibull_shape.double())
-    if method != "event_probability":
-        raise ValueError(f"Unknown risk score method: {method}")
-    if horizon is None:
-        raise ValueError("event_probability requires a positive horizon.")
-    return weibull_event_probability(weibull_shape, weibull_scale, horizon)
+    """由 TorchSurv 计算 Harrell/Uno C-index；保留训练入口无比较对时的 0 约定。"""
+    risk = risk_score.reshape(-1)
+    time = survival_time.reshape(-1)
+    events = event.bool().reshape(-1)
+    eligible = events if tau is None else events & (time < tau)
+    if len(time) < 2 or not bool(eligible.any()):
+        return risk.new_zeros(())
+    comparable = time[eligible].min() < time.max() or (
+        bool((~events).any()) and time[eligible].min() <= time[~events].max()
+    )
+    if not comparable:
+        return risk.new_zeros(())
+    return ConcordanceIndex(tied_tol=1e-8)(
+        risk,
+        events,
+        time,
+        weight=weight,
+        tmax=None if tau is None else time.new_tensor(tau),
+        instate=False,
+    )
 
 
-def concordance_index(risk_score: Tensor, survival_time: Tensor, event: Tensor) -> float:
-    """计算考虑删失的 Harrell C-index。
+class SurvivalMetrics:
+    """训练集 IPCW 适配；输入须位于同一设备，结果保留设备，不实现指标或 KM 公式。"""
 
-    风险分数越大表示预测风险越高。少于两个样本、没有事件或不存在可比较样本
-    对时返回 ``0.0``。
+    def __init__(self, train_event: Tensor, train_time: Tensor) -> None:
+        self.event = train_event.detach().bool()
+        self.time = train_time.detach()
+        self.max_time = self.time.max()
 
-    参数：
-        risk_score: 每位患者的连续风险分数。
-        survival_time: 每位患者的随访或事件时间。
-        event: 每位患者的事件指示。
+    def supported(self, times: Tensor) -> Tensor:
+        """零删失概率和超出训练随访范围均不能作为有效 IPCW 支持。"""
+        grid = times
+        result = (grid <= self.max_time) & (grid >= 0)
+        if bool(result.any()):
+            result[result.clone()] = get_ipcw(self.event, self.time, grid[result]) > 0
+        return result
 
-    返回：
-        ``[0, 1]`` 范围内的 concordance 指标；不可计算时为 ``0.0``。
-    """
-    risk = risk_score.detach().cpu().reshape(-1).double().numpy()
-    time = survival_time.detach().cpu().reshape(-1).double().numpy()
-    event_indicator = event.detach().cpu().reshape(-1).bool().numpy()
-    if len(time) < 2 or not event_indicator.any():
-        return 0.0
-    try:
-        result = concordance_index_censored(event_indicator, time, risk, tied_tol=1e-8)
-    except NoComparablePairException:
-        return 0.0
-    comparable = int(result[1] + result[2] + result[3])
-    return float(result[0]) if comparable > 0 else 0.0
+    def _weights(self, times: Tensor) -> Tensor:
+        if not bool(self.supported(times).all()):
+            raise ValueError(
+                "Training censoring distribution does not support the requested times."
+            )
+        return get_ipcw(self.event, self.time, times).to(times.dtype)
+
+    def _event_weights(self, event: Tensor, time: Tensor, tau: float | None = None) -> Tensor:
+        # 删失者不作为病例；Uno 截断后的患者仍保留为比较对照。
+        selected = event if tau is None else event & (time < tau)
+        weights = torch.zeros_like(time)
+        if bool(selected.any()):
+            weights[selected] = self._weights(time[selected])
+        return weights
+
+    def cindex(
+        self,
+        risk: Tensor,
+        event: Tensor,
+        time: Tensor,
+        *,
+        tau: float,
+    ) -> Tensor:
+        events, times = event.bool(), time
+        return concordance_index(
+            risk, times, events, weight=self._event_weights(events, times, tau), tau=tau
+        )
+
+    def auc(
+        self,
+        risk: Tensor,
+        event: Tensor,
+        time: Tensor,
+        grid: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        events, times, points = event.bool(), time, grid
+        # 库内部部分临时张量未显式指定设备，使用局部默认设备避免 CPU/GPU 混用。
+        with torch.device(risk.device):
+            metric = Auc(tied_tol=1e-8)
+            values = metric(
+                risk,
+                events,
+                times,
+                auc_type="cumulative",
+                new_time=points,
+                weight=self._event_weights(events, times),
+                weight_new_time=self._weights(points),
+            )
+            if risk.device.type != "cpu" and len(points) > 1:
+                # TorchSurv 0.2 integral() 的 KM 默认在 CPU；仅补设备，积分仍调用库原实现。
+                km = KaplanMeierEstimator(device=str(risk.device))
+                km(events, times)
+                return values, metric._integrate_cumulative(km.predict(points), points[-1])
+            return values, metric.integral()
+
+    def brier(
+        self,
+        probabilities: Tensor,
+        event: Tensor,
+        time: Tensor,
+        grid: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        events, times, points = event.bool(), time, grid
+        if times.max() > self.max_time:
+            raise ValueError("Evaluation follow-up exceeds training censoring support.")
+        metric = BrierScore()
+        values = metric(
+            probabilities,
+            events,
+            times,
+            new_time=points,
+            weight=self._event_weights(events, times),
+            weight_new_time=self._weights(points),
+        )
+        return values, metric.integral()
 
 
 def cluster_assignment_diagnostics(pred_cluster: Tensor, *, n_clusters: int) -> dict[str, float]:
@@ -233,7 +268,7 @@ class Cindex(Metric):
         time = torch.cat(self.time, dim=0)
         event = torch.cat(self.event, dim=0)
 
-        return risk.new_tensor(concordance_index(risk, time, event))
+        return concordance_index(risk, time, event)
 
 
 def cluster_accuracy(pred_cluster: Tensor, true_cluster: Tensor) -> float:

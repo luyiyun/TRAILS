@@ -30,7 +30,7 @@ fit_group() {
         printf '探索进度 %s/38：%s %s seed=%s\n' "$completed" "$stage" "$label" "$seed"
         started=$(date +%s)
         uv run python -m scripts.crc_yunnan.05_run model=base trainer=full \
-            trainer.valid_size=0.0 trainer.cindex_risk_score=median_survival \
+            trainer.valid_size=0.0 model.survival_loss=weibull trainer.cindex_risk_score=median_survival \
             swanlab.enabled=false "${reference_args[@]}" "$@" "${smoke_overrides[@]}" \
             n_clusters=3 "trainer.seed=$seed" "paths.dir=$group/seed-$seed"
         finished=$(date +%s)

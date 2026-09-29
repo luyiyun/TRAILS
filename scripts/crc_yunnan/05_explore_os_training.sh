@@ -63,6 +63,7 @@ STAGE_LIMITS = {"A": 18, "B": 8, "C": 2, "D": 54}
 MODULES = {"preproc": "04_preproc", "run": "05_run", "evaluate": "06_evaluate"}
 BASE_OVERRIDES: dict[str, Any] = {
     "model": "base",
+    "model.survival_loss": "weibull",
     "trainer": "full",
     "split.strategy": "random",
     "split.seed": 20260908,
@@ -814,6 +815,7 @@ def main() -> int:
     root, split = args.output.resolve(), args.split_dir.resolve()
     template_data, template_run = root / "preproc/template", root / "runs/template"
     contract = {
+        "survival_format_version": 2,
         "script_sha256": hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest(),
         "budget_hours": args.budget_hours,
         "preproc": resolved(

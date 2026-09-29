@@ -12,22 +12,17 @@ from typing import Any, Literal, cast
 import hydra
 import numpy as np
 import pandas as pd
+import torch
 from lifelines.exceptions import ConvergenceError
 from omegaconf import DictConfig
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from sksurv.compare import compare_survival
-from sksurv.metrics import (
-    brier_score,
-    concordance_index_censored,
-    concordance_index_ipcw,
-    cumulative_dynamic_auc,
-    integrated_brier_score,
-)
 from sksurv.nonparametric import kaplan_meier_estimator
 from sksurv.util import Surv
 
 from trails import ClinicalTimeSeriesDataset
 from trails.artifacts import save_json
+from trails.metrics import SurvivalMetrics, concordance_index
 from trails_simulate.config import resolved_payload
 
 from ..baselines.base import BaselinePrediction
@@ -304,25 +299,70 @@ def evaluate_split(
     if selected_metrics & SURVIVAL_METRICS:
         assert train is not None and prediction is not None and evaluation_set is not None
         risk = target["risk_score"].to_numpy(dtype=np.float64)
-        train_survival = Surv.from_arrays(
-            train["event"].to_numpy(dtype=bool),
-            train["survival_time"].to_numpy(dtype=np.float64),
+        event_tensor, time_tensor, risk_tensor = (
+            torch.tensor(event),
+            torch.tensor(time),
+            torch.tensor(risk),
         )
-        target_survival = Surv.from_arrays(event, time)
+        survival_metrics = SurvivalMetrics(
+            torch.tensor(train["event"].to_numpy(dtype=bool)),
+            torch.tensor(train["survival_time"].to_numpy(dtype=np.float64)),
+        )
+        train_max = float(survival_metrics.max_time)
         summary.update(
             evaluation_set=evaluation_set,
             censoring_reference_set="train",
             n_train=len(train),
-            risk_definition="1-S(tau); fixed-horizon score also used for dynamic AUC",
+            risk_definition=(
+                "Cox log-risk; also used for dynamic AUC"
+                if prediction.risk_method == "log_hazard"
+                else "1-S(tau); fixed-horizon score also used for dynamic AUC"
+            ),
+        )
+        unavailable: dict[str, Any] = {}
+        summary["unavailable_reasons"] = unavailable
+        train_has_events = bool(survival_metrics.event.any())
+        event_supported = (
+            train_has_events
+            and event.any()
+            and bool(survival_metrics.supported(time_tensor[event_tensor]).all())
+        )
+        comparable = event.any() and (
+            time[event].min() < time.max()
+            or ((~event).any() and time[event].min() <= time[~event].max())
         )
 
         # 7. Harrell与IPCW C-index。
         if "harrell_cindex" in selected_metrics:
-            summary["harrell_cindex"] = float(concordance_index_censored(event, time, risk)[0])
-        if "ipcw_cindex" in selected_metrics:
-            summary["ipcw_cindex"] = float(
-                concordance_index_ipcw(train_survival, target_survival, risk, tau=config.tau)[0]
+            summary["harrell_cindex"] = (
+                float(concordance_index(risk_tensor, time_tensor, event_tensor))
+                if comparable
+                else None
             )
+            if not comparable:
+                unavailable["harrell_cindex"] = "No comparable survival pairs"
+        if "ipcw_cindex" in selected_metrics:
+            in_tau = event & (time < config.tau)
+            uno_supported = (
+                train_has_events
+                and in_tau.any()
+                and (
+                    time[in_tau].min() < time.max()
+                    or ((~event).any() and time[in_tau].min() <= time[~event].max())
+                )
+            )
+            uno_supported = uno_supported and bool(
+                survival_metrics.supported(torch.tensor(time[in_tau])).all()
+            )
+            summary["ipcw_cindex"] = (
+                float(
+                    survival_metrics.cindex(risk_tensor, event_tensor, time_tensor, tau=config.tau)
+                )
+                if uno_supported
+                else None
+            )
+            if not uno_supported:
+                unavailable["ipcw_cindex"] = "No comparable events or training IPCW support"
             summary["ipcw_tau"] = config.tau
 
         # 8. 累积/动态AUC。
@@ -330,15 +370,35 @@ def evaluate_split(
         if "dynamic_auc" in selected_metrics:
             if len(auc_times) == 0 or np.any(np.diff(auc_times) <= 0):
                 raise ValueError("auc_times 必须为非空严格递增序列")
-            if auc_times[0] <= time.min() or auc_times[-1] >= time.max():
-                raise ValueError(f"auc_times 必须位于 {evaluation_set} 随访时间的开区间内")
-            dynamic_auc_values, mean_auc = cumulative_dynamic_auc(
-                train_survival, target_survival, risk, auc_times
+            auc_supported = (
+                (auc_times > time.min())
+                & (auc_times < time.max())
+                & (np.sum(event[:, None] & (time[:, None] <= auc_times), axis=0) > 0)
+                & event_supported
             )
-            summary["dynamic_auc"] = dict(
-                zip(map(str, auc_times), map(float, dynamic_auc_values), strict=True)
-            )
-            summary["mean_dynamic_auc"] = float(mean_auc)
+            if train_has_events:
+                auc_supported &= survival_metrics.supported(torch.tensor(auc_times)).numpy()
+            dynamic_auc_values = np.full(len(auc_times), np.nan)
+            mean_auc = None
+            if auc_supported.any():
+                auc_values, auc_integral = survival_metrics.auc(
+                    risk_tensor, event_tensor, time_tensor, torch.tensor(auc_times[auc_supported])
+                )
+                dynamic_auc_values[auc_supported] = auc_values.numpy()
+                mean_auc = float(auc_integral)
+            summary["dynamic_auc"] = {
+                str(t): float(value) if supported else None
+                for t, value, supported in zip(
+                    auc_times, dynamic_auc_values, auc_supported, strict=True
+                )
+            }
+            summary["mean_dynamic_auc"] = mean_auc if auc_supported.all() else None
+            if not auc_supported.all():
+                unavailable["dynamic_auc"] = {
+                    str(t): "No cases/controls or training IPCW support"
+                    for t in auc_times[~auc_supported]
+                }
+                unavailable["mean_dynamic_auc"] = "Full configured integration grid unsupported"
 
         # *. Brier、IBS和分位数组KM校准共用冻结生存曲线。
         probability_times = np.asarray(config.probability_times, dtype=np.float64)
@@ -350,8 +410,6 @@ def evaluate_split(
         if selected_metrics & curve_metrics:
             if len(probability_times) < 2 or np.any(np.diff(probability_times) <= 0):
                 raise ValueError("probability_times 必须包含至少两个严格递增时间点")
-            if probability_times[0] <= time.min() or probability_times[-1] >= time.max():
-                raise ValueError(f"probability_times 必须位于 {evaluation_set} 随访时间的开区间内")
             assert prediction.survival_times is not None
             assert prediction.survival_probabilities is not None
             indices = np.searchsorted(prediction.survival_times, probability_times)
@@ -360,44 +418,122 @@ def evaluate_split(
             ):
                 raise ValueError("冻结曲线缺少09需要的时间点，不能外插或重拟合")
             probabilities = prediction.survival_probabilities[:, indices]
+            brier_supported = (
+                (probability_times > time.min())
+                & (probability_times < time.max())
+                & (time.max() <= train_max)
+                & event_supported
+            )
+            if train_has_events:
+                brier_supported &= survival_metrics.supported(
+                    torch.tensor(probability_times)
+                ).numpy()
+            brier_values = np.full(len(probability_times), np.nan)
+            integrated_brier = None
+            if (
+                selected_metrics & {"brier_score", "integrated_brier_score"}
+                and brier_supported.any()
+            ):
+                scores, brier_integral = survival_metrics.brier(
+                    torch.tensor(probabilities[:, brier_supported]),
+                    event_tensor,
+                    time_tensor,
+                    torch.tensor(probability_times[brier_supported]),
+                )
+                brier_values[brier_supported] = scores.numpy()
+                integrated_brier = float(brier_integral)
+            if not brier_supported.all():
+                unavailable["brier_score"] = {
+                    str(t): "Evaluation follow-up or training IPCW support unavailable"
+                    for t in probability_times[~brier_supported]
+                }
+                unavailable["integrated_brier_score"] = (
+                    "Full configured integration grid unsupported"
+                )
 
             # 9. Brier
             if "brier_score" in selected_metrics:
-                _, brier_values = brier_score(
-                    train_survival, target_survival, probabilities, probability_times
-                )
-                summary["brier_score"] = dict(
-                    zip(map(str, probability_times), map(float, brier_values), strict=True)
-                )
-                pd.DataFrame({"time": probability_times, "brier_score": brier_values}).to_csv(
-                    output / "brier_scores.csv", index=False
-                )
+                summary["brier_score"] = {
+                    str(t): float(value) if supported else None
+                    for t, value, supported in zip(
+                        probability_times, brier_values, brier_supported, strict=True
+                    )
+                }
+                pd.DataFrame(
+                    {
+                        "time": probability_times,
+                        "brier_score": brier_values,
+                        "unavailable_reason": np.where(
+                            brier_supported,
+                            "",
+                            "Evaluation follow-up or training IPCW support unavailable",
+                        ),
+                    }
+                ).to_csv(output / "brier_scores.csv", index=False)
 
             # 10. IBS
             if "integrated_brier_score" in selected_metrics:
-                integrated_brier = float(
-                    integrated_brier_score(
-                        train_survival, target_survival, probabilities, probability_times
-                    )
+                summary["integrated_brier_score"] = (
+                    integrated_brier if brier_supported.all() else None
                 )
-                summary["integrated_brier_score"] = integrated_brier
 
             # 11. 分位数组校准：按配置时间点分别比较分位数组预测值与KM观察值。
             if "survival_calibration" in selected_metrics:
                 calibration_analysis = SurvivalCalibration(
-                    event, time, probabilities, probability_times, config.calibration_bins
+                    event,
+                    time,
+                    probabilities,
+                    probability_times,
+                    config.calibration_bins,
+                    prediction_support_max=(
+                        train_max if prediction.risk_method == "log_hazard" else np.inf
+                    ),
                 )
                 calibration_table, calibration_errors = calibration_analysis.calculate()
                 calibration_table.to_csv(output / "calibration.csv", index=False)
-                summary["calibration_weighted_absolute_error"] = calibration_errors
+                summary["calibration_weighted_absolute_error"] = {
+                    t: value if np.isfinite(value) else None
+                    for t, value in calibration_errors.items()
+                }
+                if not all(np.isfinite(value) for value in calibration_errors.values()):
+                    unavailable["survival_calibration"] = (
+                        "Prediction or within-bin observed follow-up support unavailable"
+                    )
                 summary["calibration_bins"] = config.calibration_bins
 
         # 12. 固定tau时预测生存率与总体KM生存率。
         if "survival_at_tau" in selected_metrics:
             km_time, km_survival = kaplan_meier_estimator(event, time)[:2]
             index = int(np.searchsorted(km_time, config.tau, side="right") - 1)
-            summary["mean_predicted_survival_tau"] = float((1.0 - risk).mean())
-            summary["observed_km_survival_tau"] = 1.0 if index < 0 else float(km_survival[index])
+            if prediction.risk_method == "log_hazard":
+                assert (
+                    prediction.survival_times is not None
+                    and prediction.survival_probabilities is not None
+                )
+                tau_index = int(np.searchsorted(prediction.survival_times, config.tau))
+                if (
+                    tau_index >= len(prediction.survival_times)
+                    or prediction.survival_times[tau_index] != config.tau
+                ):
+                    raise ValueError("Cox预测曲线缺少tau，不能将log-risk当作事件概率")
+                summary["mean_predicted_survival_tau"] = (
+                    float(prediction.survival_probabilities[:, tau_index].mean())
+                    if config.tau <= train_max
+                    else None
+                )
+                if config.tau > train_max:
+                    summary["survival_at_tau_unavailable_reason"] = (
+                        "Cox tau exceeds training support"
+                    )
+            else:
+                summary["mean_predicted_survival_tau"] = float((1.0 - risk).mean())
+            summary["observed_km_survival_tau"] = (
+                (1.0 if index < 0 else float(km_survival[index]))
+                if config.tau <= time.max()
+                else None
+            )
+            if config.tau > time.max():
+                unavailable["observed_km_survival_tau"] = "Beyond observed follow-up support"
 
     # ==================================================================================
     # 三、绘图；绘图只消费已选择并完成计算的指标。
@@ -460,7 +596,7 @@ def evaluate_split(
                 y_values = [summary["brier_score"][str(float(day))] for day in x_values]
                 axis.plot(x_values, y_values, color="#D55E00")
                 axis.set(
-                    title=f"Brier score (IBS={summary['integrated_brier_score']:.3f})",
+                    title=f"Brier score (IBS={summary.get('integrated_brier_score')})",
                     ylabel="Brier score",
                 )
                 axis.set_ylim(bottom=0.0)
@@ -493,7 +629,7 @@ def evaluate_split(
                 "mean_dynamic_auc",
                 "integrated_brier_score",
             )
-            if key in summary
+            if key in summary and summary[key] is not None
         ]
         if not np.isfinite(scalar_metrics).all():
             raise ValueError("生存评价产生非有限核心指标")

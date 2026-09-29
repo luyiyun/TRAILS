@@ -14,9 +14,71 @@ Subtypes** 的缩写。项目目标是构建面向非同步多变量医学纵向
   per-feature `mtan2` 输入层用于对照。
 - 解码器支持 GRU/LSTM/Transformer，从患者级 latent representation 重构纵向轨迹。
 - 聚类模块使用 VaDE 风格的可学习 Gaussian mixture latent prior。
-- 生存模块由患者 latent mean 输出一组 Weibull shape/scale，不跨簇混合生存分布。
+- 生存模块由患者 latent mean 直接输出 Weibull log 参数或 Cox log-risk，不跨簇混合生存分布。
 
 本阶段不实现 mixed-type likelihood、competing risks 或 recurrent events。
+
+## 生存损失与评价（TorchSurv）
+
+`model.survival_loss` 可选 `weibull`（通用默认）或 `cox`（CRC 默认）。基础预设
+保留一个隐藏层。Weibull 最终两列直接为 `log(scale), log(shape)`；Cox 为一个
+`log-risk`，均不再经过 softplus。两种生存损失及 Harrell/Uno C-index、动态 AUC、
+Brier/IBS 统一调用 TorchSurv 0.2，具体版本由 `uv.lock` 固定。
+
+```bash
+# CRC：Cox；继续使用现有冻结预处理数据和训练协议
+uv run python -m scripts.crc_yunnan.05_run model.survival_loss=cox
+# Weibull：如需沿用中位时间排序，显式指定
+uv run python -m scripts.crc_yunnan.05_run model.survival_loss=weibull trainer.cindex_risk_score=median_survival
+```
+
+Cox 采用 Efron 并列时间处理，训练损失是按事件归一化的 **mini-batch 风险集近似**；
+验证和测试在完整风险集计算。两者计算口径不同，不能将两条损失曲线的差距直接视为
+泛化差距；这一固定约定不在每个 epoch 的历史中重复记录。单患者批次跳过生存项和对应 uncertainty
+正则；warmup 仍优化重建及启用的生存目标。训练调用只将时间映射为保序秩并把同刻删失
+排在死亡之后，以避开 TorchSurv 0.2 无并列死亡分支的风险集排序歧义；真实时间用于基线。
+
+`estimator.fit()` 完成内部训练/验证划分后，分别检查实际训练集和验证集至少有一个事件；
+`estimator.test()` 同样在入口校验，无事件立即报错，两种生存头均遵守这一约定。
+Cox 训练通过 `EventBatchSampler` 先将事件患者均分到各批次，再分配删失患者；每轮
+每名患者恰好使用一次，批次人数尽量均衡且不超过 batch size。每轮重新随机分配，相同
+seed 可复现。事件数少于所需批次数时在训练前报错，需增大 batch size。现有 collate
+负责 aligned/compact 张量整理。模型、loss 适配及基线拟合不重复判断事件是否存在；
+验证、测试、预测及基线估计使用普通加载器。纯预测 `predict()` 不要求结局中存在事件。
+
+`prediction.risk_score()` 在 Cox 下直接返回 log-risk，越大越危险；Weibull 默认仍需
+传入时间窗。`prediction.risk_score(t, method="event_probability")` 返回 `1-S(t)`，
+`prediction.survival(times)` 返回完整曲线。Cox 基线在最佳模型恢复后，仅用实际参与优化
+的训练子集估计；不含内部验证集。保存模型和预测时同时保存基线。Cox 曲线按右连续阶梯
+取值，首个观察时间前为 1，尾部延续最后值；尾部延续不代表支持外的有效绝对风险预测。
+`median_survival_time()` 在 Cox 支持范围内未达到 0.5 时返回 NaN。
+
+评价的 IPCW 始终由训练集估计并显式传给 TorchSurv；AUC 使用 cumulative/dynamic
+定义，Brier 输入生存概率。无病例/对照、删失权重不受支持等评价点保留缺失和原因，IBS
+不缩短预设积分区间。CRC 术后3/5年 AUC 均值仍是两点算术平均；综合动态 AUC 则使用
+库的 `Auc.integral()`。C-index 在整轮汇总后计算，不平均批次 C-index。
+
+生存指标入口接收同一设备上的 Tensor，并返回该设备上的 Tensor；不在计算前搬到
+CPU 或统一转成 float64。训练和 K 选择保留模型设备，仅在写入最终标量结果时转换。
+CRC/MIMIC 的 pandas 报表在调用端转换 NumPy/Tensor。`Cindex` 只承担跨批次累积；
+`concordance_index` 保留无有效比较对时的既有返回约定；`SurvivalMetrics` 保存训练集
+删失参考，负责传入 IPCW 和检查支持范围，所有指标公式仍由 TorchSurv 计算。
+TorchSurv 0.2 的 AUC 部分临时张量没有指定设备，调用时使用局部设备上下文；
+多时间点 `Auc.integral()` 内部 KM 默认使用 CPU，GPU 路径显式创建
+同设备的库 KM 估计器，再调用库的 `_integrate_cumulative`，不复制积分公式。
+
+**格式变更：** 新 checkpoint 和预测文件保存生存类型、log 参数及格式版本 2。
+旧 softplus 权重及旧预测文件明确拒绝读取，历史实验请使用原代码；探索脚本显式固定
+Weibull 并在续跑契约中记录新格式，禁止混用旧结果。直接输出 log 参数改变了参数化和
+训练动态，新 Weibull 训练不要求重现旧曲线。库的有限精度、极值截断处理也可能造成微小
+数值差异；不改变已冻结实验的患者级产物。TorchSurv 0.2 的通用 eager 输入校验拒绝
+全删失批次，而 Weibull 完整似然在这种批次仍有效，因此 Weibull 使用库支持的脚本化
+loss 路径，保留删失患者的梯度，不补造事件。
+
+并列风险容差显式保持 `1e-8`，但 TorchSurv 0.2 的 C-index 内部使用 float32 判断
+风险并列。例如 float64 的 `1` 与 `1+2e-8` 会被视为并列，与旧 scikit-survival 的
+双精度比较有差异。常规合成数据的指标对照通过；近浮点精度边界以所锁定库的实现为准，
+不在项目中复制一套指标算法纠正库的舍入行为。
 
 ## 数据结构
 

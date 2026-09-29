@@ -26,6 +26,7 @@ k_selection:
   result_dir: k_selection
 
 model:
+  survival_loss: cox
   latent_dim: 32
   loss:
     weighting: uncertainty
@@ -39,8 +40,8 @@ trainer:
   learning_rate: 1e-3
   warmup_epochs: 10
   gmm_init_iters: 5
-  # 使用负对数预测中位OS时间排序；不使用risk_horizon，也不截断随访。
-  cindex_risk_score: median_survival
+  # Cox 直接使用 log-risk 排序；不依赖风险时间窗或基线。
+  cindex_risk_score: auto
 artifacts:
   names: [history]
 swanlab:

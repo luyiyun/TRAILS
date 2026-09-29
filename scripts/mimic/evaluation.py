@@ -125,6 +125,11 @@ def load_prediction(
     if method["prediction_format"] == "trails":
         saved = TrailsPrediction.load(directory / "model_prediction.pt")
         survival = "survival" in method["capabilities"]
+        curve_times = (
+            np.union1d(config.probability_times, [config.tau])
+            if saved.survival_kind == "cox"
+            else np.asarray(config.probability_times)
+        )
         prediction = BaselinePrediction(
             method_name=method["name"],
             patient_ids=dataset_patient_ids(dataset),
@@ -134,10 +139,9 @@ def load_prediction(
             if survival
             else None,
             risk_horizon=config.tau if survival else None,
-            survival_times=np.asarray(config.probability_times) if survival else None,
-            survival_probabilities=saved.survival(config.probability_times)
-            .numpy()
-            .astype(np.float64)
+            risk_method="log_hazard" if saved.survival_kind == "cox" else "event_probability",
+            survival_times=curve_times if survival else None,
+            survival_probabilities=saved.survival(curve_times.tolist()).numpy().astype(np.float64)
             if survival
             else None,
         )
@@ -195,12 +199,15 @@ class SurvivalCalibration:
         predicted_survival: np.ndarray,
         times: np.ndarray,
         n_bins: int,
+        *,
+        prediction_support_max: float = np.inf,
     ) -> None:
         self.event = event
         self.followup = followup
         self.predicted_survival = predicted_survival
         self.times = times
         self.n_bins = n_bins
+        self.prediction_support_max = prediction_support_max
         self._table: pd.DataFrame | None = None
         self._weighted_absolute_errors: dict[str, float] | None = None
 
@@ -209,9 +216,26 @@ class SurvivalCalibration:
         if self._table is not None and self._weighted_absolute_errors is not None:
             return self._table.copy(), dict(self._weighted_absolute_errors)
 
-        rows: list[dict[str, float | int]] = []
+        rows: list[dict[str, Any]] = []
         weighted_errors: dict[str, float] = {}
         for time_index, calibration_time in enumerate(self.times):
+            if (
+                calibration_time > self.prediction_support_max
+                or calibration_time > self.followup.max()
+            ):
+                rows.append(
+                    {
+                        "time": float(calibration_time),
+                        "bin": 0,
+                        "n_patients": len(self.event),
+                        "mean_predicted_survival": np.nan,
+                        "observed_survival_km": np.nan,
+                        "absolute_error": np.nan,
+                        "unavailable_reason": "Beyond prediction or observed follow-up support",
+                    }
+                )
+                weighted_errors[str(calibration_time)] = float("nan")
+                continue
             predicted = self.predicted_survival[:, time_index]
             groups = np.asarray(
                 pd.qcut(
@@ -233,7 +257,11 @@ class SurvivalCalibration:
                     self.followup[selected],
                 )[:2]
                 km_index = int(np.searchsorted(km_time, calibration_time, side="right") - 1)
-                observed = 1.0 if km_index < 0 else float(km_survival[km_index])
+                observed = (
+                    (1.0 if km_index < 0 else float(km_survival[km_index]))
+                    if calibration_time <= self.followup[selected].max()
+                    else float("nan")
+                )
                 mean_predicted = float(predicted[selected].mean())
                 time_rows.append(
                     {
