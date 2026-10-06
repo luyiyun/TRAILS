@@ -397,7 +397,7 @@ def main() -> int:
         "preproc", preproc_values(base, split, root / "preproc", root / "logs")
     )
     contract = {
-        "survival_format_version": 2,
+        "survival_format_version": 3,
         "脚本SHA256": script_hash,
         "预算小时": args.budget_hours,
         "run": run_config,

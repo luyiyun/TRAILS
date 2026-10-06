@@ -321,9 +321,6 @@ def survival_evaluation(
     )
     times = months.astype(float) * 30
     probabilities = prediction.survival(times.tolist()).numpy().astype(float)
-    prediction_limit = (
-        float(prediction.cox_baseline.time[-1]) if prediction.cox_baseline is not None else np.inf
-    )
     summary: dict[str, Any] = {
         "人数": len(frame),
         "事件数": int(event.sum()),
@@ -353,7 +350,7 @@ def survival_evaluation(
     censor_positive = np.zeros(len(times), dtype=bool)
     if censoring is not None and support.any():
         censor_positive[support] = censoring.supported(torch.tensor(times[support])).numpy()
-    support &= censor_positive & (times <= prediction_limit)
+    support &= censor_positive
     # AUC的库实现会为全部事件计算IPCW；不隐式截断不受支持的事件。
     event_support = censoring is not None and event.any() and time[event].max() <= train_max
     if event_support and censoring is not None:
@@ -436,15 +433,11 @@ def survival_evaluation(
                     "分位组": int(group) + 1,
                     "人数": int(selected.sum()),
                     "实际分组数": len(np.unique(bins)),
-                    "平均预测生存率": float(predicted[selected].mean())
-                    if month * 30 <= prediction_limit
-                    else np.nan,
+                    "平均预测生存率": float(predicted[selected].mean()),
                     "KM生存率": float(km.predict(month)) if supported else np.nan,
                     "95%CI下限": float(bounds.iloc[0]) if supported else np.nan,
                     "95%CI上限": float(bounds.iloc[1]) if supported else np.nan,
-                    "不可计算原因": "超过Cox训练支持范围"
-                    if month * 30 > prediction_limit
-                    else ("" if supported else "超过该组观察随访范围"),
+                    "不可计算原因": "" if supported else "超过该组观察随访范围",
                 }
             )
     km = KaplanMeierFitter().fit(time / 30, event)
@@ -461,7 +454,4 @@ def survival_evaluation(
     beyond = months > time.max() / 30
     overall.loc[beyond, ["KM生存率", "95%CI下限", "95%CI上限"]] = np.nan
     overall["不可计算原因"] = np.where(beyond, "超过观察随访范围", "")
-    beyond_prediction = times > prediction_limit
-    overall.loc[beyond_prediction, "平均预测生存率"] = np.nan
-    overall.loc[beyond_prediction, "不可计算原因"] = "超过Cox训练支持范围"
     return summary, curve, pd.DataFrame(calibration), overall

@@ -425,7 +425,7 @@ class ClusterNumberSelector:
                 concordance_index(
                     survival_risk(
                         outputs.survival_log_params,
-                        estimator.config.model.survival_loss,
+                        outputs.cluster_probabilities,
                         estimator.config.trainer.risk_horizon,
                         method=estimator.config.trainer.cindex_risk_score,
                     ).detach(),

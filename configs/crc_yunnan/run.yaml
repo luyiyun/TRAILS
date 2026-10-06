@@ -26,7 +26,7 @@ k_selection:
   result_dir: k_selection
 
 model:
-  survival_loss: cox
+  survival_loss: weibull
   latent_dim: 32
   loss:
     weighting: uncertainty
@@ -40,7 +40,7 @@ trainer:
   learning_rate: 1e-3
   warmup_epochs: 10
   gmm_init_iters: 5
-  # Cox 直接使用 log-risk 排序；不依赖风险时间窗或基线。
+  # 使用配置时间窗内的混合事件概率排序。
   cindex_risk_score: auto
 artifacts:
   names: [history]

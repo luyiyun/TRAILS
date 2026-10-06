@@ -202,14 +202,14 @@ class LossConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
-    """配置完整的 Surv-VaDER 模型架构。
+    """配置簇特异生存变分 TRAILS 模型架构。
 
     属性：
         latent_dim: 患者变分表示的宽度。
         n_clusters: 高斯混合分量及患者亚型的数量。
         dropout: 支持该操作的网络层所使用的 dropout 概率。
-        survival_head_hidden_layers: 输出生存 log 参数前使用的潜空间等宽隐藏层数量。
-        survival_loss: Weibull 完整似然或 Cox 部分似然。
+        survival_head_hidden_layers: 多输出生存头的潜空间等宽隐藏层数量。
+        survival_loss: 簇特异 Weibull；Cox 枚举保留但尚未实现。
         loss: 多任务损失加权配置。
         encoder: 异步输入和时序映射配置。
         decoder: 纵向重建配置。
@@ -249,7 +249,7 @@ class TrainerConfig(BaseModel):
         early_stopping_min_delta: 被视为改善所需的最小变化量。
         early_stopping_monitor: 监控总损失、生存损失或 C-index。
         risk_horizon: 计算 C-index 风险排序所用的固定结局时间窗。
-        cindex_risk_score: auto 对 Cox 使用 log-risk，对 Weibull 使用时间窗事件概率。
+        cindex_risk_score: auto 使用混合 Weibull 的时间窗事件概率。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -291,12 +291,9 @@ class TrailsConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_survival_risk(self) -> TrailsConfig:
-        """训练中 Cox 始终用 log-risk 排序，不依赖尚未拟合的基线。"""
-        if self.model.survival_loss == "cox":
-            if self.trainer.cindex_risk_score not in {"auto", "log_hazard"}:
-                raise ValueError("Cox C-index requires cindex_risk_score=auto or log_hazard.")
-        elif self.trainer.cindex_risk_score == "log_hazard":
-            raise ValueError("log_hazard risk scoring requires survival_loss=cox.")
+        """Weibull 使用混合事件概率或中位时间；Cox 在构造模型时明确拒绝。"""
+        if self.model.survival_loss == "weibull" and self.trainer.cindex_risk_score == "log_hazard":
+            raise ValueError("Weibull does not support log_hazard risk scoring.")
         return self
 
 

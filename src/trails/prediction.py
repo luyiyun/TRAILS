@@ -12,15 +12,15 @@ from torch import Tensor
 
 from .config import RiskMethod, SurvivalKind
 from .diagnostics import LatentDiagnostics
-from .survival import SURVIVAL_FORMAT_VERSION, CoxBaseline, survival_risk
+from .survival import SURVIVAL_FORMAT_VERSION, mixture_survival, survival_risk
 
 
 @dataclass(frozen=True)
 class TrailsPrediction:
     """保存潜空间、簇后验及生存 log 参数，不重复执行模型前向推理。
 
-    Weibull 的两列依次为 log(scale)、log(shape)；Cox 的一列为 log-risk。
-    Cox 基线仅从实际训练子集估计，与预测一同保存。
+    生存参数形状为 (N,K,2)，末维为 log(scale)、log(shape)。
+    常规簇概率为 p(c|z)，可选结局后验仅用于回顾性分析。
     """
 
     latent_representation: Tensor
@@ -28,19 +28,22 @@ class TrailsPrediction:
     survival_log_params: Tensor
     survival_kind: SurvivalKind = "weibull"
     true_cluster: Tensor | None = None
-    cox_baseline: CoxBaseline | None = None
+    survival_conditioned_cluster_probabilities: Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.survival_kind == "cox":
+            raise NotImplementedError("Cluster-specific Cox survival is not implemented.")
+        expected = (*self.cluster_probabilities.shape, 2)
+        if self.survival_log_params.shape != expected:
+            raise ValueError(f"survival_log_params must have shape {expected} (format 3).")
 
     @property
     def weibull_shape(self) -> Tensor:
-        if self.survival_kind != "weibull":
-            raise ValueError("Cox predictions do not have Weibull shape parameters.")
-        return self.survival_log_params[:, 1].exp()
+        return self.survival_log_params[..., 1].exp()
 
     @property
     def weibull_scale(self) -> Tensor:
-        if self.survival_kind != "weibull":
-            raise ValueError("Cox predictions do not have Weibull scale parameters.")
-        return self.survival_log_params[:, 0].exp()
+        return self.survival_log_params[..., 0].exp()
 
     def predict(self) -> Tensor:
         """返回每位患者后验概率最大的簇标签。"""
@@ -51,44 +54,25 @@ class TrailsPrediction:
         return self.cluster_probabilities
 
     def risk_score(self, horizon: float | None = None, *, method: RiskMethod = "auto") -> Tensor:
-        """越大越危险；auto 对 Cox 返回 log-risk，对 Weibull 返回时间窗事件概率。"""
-        if self.survival_kind == "cox" and method == "event_probability":
-            if horizon is None or not 0 < horizon < float("inf"):
-                raise ValueError("event_probability requires a positive horizon.")
-            return 1.0 - self.survival([horizon])[:, 0]
-        return survival_risk(self.survival_log_params, self.survival_kind, horizon, method=method)
+        """越大越危险；默认使用混合生存曲线的时间窗事件概率。"""
+        return survival_risk(
+            self.survival_log_params, self.cluster_probabilities, horizon, method=method
+        )
 
     def survival(self, times: Sequence[float] | Tensor) -> Tensor:
-        """返回 (患者数, 时间点数) 生存概率；Cox 尾部延续最后基线值，不作参数外推。"""
-        time_grid = torch.as_tensor(times).detach().cpu().double()
+        """返回不依赖结局的混合生存概率，形状为 (患者数, 时间点数)。"""
+        time_grid = torch.as_tensor(times, device=self.survival_log_params.device).detach()
         if time_grid.ndim != 1 or time_grid.numel() == 0:
             raise ValueError("times must be a non-empty one-dimensional grid.")
         if not bool(torch.isfinite(time_grid).all()) or bool((time_grid < 0).any()):
             raise ValueError("times must contain finite non-negative values.")
         if time_grid.numel() > 1 and not bool((time_grid[1:] > time_grid[:-1]).all()):
             raise ValueError("times must be strictly increasing.")
-        if self.survival_kind == "cox":
-            if self.cox_baseline is None:
-                raise ValueError("Cox survival probabilities require a fitted training baseline.")
-            return self.cox_baseline.predict(self.survival_log_params, time_grid)
-        log_scale, log_shape = self.survival_log_params.unbind(-1)
-        # 直接用 log 参数，避免先 exp 再 log；S(0)=1 显式保留。
-        grid = time_grid.to(log_scale.dtype)
-        log_hazard = log_shape.exp().unsqueeze(1) * (
-            grid.log().unsqueeze(0) - log_scale.unsqueeze(1)
-        )
-        return torch.exp(-torch.exp(log_hazard))
+        return mixture_survival(self.survival_log_params, self.cluster_probabilities, time_grid)
 
     def median_survival_time(self) -> Tensor:
-        """返回中位时间；Cox 在训练支持内未达到 0.5 时记为 NaN。"""
-        if self.survival_kind == "weibull":
-            return torch.exp(-self.risk_score(method="median_survival"))
-        if self.cox_baseline is None:
-            raise ValueError("Cox median survival requires a fitted training baseline.")
-        curves = self.survival(self.cox_baseline.time)
-        reached = curves <= 0.5
-        index = reached.long().argmax(dim=1)
-        return torch.where(reached.any(dim=1), self.cox_baseline.time[index], torch.nan)
+        """数值求解混合曲线达到 0.5 的时间，不平均各分量参数。"""
+        return torch.exp(-self.risk_score(method="median_survival"))
 
     def latent_diagnostics(self) -> LatentDiagnostics:
         """返回与现有潜空间诊断产物兼容的张量映射。"""
@@ -103,7 +87,7 @@ class TrailsPrediction:
         return diagnostics
 
     def save(self, path: str | Path) -> None:
-        """保存 log 参数、类型及可选训练基线。"""
+        """保存分量 log 参数、类型及可选回顾性后验。"""
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -114,22 +98,19 @@ class TrailsPrediction:
                 "survival_log_params": self.survival_log_params,
                 "survival_kind": self.survival_kind,
                 "true_cluster": self.true_cluster,
-                "cox_baseline": self.cox_baseline.payload()
-                if self.cox_baseline is not None
-                else None,
+                "survival_conditioned_cluster_probabilities": (
+                    self.survival_conditioned_cluster_probabilities
+                ),
             },
             destination,
         )
 
     @classmethod
     def load(cls, path: str | Path) -> TrailsPrediction:
-        """读取新格式；旧 softplus 参数化产物须由原版本代码分析。"""
+        """读取版本 3；旧患者特异生存头产物须由原版本代码分析。"""
         payload: dict[str, Any] = torch.load(Path(path), map_location="cpu", weights_only=True)
         if payload.pop("survival_format_version", None) != SURVIVAL_FORMAT_VERSION:
             raise ValueError(
                 "Unsupported survival format; load legacy artifacts with the original code."
             )
-        baseline = payload.pop("cox_baseline")
-        return cls(
-            **payload, cox_baseline=CoxBaseline(**baseline) if baseline is not None else None
-        )
+        return cls(**payload)

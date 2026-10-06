@@ -6,7 +6,7 @@ TRAILS studies deep survival trajectory clustering for asynchronous multivariate
 medical longitudinal data. The method targets patient subtypes that differ in
 both clinical trajectories and time-to-event risk.
 
-The current scope is phase one: a modular Surv-VaDER/VaDE prototype for
+The current scope is phase one: a cluster-specific survival variational TRAILS model for
 variable-length clinical visit sequences with `x`, `mask`, and `delta_time`.
 Mixed-type likelihoods, competing risks, and recurrent events are later roadmap
 items.
@@ -249,15 +249,10 @@ clean reusable method library.
   not saved as a separate `val.pt`, and is used for early stopping; if no validation
   split is requested, early stopping monitors the training metric instead. The
   monitor can be total loss, survival loss, or C-index.
-- `TrailsEstimator.fit()` owns the internal split and checks the actual training
-  and validation subsets for at least one observed event; `test()` checks its
-  evaluation dataset at entry. This applies to both survival heads. The trainer,
-  loss adapter and Cox baseline trust those dataset checks. Cox training uses
-  `EventBatchSampler`: shuffle and evenly distribute event patients first, then
-  fill balanced batches with censored patients, once per patient per epoch and
-  never above batch size. Too few events for the batch count fails before training.
-  Model/loss code does not repeat event-existence checks; evaluation, prediction
-  and baseline loaders retain normal ordering. Pure `predict()` does not require events.
+- `TrailsEstimator.fit()` owns the internal split and checks actual training and
+  validation subsets for an observed event; `test()` checks at entry. Model and loss
+  trust these checks. Ordinary batches may be entirely censored: Weibull likelihood
+  remains valid. Pure `predict()` does not require observed events.
 - Hydra metadata and command outputs go under the single user-visible `paths.dir`
   directory. Each command root config sets `hydra.run.dir: ${paths.dir}` and
   defines `paths.root`, `paths.prefix`, and `paths.suffix`, which compose the
@@ -303,27 +298,46 @@ clean reusable method library.
   repeated latent plus visit-time input.
 - Clustering uses a VaDE-style learnable Gaussian mixture latent prior,
   initialized by deterministic k-means after warmup.
-- The survival head maps latent means directly to `[log(scale), log(shape)]`
-  for `model.survival_loss=weibull` (generic default), or one Cox log-risk for
-  `cox` (CRC default). Both retain configurable hidden layers; base uses one.
-  TorchSurv computes both likelihoods; Cox uses Efron ties and event-normalized
-  mini-batch partial likelihood. Weibull uses the library scripted loss path because
-  its eager validator incorrectly rejects all-censored batches with valid likelihood.
-  Cox mini-batches are assumed to contain events; singleton batches skip the survival
-  uncertainty term. Validation/test Cox losses use the full evaluation risk set.
-  Loss calls order censoring after events at tied times using order-preserving
-  rank times, avoiding the TorchSurv 0.2 no-tied-deaths fast-path ambiguity.
-- After restoring the best model, Cox Breslow baseline estimation uses only the
-  actual optimized training subset, excluding internally held-out validation.
-  The baseline is saved with the model and predictions. Cox curves are right-continuous
-  steps with flat tails; absolute-risk evaluation outside training support is unavailable.
-- `TrailsPrediction` stores survival kind and log parameters. `risk_score(method="auto")`
-  returns Cox log-risk or Weibull `1-S(horizon)`; explicit `event_probability`
-  requires a positive horizon. Weibull alone supports `median_survival` risk.
-  `median_survival_time()` returns NaN for Cox when the training-supported curve
-  does not reach 0.5. Derived Weibull shape/scale remain available as properties.
-  Checkpoints/predictions use survival format 2; legacy softplus artifacts are
-  rejected and must be evaluated with their original code version.
+- The core network is `TrailsModel`, replacing the old patient-level survival model.
+  Its joint distribution is p(c)p(z|c)p(x|z)p(T|z,c). Training reconstruction,
+  mixture-prior and survival branches share one reparameterized z; evaluation and
+  prediction use the latent mean deterministically. The survival network takes z
+  through shared hidden layers and emits K cluster-specific log-scales directly.
+  All clusters reuse the same sampled z; hidden layers keep latent_dim width and ReLU.
+  Zero hidden layers give each cluster its own linear z effect and intercept.
+  One trainable scalar log-shape is
+  shared and initialized to zero. CRC retains one hidden layer; no softplus is applied. Generic and CRC
+  defaults are Weibull. `survival_loss=cox` remains a configuration enum but model
+  construction raises NotImplementedError; no old TRAILS Cox execution path remains.
+  Independent baseline models are unaffected.
+- The survival adapter uses TorchSurv log_hazard and _cumulative_hazard to assemble
+  vectorized (B,K) censored log likelihoods, with a 1e-4 time floor. Training uses
+  log-softmax(log pi + log p(z|c) + log likelihood) for the conditional responsibility
+  gamma. The expected negative survival likelihood and joint variational KL use the
+  same gamma without detaching gradients. Posterior likelihoods are not scaled by
+  task weights. Existing reconstruction, fixed/uncertainty weighting and histories
+  remain: this is a weighted variational objective, not an unqualified standard ELBO.
+  Warmup optimizes reconstruction and survival without joint KL; train latent means
+  initialize the Gaussian mixture afterward. Survival weight zero restores p(c|z)
+  responsibilities and excludes outcomes from KL.
+- `TrailsPrediction.cluster_probabilities` and labels always use outcome-free p(c|z).
+  Survival curves mix component curves with these probabilities, never averaged
+  Weibull parameters. Validation losses use gamma; occupancy, ARI, C-index and other
+  prospective metrics use outcome-free predictions. K-selection rules are unchanged.
+  `TrailsEstimator.predict(..., include_survival_posterior=True)` optionally returns
+  `survival_conditioned_cluster_probabilities` for retrospective analysis without
+  changing ordinary predictions; requesting it with survival disabled raises an error.
+  Log parameters have shape (N,K,2); derived shape/scale have shape (N,K). Risk is
+  1-S(horizon), or negative log mixture median, found by vectorized log-time bisection
+  between component medians. Models and predictions use format 3; all older formats
+  are rejected and require their original code. Model checkpoints save
+  survival_head_architecture="multi_output". Original format-3 multi-output checkpoints
+  without this marker remain loadable; explicit mismatched markers are rejected.
+  Conditioned-one-hot models require their original code; format-3 predictions remain
+  compatible. Optional retrospective posteriors are saved with predictions.
+  The matched OS24/E60 experiment did not improve occupancy with one-hot conditioning,
+  so the multi-output head is restored. Initialization, warmup, early stopping and
+  K-selection remain unchanged.
 - TorchSurv supplies Harrell/Uno C-index, cumulative/dynamic AUC, Brier and their
   integrals across training, K selection, CRC/MIMIC and baseline selection.
   `trails.metrics.SurvivalMetrics` supplies train-only IPCW and support checks; it
@@ -334,8 +348,9 @@ clean reusable method library.
   points retain null/reasons; integration windows are never silently shortened.
   CRC two-horizon mean AUC remains an arithmetic mean, separate from integrated AUC.
 - Validation and test report ACC/ARI/NMI only with true labels; occupancy
-  diagnostics remain available regardless of reference labels. Cox uses log-risk
-  for C-index throughout; shared baseline predictions label their risk method.
+  diagnostics remain available regardless of reference labels. Training, K selection
+  and evaluation use the shared mixture-risk function; independent baseline predictions
+  label their own risk method.
 - Train and baseline commands recursively discover all sibling `train.pt`/`test.pt`
   directories under `paths.data_root`, infer K from dataset metadata when present,
   and save unified prediction payloads under mirrored run directories plus

@@ -125,11 +125,7 @@ def load_prediction(
     if method["prediction_format"] == "trails":
         saved = TrailsPrediction.load(directory / "model_prediction.pt")
         survival = "survival" in method["capabilities"]
-        curve_times = (
-            np.union1d(config.probability_times, [config.tau])
-            if saved.survival_kind == "cox"
-            else np.asarray(config.probability_times)
-        )
+        curve_times = np.asarray(config.probability_times)
         prediction = BaselinePrediction(
             method_name=method["name"],
             patient_ids=dataset_patient_ids(dataset),
@@ -139,7 +135,7 @@ def load_prediction(
             if survival
             else None,
             risk_horizon=config.tau if survival else None,
-            risk_method="log_hazard" if saved.survival_kind == "cox" else "event_probability",
+            risk_method="event_probability",
             survival_times=curve_times if survival else None,
             survival_probabilities=saved.survival(curve_times.tolist()).numpy().astype(np.float64)
             if survival

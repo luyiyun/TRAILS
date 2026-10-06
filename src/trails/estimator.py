@@ -11,9 +11,9 @@ import torch
 
 from .config import TrailsConfig
 from .data import ClinicalTimeSeriesDataset, infer_data_config
-from .model import TrailsSurvVaderModel
+from .model import SURVIVAL_HEAD_ARCHITECTURE, TrailsModel
 from .prediction import TrailsPrediction
-from .survival import SURVIVAL_FORMAT_VERSION, CoxBaseline
+from .survival import SURVIVAL_FORMAT_VERSION, component_log_likelihood, survival_log_posterior
 from .trainer import HistoryEntry, TrailsTrainer
 
 HistoryCallback = Callable[[HistoryEntry], None]
@@ -28,7 +28,7 @@ class TrailsEstimator:
 
     属性：
         config: 完整且不可变的 TRAILS 配置。
-        model: Surv-VaDER 神经网络模型。
+        model: 簇特异生存变分 TrailsModel。
         trainer: 与模型和训练配置绑定的训练器。
         history: 最近一次拟合产生的逐轮历史。
     """
@@ -41,7 +41,7 @@ class TrailsEstimator:
         """
         self.config = config or TrailsConfig()
         torch.manual_seed(self.config.seed)
-        self.model = TrailsSurvVaderModel(self.config.data, self.config.model)
+        self.model = TrailsModel(self.config.data, self.config.model)
         trainer_config = self.config.trainer.model_copy(update={"seed": self.config.seed})
         self.trainer = TrailsTrainer(self.model, trainer_config)
         self.history: list[HistoryEntry] = []
@@ -97,23 +97,41 @@ class TrailsEstimator:
         )
         return self
 
-    def predict(self, data: ClinicalTimeSeriesDataset) -> TrailsPrediction:
+    def predict(
+        self, data: ClinicalTimeSeriesDataset, *, include_survival_posterior: bool = False
+    ) -> TrailsPrediction:
         """一次推理返回可派生全部患者级预测的结构化对象。
 
         参数：
             data: 特征维度与估计器配置一致的数据集。
 
         返回：
-            CPU 上的 :class:`TrailsPrediction`，包含潜表示、簇后验和生存 log 参数。
+            CPU 上的 :class:`TrailsPrediction`，常规分簇不依赖结局。
+            include_survival_posterior=True 时另存回顾性后验，不改变分簇及曲线。
         """
         self._validate_data_config(data)
+        if include_survival_posterior and self.config.model.loss.survival_weight == 0:
+            raise ValueError("Survival posterior requires an enabled survival task.")
         outputs, batch = self.trainer._collect_outputs(data)
+        posterior = None
+        if include_survival_posterior:
+            posterior = (
+                survival_log_posterior(
+                    outputs.cluster_logits,
+                    component_log_likelihood(
+                        outputs.survival_log_params, batch["event"], batch["survival_time"]
+                    ),
+                )
+                .exp()
+                .detach()
+                .cpu()
+            )
         return TrailsPrediction(
             latent_representation=outputs.latent_mean.detach().cpu(),
             cluster_probabilities=outputs.cluster_probabilities.detach().cpu(),
             survival_log_params=outputs.survival_log_params.detach().cpu(),
             survival_kind=self.config.model.survival_loss,
-            cox_baseline=self.trainer.cox_baseline,
+            survival_conditioned_cluster_probabilities=posterior,
             true_cluster=(
                 batch["cluster_label"].detach().cpu().long() if "cluster_label" in batch else None
             ),
@@ -140,9 +158,7 @@ class TrailsEstimator:
         """
         checkpoint = {
             "survival_format_version": SURVIVAL_FORMAT_VERSION,
-            "cox_baseline": self.trainer.cox_baseline.payload()
-            if self.trainer.cox_baseline is not None
-            else None,
+            "survival_head_architecture": SURVIVAL_HEAD_ARCHITECTURE,
             "config": self.config.model_dump(mode="json"),
             "history": self.history,
             "model_state": self.model.state_dict(),
@@ -170,6 +186,15 @@ class TrailsEstimator:
             raise ValueError(
                 "Unsupported survival format; load legacy checkpoints with the original code."
             )
+        # 原始版本3多输出头未保存结构标识，仍可按其原有结构加载。
+        if (
+            checkpoint.get("survival_head_architecture", SURVIVAL_HEAD_ARCHITECTURE)
+            != SURVIVAL_HEAD_ARCHITECTURE
+        ):
+            raise ValueError(
+                "Unsupported survival head architecture; expected multi_output. "
+                "Load legacy checkpoints with the original code."
+            )
         config = TrailsConfig.model_validate(checkpoint["config"])
         if device is not None:
             config = config.model_copy(
@@ -178,8 +203,6 @@ class TrailsEstimator:
         estimator = cls(config)
         estimator.model.load_state_dict(checkpoint["model_state"])
         estimator.history = list(checkpoint.get("history", []))
-        baseline = checkpoint["cox_baseline"]
-        estimator.trainer.cox_baseline = CoxBaseline(**baseline) if baseline is not None else None
         return estimator
 
     def _validate_data_config(self, data: ClinicalTimeSeriesDataset) -> None:

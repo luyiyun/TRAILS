@@ -121,9 +121,22 @@ def simulate_dataset(seed: int) -> ClinicalTimeSeriesDataset:
     )
 
 
-def test_estimator_fit_predict_test() -> None:
+@pytest.mark.parametrize("hidden_layers", [0, 1, 2])
+@pytest.mark.parametrize("n_clusters", [2, 3])
+def test_estimator_fit_predict_test(hidden_layers: int, n_clusters: int) -> None:
     data = simulate_dataset(seed=13)
-    estimator = TrailsEstimator(tiny_config(data.n_features)).fit(data)
+    config = tiny_config(data.n_features)
+    config = config.model_copy(
+        update={
+            "model": config.model.model_copy(
+                update={
+                    "survival_head_hidden_layers": hidden_layers,
+                    "n_clusters": n_clusters,
+                }
+            )
+        }
+    )
+    estimator = TrailsEstimator(config).fit(data)
     prediction = estimator.predict(data)
     predictions = prediction.predict()
     probabilities = prediction.predict_proba()
@@ -131,9 +144,11 @@ def test_estimator_fit_predict_test() -> None:
     metrics = estimator.test(data)
 
     assert predictions.shape == (8,)
-    assert probabilities.shape == (8, 2)
-    assert prediction.weibull_shape.shape == (8,)
-    assert prediction.weibull_scale.shape == (8,)
+    assert probabilities.shape == (8, n_clusters)
+    assert prediction.survival_log_params.shape == (8, n_clusters, 2)
+    assert prediction.weibull_shape.shape == (8, n_clusters)
+    assert prediction.weibull_scale.shape == (8, n_clusters)
+    assert torch.all(prediction.weibull_shape == prediction.weibull_shape[0, 0])
     risk_score = prediction.risk_score(28.0)
     assert risk_score.shape == (8,)
     assert torch.allclose(risk_score, 1.0 - prediction.survival([28.0]).squeeze(1))
@@ -141,9 +156,9 @@ def test_estimator_fit_predict_test() -> None:
     assert survival.shape == (8, 3)
     assert torch.allclose(survival[:, 0], torch.ones(8), atol=1e-6)
     assert bool(((survival[:, :-1] - survival[:, 1:]) >= 0).all())
-    assert set(predictions.tolist()) <= {0, 1}
+    assert set(predictions.tolist()) <= set(range(n_clusters))
     assert not any(key.startswith("val_") for key in estimator.history[-1])
-    assert metrics["loss"] > 0
+    assert math.isfinite(metrics["loss"])
     assert "cindex" in metrics
     assert "acc" in metrics
     assert "ari" in metrics
@@ -256,13 +271,25 @@ def test_unlabeled_data_skips_cluster_metrics() -> None:
 
 
 @pytest.mark.parametrize("method", ["event_probability", "median_survival"])
+@pytest.mark.parametrize("hidden_layers,n_clusters", [(0, 2), (1, 3), (2, 2)])
 def test_estimator_save_load(
-    tmp_path: Path, method: Literal["event_probability", "median_survival"]
+    tmp_path: Path,
+    method: Literal["event_probability", "median_survival"],
+    hidden_layers: int,
+    n_clusters: int,
 ) -> None:
     data = simulate_dataset(seed=17)
     config = tiny_config(data.n_features)
     config = config.model_copy(
-        update={"trainer": config.trainer.model_copy(update={"cindex_risk_score": method})}
+        update={
+            "trainer": config.trainer.model_copy(update={"cindex_risk_score": method}),
+            "model": config.model.model_copy(
+                update={
+                    "survival_head_hidden_layers": hidden_layers,
+                    "n_clusters": n_clusters,
+                }
+            ),
+        }
     )
     estimator = TrailsEstimator(config).fit(data)
     path = tmp_path / "trails.pt"
@@ -278,6 +305,23 @@ def test_estimator_save_load(
         estimator.predict(data).risk_score(28.0, method=method),
         loaded_prediction.risk_score(28.0, method=method),
     )
+    assert torch.equal(
+        estimator.predict(data).survival_log_params, loaded.predict(data).survival_log_params
+    )
+    checkpoint = torch.load(path, weights_only=False)
+    assert checkpoint["survival_head_architecture"] == "multi_output"
+    legacy = checkpoint.copy()
+    legacy.pop("survival_head_architecture")
+    legacy_path = tmp_path / "legacy.pt"
+    torch.save(legacy, legacy_path)
+    assert torch.equal(
+        estimator.predict(data).survival_log_params,
+        TrailsEstimator.load(legacy_path).predict(data).survival_log_params,
+    )
+    legacy["survival_head_architecture"] = "conditioned_one_hot"
+    torch.save(legacy, legacy_path)
+    with pytest.raises(ValueError, match="Unsupported survival head architecture"):
+        TrailsEstimator.load(legacy_path)
 
 
 def test_prediction_median_risk_preserves_time_ranking() -> None:
@@ -286,7 +330,9 @@ def test_prediction_median_risk_preserves_time_ranking() -> None:
         cluster_probabilities=torch.full((3, 2), 0.5),
         survival_log_params=torch.stack(
             [torch.tensor([100.0, 200.0, 1.0]).log(), torch.tensor([1.0, 2.0, 0.001]).log()], dim=1
-        ),
+        )
+        .unsqueeze(1)
+        .expand(-1, 2, -1),
     )
     risk = prediction.risk_score(method="median_survival")
     median = torch.exp(-risk)

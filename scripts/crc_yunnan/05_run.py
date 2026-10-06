@@ -20,6 +20,7 @@ from trails import (
 )
 from trails.artifacts import save_history_csv, save_json
 from trails.metrics import cluster_assignment_diagnostics, concordance_index
+from trails.survival import SURVIVAL_FORMAT_VERSION
 from trails_simulate.config import resolved_payload
 
 LOGGER = logging.getLogger(__name__)
@@ -195,11 +196,9 @@ def run(config: TrailsApplicationConfig) -> dict[str, object]:
         "panel": split_manifest["panel"],
         "selected_k": selected_k,
         "selected_seed": selected_seed,
-        "cindex_risk_score": "log_hazard"
-        if estimator.config.model.survival_loss == "cox"
-        else estimator.config.trainer.cindex_risk_score,
+        "cindex_risk_score": estimator.config.trainer.cindex_risk_score,
         "survival_loss": estimator.config.model.survival_loss,
-        "survival_format_version": 2,
+        "survival_format_version": SURVIVAL_FORMAT_VERSION,
         "model": "model.pt",
         "training_history": "training_history.csv",
         "metrics": "metrics.csv",

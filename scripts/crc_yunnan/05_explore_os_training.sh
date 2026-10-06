@@ -815,7 +815,7 @@ def main() -> int:
     root, split = args.output.resolve(), args.split_dir.resolve()
     template_data, template_run = root / "preproc/template", root / "runs/template"
     contract = {
-        "survival_format_version": 2,
+        "survival_format_version": 3,
         "script_sha256": hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest(),
         "budget_hours": args.budget_hours,
         "preproc": resolved(

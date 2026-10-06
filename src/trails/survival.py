@@ -1,103 +1,86 @@
-"""生存头的 log 参数适配及训练集 Cox 基线；似然计算委托 TorchSurv。"""
+"""簇特异 Weibull 似然、结局后验和混合生存预测。"""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import cast
 
 import torch
 from torch import Tensor
-from torchsurv.loss.cox import baseline_survival_function, neg_partial_log_likelihood
-from torchsurv.loss.weibull import neg_log_likelihood_weibull
+from torchsurv.loss.weibull import _cumulative_hazard, log_hazard
 
-from .config import RiskMethod, SurvivalKind
+from .config import RiskMethod
 
-SURVIVAL_FORMAT_VERSION = 2
-
-# TorchSurv 0.2 的通用 eager 校验拒绝全删失批次，但 Weibull 完整似然在此仍有效。
-# 使用库支持的脚本化 loss 路径，保留原公式及全删失患者的梯度，不补造事件。
-_weibull_nll = torch.jit.script(neg_log_likelihood_weibull)
+SURVIVAL_FORMAT_VERSION = 3
 
 
-def survival_loss(log_params: Tensor, event: Tensor, time: Tensor, kind: SurvivalKind) -> Tensor:
-    """Weibull 按患者、Cox 按事件归一化；调用方保证 Cox 风险集有效。"""
-    event = event.reshape(-1).bool()
-    time = time.reshape(-1)
+def component_log_likelihood(log_params: Tensor, event: Tensor, time: Tensor) -> Tensor:
+    """返回 (B,K) 删失对数似然；TorchSurv 的标量 loss 不提供未归约输出。"""
     if not bool(torch.isfinite(log_params).all()):
         raise ValueError("Survival log parameters must be finite.")
-    if kind == "weibull":
-        return _weibull_nll(log_params, event, time.clamp_min(1e-4), reduction="mean")
-    # Cox 部分似然只依赖时间顺序。TorchSurv 0.2 的无并列死亡分支
-    # 按行构造风险集，故调用时把同刻删失排在死亡之后；真实时间仍用于基线。
-    _, ranks = torch.unique(time, sorted=True, return_inverse=True)
-    cox_time = (2 * ranks + 1 + (~event).long()).float()
-    log_hazard = log_params.reshape(-1).double()
-    log_hazard = log_hazard - log_hazard.detach().mean()
-    return (
-        neg_partial_log_likelihood(
-            log_hazard, event, cox_time, ties_method="efron", reduction="sum"
-        )
-        / event.sum()
+    batch_size, n_clusters, _ = log_params.shape
+    params = log_params.reshape(-1, 2)
+    times = time.reshape(-1).clamp_min(1e-4).repeat_interleave(n_clusters)
+    events = event.reshape(-1).bool().repeat_interleave(n_clusters)
+    # 私有累积风险接口集中在此适配锁定的 TorchSurv 版本，保留其数值截断。
+    likelihood = events * log_hazard(params, times, respective_times=True) - _cumulative_hazard(
+        params, times, respective_times=True
     )
+    return likelihood.reshape(batch_size, n_clusters)
+
+
+def survival_log_posterior(cluster_logits: Tensor, log_likelihood: Tensor) -> Tensor:
+    """p(c|z,t,delta)；使用原始似然，不缩放任务权重，也不截断梯度。"""
+    return torch.log_softmax(cluster_logits + log_likelihood, dim=-1)
+
+
+def _mixture_survival_at_log_time(
+    log_params: Tensor, probabilities: Tensor, log_time: Tensor
+) -> Tensor:
+    """log_time 为 (N,T) 或可广播的 (1,T)，避免中位数搜索中的时间溢出。"""
+    log_scale, log_shape = log_params.unbind(-1)
+    log_cumulative_hazard = log_shape.exp().unsqueeze(-1) * (
+        log_time.unsqueeze(-2) - log_scale.unsqueeze(-1)
+    )
+    component_survival = torch.exp(-torch.exp(log_cumulative_hazard))
+    return (probabilities.unsqueeze(-1) * component_survival).sum(dim=-2)
+
+
+def mixture_survival(log_params: Tensor, probabilities: Tensor, times: Tensor) -> Tensor:
+    """按 p(c|z) 混合各簇生存曲线，返回 (N,T)，包括 S(0)=1。"""
+    times = times.to(device=log_params.device, dtype=log_params.dtype)
+    curves = _mixture_survival_at_log_time(log_params, probabilities, times.log().unsqueeze(0))
+    return torch.where(times.unsqueeze(0) == 0, torch.ones_like(curves), curves)
+
+
+def mixture_log_median(log_params: Tensor, probabilities: Tensor) -> Tensor:
+    """在分量中位数构成的 log 时间区间内向量化二分求混合中位数。"""
+    params = log_params.double()
+    weights = probabilities.double()
+    log_scale, log_shape = params.unbind(-1)
+    component_medians = log_scale + math.log(math.log(2.0)) * torch.exp(-log_shape)
+    lower, upper = component_medians.amin(-1), component_medians.amax(-1)
+    for _ in range(64):
+        middle = lower + (upper - lower) * 0.5
+        above = (
+            _mixture_survival_at_log_time(params, weights, middle.unsqueeze(-1)).squeeze(-1) > 0.5
+        )
+        lower = torch.where(above, middle, lower)
+        upper = torch.where(above, upper, middle)
+    return lower + (upper - lower) * 0.5
 
 
 def survival_risk(
     log_params: Tensor,
-    kind: SurvivalKind,
+    probabilities: Tensor,
     horizon: float | None = None,
     *,
     method: RiskMethod = "auto",
 ) -> Tensor:
-    """无需基线的排序分数；Cox 的绝对概率由预测对象提供。"""
-    if method == "auto":
-        method = "log_hazard" if kind == "cox" else "event_probability"
-    if kind == "cox":
-        if method != "log_hazard":
-            raise ValueError(
-                "Cox probabilities require a fitted baseline; median_survival is Weibull-only."
-            )
-        return log_params.reshape(-1)
+    """统一混合风险入口：固定时间事件概率，或负 log 中位生存时间。"""
     if method == "median_survival":
-        log_scale, log_shape = log_params.double().unbind(-1)
-        return -(log_scale + math.log(math.log(2.0)) * torch.exp(-log_shape))
-    if method != "event_probability":
+        return -mixture_log_median(log_params, probabilities)
+    if method not in {"auto", "event_probability"}:
         raise ValueError("Weibull supports event_probability or median_survival risk.")
     if horizon is None or not math.isfinite(horizon) or horizon <= 0:
         raise ValueError("event_probability requires a positive horizon.")
-    log_scale, log_shape = log_params.unbind(-1)
-    cumulative_hazard = torch.exp(torch.exp(log_shape) * (math.log(horizon) - log_scale))
-    return -torch.expm1(-cumulative_hazard)
-
-
-@dataclass(frozen=True)
-class CoxBaseline:
-    """最佳模型在实际训练子集上拟合的 Breslow 基线（CPU float64）。"""
-
-    time: Tensor
-    survival: Tensor
-    log_risk_center: Tensor
-
-    @classmethod
-    def fit(cls, log_params: Tensor, event: Tensor, time: Tensor) -> CoxBaseline:
-        event, time = event.detach().cpu().bool(), time.detach().cpu().double()
-        log_risk = log_params.detach().cpu().double().reshape(-1)
-        center = log_risk.mean()
-        baseline = cast(
-            dict[str, Tensor], baseline_survival_function(log_risk - center, event, time)
-        )
-        return cls(baseline["time"].double(), baseline["baseline_survival"].double(), center)
-
-    def predict(self, log_params: Tensor, times: Tensor) -> Tensor:
-        """右连续阶梯；首个观察时间之前 S=1，尾部延续最后估计值。"""
-        index = torch.searchsorted(self.time, times.double(), right=True)
-        baseline = torch.cat((self.survival.new_ones(1), self.survival))[index]
-        relative_risk = torch.exp(log_params.double().reshape(-1) - self.log_risk_center)
-        return baseline.unsqueeze(0).pow(relative_risk.unsqueeze(1))
-
-    def payload(self) -> dict[str, Tensor]:
-        return {
-            "time": self.time,
-            "survival": self.survival,
-            "log_risk_center": self.log_risk_center,
-        }
+    return 1.0 - mixture_survival(log_params, probabilities, log_params.new_tensor([horizon]))[:, 0]

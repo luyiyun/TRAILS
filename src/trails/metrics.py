@@ -50,14 +50,14 @@ def vade_kl_loss(
 ) -> Tensor:
     """计算 VaDE 后验与高斯混合先验之间的变分 KL 项。
 
-    该项联合考虑 ``q(z|x)``、簇责任度 ``q(c|x)``、混合比例和各高斯分量，
+    该项联合考虑 ``q(z|x)``、条件簇责任度 ``q(c|z,t,delta)``、混合比例和各高斯分量，
     将聚类结构引入 ELBO。
 
     参数：
         latent: 从患者后验采样的潜变量。
         latent_mean: 患者后验均值。
         latent_log_variance: 患者后验对数方差。
-        cluster_logits: 各患者的后验簇 logits。
+        cluster_logits: 各患者的条件后验簇 logits；关闭生存时仅使用 p(c|z)。
         mixture_logits: 高斯混合先验的分量 logits。
         mixture_means: 各混合分量的潜空间均值。
         mixture_log_variances: 各混合分量的潜空间对数方差。

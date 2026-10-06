@@ -1,4 +1,4 @@
-"""TRAILS 的异步序列编码、重建、VaDE 聚类与可选 Weibull/Cox 生存模型。"""
+"""TRAILS 的异步序列编码、重建与簇特异生存变分模型。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,9 @@ from .metrics import (
     masked_mse,
     vade_kl_loss,
 )
-from .survival import survival_loss
+from .survival import component_log_likelihood, survival_log_posterior
+
+SURVIVAL_HEAD_ARCHITECTURE = "multi_output"
 
 
 @dataclass(frozen=True)
@@ -30,7 +32,7 @@ class TrailsModelOutput:
         latent: 训练时重参数采样、评价时取均值的潜变量。
         cluster_logits: VaDE 高斯混合后验的未归一化对数分数。
         cluster_probabilities: 归一化后的后验簇概率。
-        survival_log_params: Weibull 的 log(scale), log(shape)，或 Cox 的 log-risk。
+        survival_log_params: (B,K,2) 的 log(scale), log(shape)，shape 在患者和簇间共享。
     """
 
     reconstruction: Tensor
@@ -992,17 +994,19 @@ class TransformerDecoder(nn.Module):
         return self.reconstruction_head(decoded)
 
 
-class TrailsSurvVaderModel(nn.Module):
-    """联合纵向重建、VaDE 聚类和患者特异 Weibull/Cox 生存风险的核心模型。
+class TrailsModel(nn.Module):
+    """联合纵向重建、高斯混合先验和簇特异 Weibull 生存分布的核心模型。
 
     编码器把异步纵向序列汇总为患者表示，变分层产生潜变量；高斯混合先验给出
-    后验簇概率，解码器重建纵向输入，生存头直接输出 Weibull log 参数或 Cox log-risk。
+    不依赖结局的簇概率，解码器与生存头共用同一个潜变量。训练责任度另纳入生存似然。
     损失可使用固定权重或可学习同方差不确定性权重。
     """
 
     def __init__(self, data_config: DataConfig, model_config: ModelConfig) -> None:
         """根据数据和模型配置组装编码器、潜空间、解码器、混合先验与生存头。"""
         super().__init__()
+        if model_config.survival_loss == "cox":
+            raise NotImplementedError("Cluster-specific Cox survival is not implemented.")
         self.data_config = data_config
         self.model_config = model_config
         self.register_buffer("_feature_means", torch.zeros(data_config.n_features))
@@ -1049,6 +1053,7 @@ class TrailsSurvVaderModel(nn.Module):
             torch.zeros(model_config.n_clusters, model_config.latent_dim)
         )
         self.survival_head = build_survival_head(model_config)
+        self.survival_log_shape = nn.Parameter(torch.zeros(()))
         self.loss_log_variances = nn.ParameterDict()
         if model_config.loss.weighting == "uncertainty":
             for name, initial_weight in {
@@ -1164,7 +1169,11 @@ class TrailsSurvVaderModel(nn.Module):
         )
         cluster_logits = self._cluster_logits(latent)
         cluster_probabilities = torch.softmax(cluster_logits, dim=-1)
-        survival_raw = self.survival_head(latent_mean)
+        # 共享隐藏层直接从同一次采样的 z 输出各簇的 log(scale)。
+        log_scale = self.survival_head(latent)
+        survival_raw = torch.stack(
+            (log_scale, self.survival_log_shape.expand_as(log_scale)), dim=-1
+        )
         return TrailsModelOutput(
             reconstruction=reconstruction,
             latent_mean=latent_mean,
@@ -1217,7 +1226,6 @@ class TrailsSurvVaderModel(nn.Module):
         batch: Batch,
         *,
         include_vade_kl: bool,
-        include_survival: bool = True,
     ) -> TrailsLossBreakdown:
         """计算重建、生存、VaDE KL 及其固定或不确定性加权总损失。
 
@@ -1230,27 +1238,22 @@ class TrailsSurvVaderModel(nn.Module):
             原始损失、有效权重和总损失组成的 :class:`TrailsLossBreakdown`。
         """
         reconstruction = masked_mse(output.reconstruction, batch["x"], batch["mask"])
-        survival_active = include_survival and self.model_config.loss.survival_weight > 0
-        survival = (
-            survival_loss(
-                output.survival_log_params,
-                batch["event"],
-                batch["survival_time"],
-                self.model_config.survival_loss,
+        survival_active = self.model_config.loss.survival_weight > 0
+        posterior_logits = output.cluster_logits
+        survival = reconstruction.new_zeros(())
+        if survival_active:
+            likelihood = component_log_likelihood(
+                output.survival_log_params, batch["event"], batch["survival_time"]
             )
-            if survival_active
-            else torch.tensor(
-                0.0,
-                device=output.survival_log_params.device,
-                dtype=output.survival_log_params.dtype,
-            )
-        )
+            posterior_logits = survival_log_posterior(output.cluster_logits, likelihood)
+            survival = -(posterior_logits.exp() * likelihood).sum(dim=-1).mean()
+        # 同一责任度用于生存项和联合 KL；关闭生存任务时恢复 p(c|z)。
         if include_vade_kl:
             vade_kl = vade_kl_loss(
                 output.latent,
                 output.latent_mean,
                 output.latent_log_variance,
-                output.cluster_logits,
+                posterior_logits,
                 self.mixture_logits,
                 self.mixture_means,
                 self.mixture_log_variances,
@@ -1275,7 +1278,7 @@ class TrailsSurvVaderModel(nn.Module):
         include_vade_kl: bool,
         survival_active: bool,
     ) -> TrailsLossBreakdown:
-        """同一权重规则用于批次优化及完整验证风险集，零事件时不优化生存噪声。"""
+        """使用既有固定或 uncertainty 权重组合变分损失分量。"""
         if self.model_config.loss.weighting == "fixed":
             return self._compute_fixed_loss_breakdown(
                 reconstruction=reconstruction,
@@ -1394,15 +1397,16 @@ class TrailsSurvVaderModel(nn.Module):
 
 
 def build_survival_head(model_config: ModelConfig) -> nn.Sequential:
-    """构建直接输出 Weibull log 参数或 Cox log-risk 的生存头。
+    """构建以 z 为输入、输出 K 个 log(scale) 的簇特异生存头。
 
-    可选隐藏层均保持 ``latent_dim`` 宽度并使用 ReLU，最终宽度分别为 2 或 1。
+    隐藏层保持 ``latent_dim`` 宽度及 ReLU。零隐藏层为各簇独立的线性输出；
+    共享 log(shape) 由模型单独学习。
     """
     layers: list[nn.Module] = []
+    input_dim = model_config.latent_dim
     for _layer in range(model_config.survival_head_hidden_layers):
-        layers.append(nn.Linear(model_config.latent_dim, model_config.latent_dim))
+        layers.append(nn.Linear(input_dim, model_config.latent_dim))
         layers.append(nn.ReLU())
-    layers.append(
-        nn.Linear(model_config.latent_dim, 2 if model_config.survival_loss == "weibull" else 1)
-    )
+        input_dim = model_config.latent_dim
+    layers.append(nn.Linear(input_dim, model_config.n_clusters))
     return nn.Sequential(*layers)

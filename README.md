@@ -5,7 +5,7 @@ Subtypes** 的缩写。项目目标是构建面向非同步多变量医学纵向
 
 ## 当前范围
 
-当前版本是阶段一基础版：变长访问序列上的模块化 Surv-VaDER/VaDE 原型。
+当前版本是阶段一基础版：变长访问序列上的簇特异生存变分 TRAILS 模型。
 
 - 模拟器采用 VaDeSC-EHR 风格的数据生成主线：cluster-specific latent profile -> 随机非线性轨迹生成 -> pseudo attention -> 观测序列 -> Weibull 生存结局。
 - 输入是非同步采样的多变量医学检查序列，包括血液检查、肝肾功能、炎症指标、肿瘤标志物和肿瘤负荷等连续变量。
@@ -14,44 +14,65 @@ Subtypes** 的缩写。项目目标是构建面向非同步多变量医学纵向
   per-feature `mtan2` 输入层用于对照。
 - 解码器支持 GRU/LSTM/Transformer，从患者级 latent representation 重构纵向轨迹。
 - 聚类模块使用 VaDE 风格的可学习 Gaussian mixture latent prior。
-- 生存模块由患者 latent mean 直接输出 Weibull log 参数或 Cox log-risk，不跨簇混合生存分布。
+- 生存模块从同一个潜变量经共享隐藏层直接输出 K 个簇特异 Weibull log(scale)，共享一个可学习 log(shape)。
 
 本阶段不实现 mixed-type likelihood、competing risks 或 recurrent events。
 
 ## 生存损失与评价（TorchSurv）
 
-`model.survival_loss` 可选 `weibull`（通用默认）或 `cox`（CRC 默认）。基础预设
-保留一个隐藏层。Weibull 最终两列直接为 `log(scale), log(shape)`；Cox 为一个
-`log-risk`，均不再经过 softplus。两种生存损失及 Harrell/Uno C-index、动态 AUC、
-Brier/IBS 统一调用 TorchSurv 0.2，具体版本由 `uv.lock` 固定。
+`TrailsModel` 的生成分布为
+\[
+p(x,T,z,c)=p(c)p(z\mid c)p(x\mid z)p(T\mid z,c).
+\]
+训练时三个分支共用一次重参数采样的 \(z\sim q_\phi(z\mid x)\)；验证和预测使用
+\(z=m_\phi(x)\)。生存头恢复为共享隐藏层加 K 维输出：
+\(\log\lambda_k(z)=[f_\theta(z)]_k\)，输出分量对应簇身份，实现
+\(p(T\mid z,c)\)。隐藏层宽度保持 latent_dim，激活保持 ReLU；CRC 默认一个隐藏层。
+`survival_head_hidden_layers=0` 表示各簇独立的 z 线性效应和截距。
+共享的标量 `log(shape)` 初值为 0；均不经过 softplus。通用和 CRC 默认均为
+`model.survival_loss=weibull`。`cox` 枚举保留，但构造模型立即抛出
+`NotImplementedError`（簇特异 Cox 尚未实现），不再估计 TRAILS Cox 基线；独立基线模型不受影响。
 
-```bash
-# CRC：Cox；继续使用现有冻结预处理数据和训练协议
-uv run python -m scripts.crc_yunnan.05_run model.survival_loss=cox
-# Weibull：如需沿用中位时间排序，显式指定
-uv run python -m scripts.crc_yunnan.05_run model.survival_loss=weibull trainer.cindex_risk_score=median_survival
+令 \(a_{ik}=\delta_i\log h_k(t_i\mid z_i)-H_k(t_i\mid z_i)\)。适配模块使用
+TorchSurv 的 `log_hazard` 和 `_cumulative_hazard` 向量化得到逐患者、逐簇似然，
+时间下限为 `1e-4`；保留库的极值截断，全删失批次也可计算。
+变分分布取 \(q_\phi(z\mid x)q(c\mid z,t,\delta)\)，其中
+\[
+\log\gamma_{ik}=\operatorname{logsoftmax}_k[\log\pi_k+\log p(z_i\mid k)+a_{ik}].
+\]
+生存损失和联合 KL 使用同一责任度，梯度贯穿后验：
+\[
+\mathcal S=-\frac1B\sum_{i,k}\gamma_{ik}a_{ik},\qquad
+\mathcal K=\frac1B\sum_i\left[\log q_\phi(z_i\mid x_i)
++\sum_k\gamma_{ik}(\log\gamma_{ik}-\log\pi_k-\log p(z_i\mid k))\right].
+\]
+原 masked 重建损失及 `fixed/uncertainty` 组合方式不变，因此总目标是**加权变分目标**。
+责任度始终使用未经任务权重缩放的似然；不声称任意权重下都是标准 ELBO。
+单次采样 KL 的数值可为负，不额外截断。Warmup 训练重建和生存、关闭联合 KL，
+随后用训练潜均值执行原 K-means 初始化。生存权重为 0 时，责任度退回 \(p(c\mid z)\)，
+不通过 KL 间接读取结局。训练轮数、早停和 K 选择门槛/排序规则保持原协议。
+
+常规预测始终使用不依赖结局的 \(r_{ik}=p(c=k\mid z_i)\)，返回混合曲线
+\(S_i(t)=\sum_k r_{ik}S_k(t\mid z_i)\)，不平均 Weibull 参数。
+`cluster_probabilities`、`predict()`、`predict_proba()`、占簇及 ARI 均使用 r。
+验证损失使用结局后验，但预测指标只使用 r 和混合曲线。
+
+```python
+prediction = estimator.predict(data)
+risk = prediction.risk_score(48 * 30)  # landmark 后48个月的混合事件概率
+curves = prediction.survival([24 * 30, 48 * 30])  # (N, 时间点数)
+retrospective = estimator.predict(data, include_survival_posterior=True)
+gamma = retrospective.survival_conditioned_cluster_probabilities  # (N,K)，仅供回顾分析
 ```
 
-Cox 采用 Efron 并列时间处理，训练损失是按事件归一化的 **mini-batch 风险集近似**；
-验证和测试在完整风险集计算。两者计算口径不同，不能将两条损失曲线的差距直接视为
-泛化差距；这一固定约定不在每个 epoch 的历史中重复记录。单患者批次跳过生存项和对应 uncertainty
-正则；warmup 仍优化重建及启用的生存目标。训练调用只将时间映射为保序秩并把同刻删失
-排在死亡之后，以避开 TorchSurv 0.2 无并列死亡分支的风险集排序歧义；真实时间用于基线。
+显式请求回顾后验不会改变普通簇标签、混合权重或生存曲线；关闭生存任务时请求它会报错。
+`survival_log_params` 为 `(N,K,2)`，末维为 log(scale)/log(shape)，派生 scale/shape 均为
+`(N,K)`。`risk_score(t)` 返回 `1-S(t)`；`median_survival_time()` 在分量中位数构成的
+log 时间区间内向量化二分，`risk_score(method="median_survival")` 保留负 log 中位时间排序。
 
-`estimator.fit()` 完成内部训练/验证划分后，分别检查实际训练集和验证集至少有一个事件；
-`estimator.test()` 同样在入口校验，无事件立即报错，两种生存头均遵守这一约定。
-Cox 训练通过 `EventBatchSampler` 先将事件患者均分到各批次，再分配删失患者；每轮
-每名患者恰好使用一次，批次人数尽量均衡且不超过 batch size。每轮重新随机分配，相同
-seed 可复现。事件数少于所需批次数时在训练前报错，需增大 batch size。现有 collate
-负责 aligned/compact 张量整理。模型、loss 适配及基线拟合不重复判断事件是否存在；
-验证、测试、预测及基线估计使用普通加载器。纯预测 `predict()` 不要求结局中存在事件。
-
-`prediction.risk_score()` 在 Cox 下直接返回 log-risk，越大越危险；Weibull 默认仍需
-传入时间窗。`prediction.risk_score(t, method="event_probability")` 返回 `1-S(t)`，
-`prediction.survival(times)` 返回完整曲线。Cox 基线在最佳模型恢复后，仅用实际参与优化
-的训练子集估计；不含内部验证集。保存模型和预测时同时保存基线。Cox 曲线按右连续阶梯
-取值，首个观察时间前为 1，尾部延续最后值；尾部延续不代表支持外的有效绝对风险预测。
-`median_survival_time()` 在 Cox 支持范围内未达到 0.5 时返回 NaN。
+`estimator.fit()` 完成内部划分后，在实际训练/验证集入口检查至少一个事件；`test()`
+也保留入口检查。模型和损失不重复判断事件是否存在，普通加载器允许全删失批次。
+纯 `predict()` 不要求事件；生存任务关闭也保留既有数据集入口约定。
 
 评价的 IPCW 始终由训练集估计并显式传给 TorchSurv；AUC 使用 cumulative/dynamic
 定义，Brier 输入生存概率。无病例/对照、删失权重不受支持等评价点保留缺失和原因，IBS
@@ -67,13 +88,17 @@ TorchSurv 0.2 的 AUC 部分临时张量没有指定设备，调用时使用局�
 多时间点 `Auc.integral()` 内部 KM 默认使用 CPU，GPU 路径显式创建
 同设备的库 KM 估计器，再调用库的 `_integrate_cumulative`，不复制积分公式。
 
-**格式变更：** 新 checkpoint 和预测文件保存生存类型、log 参数及格式版本 2。
-旧 softplus 权重及旧预测文件明确拒绝读取，历史实验请使用原代码；探索脚本显式固定
-Weibull 并在续跑契约中记录新格式，禁止混用旧结果。直接输出 log 参数改变了参数化和
-训练动态，新 Weibull 训练不要求重现旧曲线。库的有限精度、极值截断处理也可能造成微小
-数值差异；不改变已冻结实验的患者级产物。TorchSurv 0.2 的通用 eager 输入校验拒绝
-全删失批次，而 Weibull 完整似然在这种批次仍有效，因此 Weibull 使用库支持的脚本化
-loss 路径，保留删失患者的梯度，不补造事件。
+**格式变更：** checkpoint 和预测文件使用版本 **3**，保存生存类型、簇分量 log 参数，
+预测文件可附带回顾性后验。模型 checkpoint 另保存结构标识
+`survival_head_architecture="multi_output"`。原始版本 3 多输出头未保存该标识，也可直接加载；
+显式标识为 `conditioned_one_hot` 的 checkpoint 拒绝读取，需使用该结构的原代码。
+预测参数语义和形状不变，已有版本 3
+预测文件仍可读取。版本 1/2 一律拒绝读取。探索脚本中的版本 3 标记本身不代表模型
+结构相同，历史运行应使用原代码续跑。TorchSurv 由 `uv.lock`
+锁定；私有累积风险接口只在生存适配模块使用，升级依赖时需复核。
+
+OS24/E60 的匹配 K/seed 对照未显示 one-hot 条件输入改善占簇，因此恢复多输出头。
+初始化、warmup、早停和 K 选择协议保持现有设置。
 
 并列风险容差显式保持 `1e-8`，但 TorchSurv 0.2 的 C-index 内部使用 float32 判断
 风险并列。例如 float64 的 `1` 与 `1+2e-8` 会被视为并列，与旧 scikit-survival 的
