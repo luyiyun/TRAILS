@@ -8,7 +8,8 @@ import hydra
 import pandas as pd
 import torch
 from omegaconf import DictConfig
-from scripts.configs import TrailsApplicationConfig
+from scripts.crc_yunnan.config import CRCRunConfig
+from threadpoolctl import threadpool_limits
 
 from trails import (
     ClinicalTimeSeriesDataset,
@@ -67,7 +68,7 @@ def _save_split_outputs(
     }
 
 
-def run(config: TrailsApplicationConfig) -> dict[str, object]:
+def run(config: CRCRunConfig) -> dict[str, object]:
     # ==================================================================================
     # 一、定位04产物和新输出目录，只读取 train 及可选的 validation。
     # ==================================================================================
@@ -211,8 +212,28 @@ def run(config: TrailsApplicationConfig) -> dict[str, object]:
 
 @hydra.main(config_path="../../configs", config_name="crc_yunnan/run", version_base="1.3")
 def main(raw_config: DictConfig) -> None:
-    config = TrailsApplicationConfig.model_validate(resolved_payload(raw_config))
-    run(config)
+    config = CRCRunConfig.model_validate(resolved_payload(raw_config))
+    runtime = config.runtime
+    if config.parallel.torch_threads is not None:
+        torch.set_num_threads(config.parallel.torch_threads)
+    if (
+        runtime.torch_interop_threads is not None
+        and torch.get_num_interop_threads() != runtime.torch_interop_threads
+    ):
+        torch.set_num_interop_threads(runtime.torch_interop_threads)
+    if runtime.cudnn_benchmark is not None:
+        torch.backends.cudnn.benchmark = runtime.cudnn_benchmark
+    if runtime.cudnn_deterministic is not None:
+        torch.backends.cudnn.deterministic = runtime.cudnn_deterministic
+    if runtime.deterministic_algorithms is not None:
+        torch.use_deterministic_algorithms(runtime.deterministic_algorithms)
+    if runtime.cuda_matmul_allow_tf32 is not None:
+        torch.backends.cuda.matmul.allow_tf32 = runtime.cuda_matmul_allow_tf32
+    if runtime.cudnn_allow_tf32 is not None:
+        torch.backends.cudnn.allow_tf32 = runtime.cudnn_allow_tf32
+    # 与07独立进程保持一致：同时限制Torch、K-means使用的BLAS/OpenMP线程。
+    with threadpool_limits(limits=config.parallel.torch_threads):
+        run(config)
 
 
 if __name__ == "__main__":

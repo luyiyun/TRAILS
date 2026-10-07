@@ -1226,6 +1226,7 @@ class TrailsModel(nn.Module):
         batch: Batch,
         *,
         include_vade_kl: bool,
+        include_survival: bool = True,
     ) -> TrailsLossBreakdown:
         """计算重建、生存、VaDE KL 及其固定或不确定性加权总损失。
 
@@ -1233,12 +1234,13 @@ class TrailsModel(nn.Module):
             output: 当前批次模型输出。
             batch: 含真实纵向值、掩码和生存结局的批次。
             include_vade_kl: 是否在当前阶段启用 VaDE KL 分量。
+            include_survival: 是否参与当前阶段优化；仅重建预训练时关闭。
 
         返回：
             原始损失、有效权重和总损失组成的 :class:`TrailsLossBreakdown`。
         """
         reconstruction = masked_mse(output.reconstruction, batch["x"], batch["mask"])
-        survival_active = self.model_config.loss.survival_weight > 0
+        survival_active = include_survival and self.model_config.loss.survival_weight > 0
         posterior_logits = output.cluster_logits
         survival = reconstruction.new_zeros(())
         if survival_active:

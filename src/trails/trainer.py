@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from collections.abc import Callable
 from itertools import chain
 from typing import Literal, NotRequired, TypedDict
 
 import torch
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
 from torch import Tensor
 from torchmetrics import Metric
 from torchmetrics.clustering import AdjustedRandScore, NormalizedMutualInfoScore
@@ -167,6 +170,8 @@ class TrailsTrainer:
         self.model = model.to(config.device)
         self.config = config
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
+        self.initialization_metrics: dict[str, float] = {}
+        self.diagnostic_history: list[dict[str, str | float]] = []
 
         self.losses = LossAccumulator()
 
@@ -205,10 +210,19 @@ class TrailsTrainer:
         )
 
         history: list[HistoryEntry] = []
+        self.initialization_metrics = {}
+        self.diagnostic_history = []
+        if self.config.epoch_diagnostics:
+            self._record_diagnostics(data, validation_data, "before_warmup", 0)
 
         if self.config.warmup_epochs > 0:
             for epoch in ProgressBar(range(self.config.warmup_epochs), desc="Warmup", leave=False):
-                losses, scores = self._epoch_loop(loader, phase="train", include_vade_kl=False)
+                losses, scores = self._epoch_loop(
+                    loader,
+                    phase="train",
+                    include_vade_kl=False,
+                    include_survival=self.config.warmup_objective == "reconstruction_survival",
+                )
                 entry: HistoryEntry = {  # type: ignore
                     "epoch": epoch + 1,
                     "global_epoch": len(history) + 1,
@@ -221,7 +235,10 @@ class TrailsTrainer:
 
                 if valid_loader is not None:
                     losses, scores = self._epoch_loop(
-                        valid_loader, phase="valid", include_vade_kl=False
+                        valid_loader,
+                        phase="valid",
+                        include_vade_kl=False,
+                        include_survival=self.config.warmup_objective == "reconstruction_survival",
                     )
                     entry["valid"] = {**losses, **scores}
 
@@ -229,7 +246,15 @@ class TrailsTrainer:
                 if history_callback is not None:
                     history_callback(entry)
 
+        if self.config.epoch_diagnostics:
+            self._record_diagnostics(data, validation_data, "before_initialization", len(history))
+        if self.config.warmup_epochs > 0 or self.config.initialize_without_warmup:
             self.initialize_mixture_from_data(data)
+        self._prepare_joint_training()
+        if self.config.epoch_diagnostics:
+            self._record_diagnostics(data, validation_data, "after_initialization", len(history))
+
+        scheduler = self._make_scheduler()
 
         survival_metrics: dict[str, Metric] = {"cindex": Cindex()}
         cluster_metrics: dict[str, Metric] = {
@@ -288,6 +313,12 @@ class TrailsTrainer:
             )
             if should_stop:
                 entry["early_stopped"] = True
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    monitored = entry.get("valid", entry["train"])
+                    scheduler.step(monitored[self.config.early_stopping_monitor])
+                else:
+                    scheduler.step()
             if history_callback is not None:
                 history_callback(entry)
             if should_stop:
@@ -295,7 +326,106 @@ class TrailsTrainer:
 
         if early_stopper is not None and early_stopper.best_state is not None:
             self.model.load_state_dict(early_stopper.best_state)
+        if self.config.epoch_diagnostics:
+            self._record_diagnostics(data, validation_data, "restored", len(history))
         return history
+
+    def _prepare_joint_training(self) -> None:
+        """在阶段边界执行显式的参数及优化器策略，默认保持既有行为。"""
+        if self.config.warmup_epochs > 0 and self.config.reset_survival_after_warmup:
+            for module in self.model.survival_head.modules():
+                if isinstance(module, torch.nn.Linear):
+                    module.reset_parameters()
+            with torch.no_grad():
+                self.model.survival_log_shape.zero_()
+        if self.config.uncertainty_after_warmup == "reset":
+            weights = self.model.model_config.loss
+            for name, weight in {
+                "reconstruction": weights.reconstruction_weight,
+                "survival": weights.survival_weight,
+                "vade_kl": weights.cluster_weight,
+            }.items():
+                if name in self.model.loss_log_variances:
+                    parameter = self.model.loss_log_variances[name]
+                    with torch.no_grad():
+                        parameter.fill_(-math.log(2.0 * weight))
+                    self.optimizer.state.pop(parameter, None)
+        for parameter in self.model.loss_log_variances.values():
+            parameter.requires_grad_(self.config.uncertainty_after_warmup != "freeze")
+        if self.config.warmup_epochs > 0 and self.config.reset_optimizer_after_warmup:
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config.learning_rate)
+
+    def _make_scheduler(self) -> torch.optim.lr_scheduler.LRScheduler | None:
+        """调度器只消耗正式阶段轮次；Plateau与早停使用同一监控方向。"""
+        minimum = self.config.learning_rate * self.config.scheduler_min_lr_ratio
+        if self.config.lr_scheduler == "cosine":
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.config.max_epochs,
+                eta_min=minimum,
+            )
+        if self.config.lr_scheduler == "plateau":
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="max" if self.config.early_stopping_monitor == "cindex" else "min",
+                factor=self.config.scheduler_factor,
+                patience=self.config.scheduler_patience,
+                min_lr=minimum,
+            )
+        return None
+
+    def _probability_diagnostics(self, probabilities: Tensor) -> dict[str, float]:
+        labels = probabilities.argmax(dim=-1)
+        n_clusters = self.model.model_config.n_clusters
+        counts = torch.bincount(labels, minlength=n_clusters)
+        weights = self.model.mixture_logits.detach().softmax(dim=-1)
+        variances = self.model.mixture_log_variances.detach().exp()
+        return {
+            **cluster_assignment_diagnostics(labels, n_clusters=n_clusters),
+            "mean_confidence": float(probabilities.max(dim=-1).values.mean().item()),
+            "mean_probability_entropy": float(
+                (
+                    -(probabilities * probabilities.clamp_min(1e-30).log()).sum(dim=-1)
+                    / math.log(n_clusters)
+                )
+                .mean()
+                .item()
+            ),
+            "mixture_variance_min": float(variances.min().item()),
+            "mixture_variance_mean": float(variances.mean().item()),
+            "mixture_variance_max": float(variances.max().item()),
+            **{f"cluster_count_{i}": float(counts[i].item()) for i in range(n_clusters)},
+            **{
+                f"probability_mass_{i}": float(probabilities[:, i].mean().item())
+                for i in range(n_clusters)
+            },
+            **{f"mixture_probability_{i}": float(weights[i].item()) for i in range(n_clusters)},
+        }
+
+    def _record_diagnostics(
+        self,
+        train: ClinicalTimeSeriesDataset,
+        validation: ClinicalTimeSeriesDataset | None,
+        stage: str,
+        global_epoch: int,
+    ) -> None:
+        """额外诊断保护CPU/CUDA随机状态，不计作训练轮次。"""
+        device = torch.device(self.config.device)
+        devices = [device.index or 0] if device.type == "cuda" else []
+        training = self.model.training
+        with torch.random.fork_rng(devices=devices):
+            for name, dataset in (("train", train), ("validation", validation)):
+                if dataset is not None:
+                    output, _ = self._collect_outputs(dataset)
+                    self.diagnostic_history.append(
+                        {
+                            "stage": stage,
+                            "split": name,
+                            "global_epoch": float(global_epoch),
+                            **self._probability_diagnostics(output.cluster_probabilities),
+                        }
+                    )
+        self.model.train(training)
 
     def test(self, data: ClinicalTimeSeriesDataset) -> dict[str, float]:
         """在完整数据集上计算损失、预测指标和簇占用诊断。
@@ -331,14 +461,60 @@ class TrailsTrainer:
         return {**losses, **scores, **cluster_scores}
 
     def initialize_mixture_from_data(self, data: ClinicalTimeSeriesDataset) -> None:
-        """用训练集潜空间均值的确定性 K-means 结果初始化高斯混合先验。"""
+        """仅用训练潜均值初始化；支持既有K-means、多启动及对角GMM。"""
         latent_means = self._collect_latent_means(data)
         # warmup 后用训练集 latent_mean 初始化 MoG，避免 VaDE 早期责任度塌缩。
-        prior_probabilities, means, variances = fit_kmeans_mixture(
-            latent_means,
-            n_clusters=self.model.model_config.n_clusters,
-            n_iters=self.config.gmm_init_iters,
-            seed=self.config.seed,
+        n_clusters = self.model.model_config.n_clusters
+        floor = self.config.mixture_variance_floor
+        if self.config.mixture_init == "legacy":
+            prior_probabilities, means, variances = fit_kmeans_mixture(
+                latent_means,
+                n_clusters=n_clusters,
+                n_iters=self.config.gmm_init_iters,
+                seed=self.config.seed,
+            )
+            labels = torch.cdist(latent_means, means).argmin(dim=1)
+        elif self.config.mixture_init == "gmm":
+            mixture = GaussianMixture(
+                n_components=n_clusters,
+                covariance_type="diag",
+                reg_covar=floor,
+                n_init=self.config.mixture_init_n_init,
+                max_iter=self.config.mixture_init_max_iter,
+                random_state=self.config.seed,
+            )
+            labels = torch.from_numpy(mixture.fit_predict(latent_means.numpy()))
+            prior_probabilities = torch.from_numpy(mixture.weights_).float()
+            means = torch.from_numpy(mixture.means_).float()
+            variances = torch.from_numpy(mixture.covariances_).float()
+            self.initialization_metrics["converged"] = float(mixture.converged_)
+        else:
+            kmeans = KMeans(
+                n_clusters=n_clusters,
+                init="k-means++",
+                n_init=self.config.mixture_init_n_init,  # type: ignore[reportArgumentType]
+                max_iter=self.config.mixture_init_max_iter,
+                random_state=self.config.seed,
+            )
+            labels = torch.from_numpy(kmeans.fit_predict(latent_means.numpy()))
+            means = torch.from_numpy(kmeans.cluster_centers_).float()
+            counts = torch.bincount(labels, minlength=n_clusters).float().clamp_min(1)
+            prior_probabilities = counts / counts.sum()
+            global_variance = latent_means.var(dim=0, unbiased=False).clamp_min(floor)
+            variances = global_variance.expand(n_clusters, -1).clone()
+            if self.config.mixture_init == "kmeans":
+                for cluster in range(n_clusters):
+                    values = latent_means[labels == cluster]
+                    if len(values):
+                        variances[cluster] = values.var(dim=0, unbiased=False)
+        variances = variances.clamp_min(floor)
+        if self.config.mixture_prior == "uniform":
+            prior_probabilities = torch.full_like(prior_probabilities, 1.0 / n_clusters)
+        self.initialization_metrics.update(
+            cluster_assignment_diagnostics(labels, n_clusters=n_clusters)
+        )
+        self.initialization_metrics.update(
+            {f"cluster_count_{i}": float((labels == i).sum().item()) for i in range(n_clusters)}
         )
         self.model.set_mixture_parameters(prior_probabilities, means, variances)
 
@@ -348,11 +524,14 @@ class TrailsTrainer:
         *,
         phase: Literal["train", "valid"] = "train",
         include_vade_kl: bool = True,
+        include_survival: bool = True,
         survival_metrics: dict[str, Metric] | None = None,
         cluster_metrics: dict[str, Metric] | None = None,
     ) -> tuple[dict[str, float], dict[str, float]]:
         """执行一次训练或验证循环并返回平均损失与指标。"""
         self.losses.reset()
+        diagnostic_probabilities: list[Tensor] = []
+        learning_rate = float(self.optimizer.param_groups[0]["lr"])
         if survival_metrics is not None:
             for m in survival_metrics.values():
                 m.reset()
@@ -373,12 +552,13 @@ class TrailsTrainer:
                     output,
                     device_batch,
                     include_vade_kl=include_vade_kl,
+                    include_survival=include_survival,
                 )
+                if not bool(torch.isfinite(loss.loss)):
+                    raise FloatingPointError(f"Non-finite {phase} loss.")
 
                 if phase == "train":
                     self.optimizer.zero_grad()
-                    if not bool(torch.isfinite(loss.loss)):
-                        raise FloatingPointError("Non-finite training loss.")
                     loss.loss.backward()
                     if self.config.gradient_clip_norm is not None:
                         torch.nn.utils.clip_grad_norm_(
@@ -389,6 +569,17 @@ class TrailsTrainer:
                     self.optimizer.step()
 
                 self.losses.update(device_batch["x"].size(0), loss)
+                if self.config.epoch_diagnostics and phase == "valid":
+                    diagnostic_probabilities.append(output.cluster_probabilities.detach())
+                    if not include_vade_kl or not include_survival:
+                        # 在同一确定性验证输出上记录未启用分量，不参与反向传播。
+                        raw = self.model.compute_loss(output, device_batch, include_vade_kl=True)
+                        count = device_batch["x"].size(0)
+                        for name in ("reconstruction_loss", "survival_loss", "vade_kl_loss"):
+                            key = f"diagnostic_raw_{name}"
+                            self.losses.total[key] = (
+                                self.losses.total.get(key, 0.0) + getattr(raw, name).item() * count
+                            )
                 if survival_metrics is not None:
                     for m in survival_metrics.values():
                         m.update(
@@ -409,6 +600,14 @@ class TrailsTrainer:
                         )
 
         losses = self.losses.compute()
+        if self.config.epoch_diagnostics:
+            losses["learning_rate"] = learning_rate
+            losses["survival_enabled"] = float(
+                include_survival and self.model.model_config.loss.survival_weight > 0
+            )
+            losses["vade_kl_enabled"] = float(include_vade_kl)
+            if diagnostic_probabilities:
+                losses.update(self._probability_diagnostics(torch.cat(diagnostic_probabilities)))
         return losses, {
             **(
                 {}

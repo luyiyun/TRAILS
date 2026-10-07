@@ -260,6 +260,23 @@ class TrainerConfig(BaseModel):
     learning_rate: float = Field(default=1e-3, gt=0.0)
     warmup_epochs: int = Field(default=1, ge=0)
     gmm_init_iters: int = Field(default=20, ge=0)
+    warmup_objective: Literal["reconstruction_survival", "reconstruction"] = (
+        "reconstruction_survival"
+    )
+    mixture_init: Literal["legacy", "kmeans", "kmeans_global", "gmm"] = "legacy"
+    mixture_init_n_init: int = Field(default=10, gt=0)
+    mixture_init_max_iter: int = Field(default=200, gt=0)
+    mixture_variance_floor: float = Field(default=1e-4, gt=0.0)
+    mixture_prior: Literal["empirical", "uniform"] = "empirical"
+    initialize_without_warmup: bool = False
+    reset_survival_after_warmup: bool = False
+    reset_optimizer_after_warmup: bool = False
+    uncertainty_after_warmup: Literal["continue", "reset", "freeze"] = "continue"
+    lr_scheduler: Literal["constant", "cosine", "plateau"] = "constant"
+    scheduler_min_lr_ratio: float = Field(default=0.01, gt=0.0, le=1.0)
+    scheduler_factor: float = Field(default=0.5, gt=0.0, lt=1.0)
+    scheduler_patience: int = Field(default=10, gt=0)
+    epoch_diagnostics: bool = False
     gradient_clip_norm: float | None = Field(default=5.0, gt=0.0)
     device: str = "cpu"
     seed: int = 2026

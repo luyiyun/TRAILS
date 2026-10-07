@@ -394,3 +394,175 @@
   cd /Users/rong/Project/TRAILS
   .venv/bin/python -c 'import pandas as pd; d=pd.read_csv("remote-results/crc-yunnan-os24-e60-trails-v3-k2-10-s3-20260930-004807/epoch_metrics.csv"); print(d[d.global_epoch.isin([10,11,310])].groupby("global_epoch")[["train.vade_kl_loss","train.survival_loss","valid.loss","valid.reconstruction_loss","valid.reconstruction_loss_weight"]].median().to_string())'
 )
+
+# 2026-10-06 CRC 07本地合成验证：固定采样20261006；检查192格分片、新增训练分支、诊断RNG、两进程及续跑。
+# 本地 /Users/rong/Project/TRAILS；CPU、synthetic train60/validation30/test36，主阶段2轮；与真实患者数据及正式结果隔离。
+(
+  cd /Users/rong/Project/TRAILS
+  UV_CACHE_DIR=/tmp/uv-cache uv run python .remote-run/verification/crc-search-20261006/verify.py > .remote-run/verification/crc-search-20261006/verify.log 2>&1
+)
+
+# 2026-10-06 CRC 07合成验证续跑：修正Hydra组合配置入口后重新执行；参数、seed及隔离目录同上。
+(
+  cd /Users/rong/Project/TRAILS
+  UV_CACHE_DIR=/tmp/uv-cache uv run python .remote-run/verification/crc-search-20261006/verify.py > .remote-run/verification/crc-search-20261006/verify.log 2>&1
+)
+
+# 2026-10-06 CRC 07远端数据准备：现有凭据临时SSH-agent；99直接复制train/validation及预处理元信息到215。
+# 两机 /home/rongzw/projects/TRAILS；OS24/E60/random/seed-20260908；核对五个SHA256，test仅留99，患者数据不落本地。
+sh /Users/rong/Project/TRAILS/.remote-run/verification/crc-search-20261006/prepare-data.sh
+
+# 2026-10-06 CRC 07合成验证：修正临时脚本的公开from_dataframes调用；参数、seed及输出同上，已完成训练按协议复用。
+(
+  cd /Users/rong/Project/TRAILS
+  MPLCONFIGDIR=/tmp/trails-07-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python .remote-run/verification/crc-search-20261006/verify.py > .remote-run/verification/crc-search-20261006/verify.log 2>&1
+)
+
+# 2026-10-06 CRC 07合成汇总夹具：测试失败K排除、锁模SHA256、一次test评价与重复finalize复用。
+# 本地隔离目录 .remote-run/verification/crc-search-20261006/fixtures；受控汇总指标仅验证控制流，不作为模型占簇达标证据。
+(
+  cd /Users/rong/Project/TRAILS
+  MPLCONFIGDIR=/tmp/trails-07-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python .remote-run/verification/crc-search-20261006/verify-finalize.py > .remote-run/verification/crc-search-20261006/finalize.log 2>&1
+)
+
+# 2026-10-06 CRC 07 CLI合成入口与汇总回归：仅复用本地合成完成试验；验证Hydra子进程入口与失败门槛修订。
+(
+  cd /Users/rong/Project/TRAILS
+  MPLCONFIGDIR=/tmp/trails-07-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python -m scripts.crc_yunnan.07_search mode=plan paths.dir=.remote-run/verification/crc-search-20261006/cli-plan
+  MPLCONFIGDIR=/tmp/trails-07-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python .remote-run/verification/crc-search-20261006/verify-finalize.py > .remote-run/verification/crc-search-20261006/finalize-regression.log 2>&1
+)
+
+# 2026-10-06 CRC 07真实合成K验证：r000，K2/3×seed20260908/09/10；复用两格K3，新增4次CPU两轮训练。
+# 本地 .remote-run/verification/crc-search-20261006/real-validate-*；每片两进程，再次validate验证不重训，保留5%占簇门槛。
+(
+  cd /Users/rong/Project/TRAILS
+  MPLCONFIGDIR=/tmp/trails-07-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python .remote-run/verification/crc-search-20261006/verify-validation.py > .remote-run/verification/crc-search-20261006/validation.log 2>&1
+)
+
+# 2026-10-06 CRC 07两机锁定环境准备；主机99/215，工作目录/home/rongzw/projects/TRAILS。
+# 同一Git跟踪工作树与uv.lock；新215环境使用Python3.12.12，99按同一锁核对环境；不修改系统Python。
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'cd /home/rongzw/projects/TRAILS && uv sync --locked --python 3.12.12'
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-215-rzw-xtcp 'cd /home/rongzw/projects/TRAILS && uv sync --locked --python 3.12.12'
+
+# 2026-10-06 CRC 07锁定环境恢复：215的NumPy/DuckDB下载长期等待，停止本次安装并从99复用相同版本缓存。
+# 服务器直接复制仅numpy1.26.4和duckdb1.4.5的cp312/Linux缓存及各自归档；重新uv sync --locked/Python3.12.12。
+sh /Users/rong/Project/TRAILS/.remote-run/crc07-20261006/prepare-dependencies.sh
+
+# 2026-10-06 CRC 07两机独立GPU短试跑：99/215，工作目录/home/rongzw/projects/TRAILS；每机2进程，各4线程/cuda:0。
+# K10×seed20260908/09：r036 Transformer2宽64/latent32/batch256/warmup10，r052 mTAN宽64/latent16/batch256/warmup0；主阶段3轮。
+# 两机各4次试跑，输出outputs/crc_yunnan/crc07-20261006/pilot/99或215；仅确认显存和执行，不进入正式选优。
+.venv/bin/python /Users/rong/Project/skills/remote-run/scripts/remote_run.py group submit --plan .remote-run/crc07-20261006/pilot.json --apply
+
+# 2026-10-06 CRC 07 GPU试跑修复后重试：CUDA统计前显式初始化设备；保留旧pilot失败记录，尚无正式训练。
+# 99/215均/home/rongzw/projects/TRAILS；原r036/r052、K10、seed20260908/09、并行2各4线程；输出pilot-r2/99或215。
+.venv/bin/python /Users/rong/Project/skills/remote-run/scripts/remote_run.py group submit --plan .remote-run/crc07-20261006/pilot-r2.json --apply
+
+# 2026-10-06 CRC 07 GPU试跑聚合验收：两机r036/r052×seed20260908/09共8格；只读取已取回的统计量。
+# 本地/Users/rong/Project/TRAILS；核对协议/数据指纹、完整退出与峰值显存，输出remote-results/crc07-20261006-pilot-r2/pilot_metrics.csv。
+.venv/bin/python .remote-run/crc07-20261006/analyse_pilot.py
+
+# 2026-10-06 CRC 07正式初筛：99/215均/home/rongzw/projects/TRAILS；各2进程/cuda:0/每进程4 CPU与BLAS线程，总并行4。
+# OS24/E60/auto-log1p-robust/random seed20260908，train1854/validation444；K3，96配方×seed20260908/09=192次；主100–300轮/patience30。
+# 负log混合中位生存时间排序；两seed占簇均>=5%且无空簇才入围，test不读取；输出outputs/crc_yunnan/crc07-20261006/screen/shard-0或1。
+.venv/bin/python /Users/rong/Project/skills/remote-run/scripts/remote_run.py group submit --plan .remote-run/crc07-20261006/screen-formal.json --apply
+
+# 2026-10-06 CRC 07正式初筛聚合：两机192格终态（191完成、1非有限梯度）；仅读取安全summary，不读取患者或test。
+# 本地/Users/rong/Project/TRAILS；原OS24/E60/random-seed20260908、K3×seed20260908/09；保留5%占簇门槛及ARI优先排序。
+# 输出remote-results/crc07-20261006/screen-merged；最多3套配方，K2–10×3seed及复用K3的分配在此次冻结。
+(
+  cd /Users/rong/Project/TRAILS
+  MPLCONFIGDIR=/tmp/trails-07-mpl UV_CACHE_DIR=/tmp/uv-cache uv run --locked python -m scripts.crc_yunnan.07_search mode=merge merge_stage=screen trainer.device=cuda:0 trainer.min_epochs=100 trainer.max_epochs=300 trainer.early_stopping_patience=30 trainer.cindex_risk_score=median_survival shard.count=2 search.n_recipes=96 search.sampling_seed=20261006 search.screen_k=3 'search.screen_seeds=[20260908,20260909]' 'search.validation_seeds=[20260908,20260909,20260910]' 'search.candidates=[2,3,4,5,6,7,8,9,10]' search.min_cluster_fraction=0.05 search.top_n=3 split.seed=20260908 split.strategy=random split.dir=data/derived/crc_yunnan/preproc/v2/os/landmark-24m/E60/auto-log1p-robust/random/seed-20260908 'inputs.summaries=[remote-results/crc07-20261006-screen/default/crc07-20261006-screen-99/outputs/crc_yunnan/crc07-20261006/screen/shard-0/summary.json,remote-results/crc07-20261006-screen/tmu-215-rzw-xtcp/crc07-20261006-screen-215/outputs/crc_yunnan/crc07-20261006/screen/shard-1/summary.json]' paths.dir=remote-results/crc07-20261006/screen-merged
+)
+
+# 2026-10-06 CRC 07冻结K验证任务分配：r009/r089，K2–10×seed20260908/09/10；仅复制聚合运行输入JSON。
+# 两机/home/rongzw/projects/TRAILS；assignment SHA256=71bcce10bec652cb5e4107f8bc72d8a16527ac7a07060e58f0bbeabc67e55931。
+scp -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes /Users/rong/Project/TRAILS/remote-results/crc07-20261006/screen-merged/validation_assignment.json tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS/outputs/crc_yunnan/crc07-20261006/validation_assignment.json
+scp -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes /Users/rong/Project/TRAILS/remote-results/crc07-20261006/screen-merged/validation_assignment.json tmu-215-rzw-xtcp:/home/rongzw/projects/TRAILS/outputs/crc_yunnan/crc07-20261006/validation_assignment.json
+
+# 2026-10-06 CRC 07正式K验证：r009/r089，K2–10×seed20260908/09/10共54单元，复用4格K3，新增50次训练。
+# 99/215均/home/rongzw/projects/TRAILS；冻结新增分配24/26；各2进程/cuda:0/4线程；原OS24/E60划分及100–300轮/patience30。
+# 输出outputs/crc_yunnan/crc07-20261006/validate/shard-0或1；配方内one-standard-error选K，三seed占簇与ARI，不读取test。
+.venv/bin/python /Users/rong/Project/skills/remote-run/scripts/remote_run.py group submit --plan .remote-run/crc07-20261006/validate.json --apply
+
+# 2026-10-06 CRC 07配方表导出：仅在本地生成与正式协议相同的96套参数及protocol.json，不加载患者数据或训练。
+# 本地/Users/rong/Project/TRAILS；采样seed20261006，输出remote-results/crc07-20261006/recipe-plan，供聚合结果解释与复现。
+(
+  cd /Users/rong/Project/TRAILS
+  MPLCONFIGDIR=/tmp/trails-07-mpl UV_CACHE_DIR=/tmp/uv-cache uv run --locked python -m scripts.crc_yunnan.07_search mode=plan trainer.device=cuda:0 trainer.min_epochs=100 trainer.max_epochs=300 trainer.early_stopping_patience=30 search.n_recipes=96 search.sampling_seed=20261006 'search.screen_seeds=[20260908,20260909]' 'search.validation_seeds=[20260908,20260909,20260910]' paths.dir=remote-results/crc07-20261006/recipe-plan
+)
+
+# 2026-10-06 用户追加CRC 07回顾性诊断：两机CPU各1进程/4线程，已完成K3模型比较p(c|z)和p(c|z,t,e)的占簇及跨seed ARI。
+# 仅读取冻结validation444人与远端checkpoint/标签，额外纳入已完成的入围配方第三seed；不训练、不读test，脚本与患者数组不取回。
+# 临时脚本.remote-run/crc07-20261006/posterior_diagnostics.py经Ruff/Pyright检查后传送独立目录，输出outputs/crc_yunnan/crc07-20261006/posterior/shard-0/1。
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'set -eu
+diag_out=/home/rongzw/projects/TRAILS/outputs/crc_yunnan/crc07-20261006/posterior/shard-0
+mkdir "$diag_out/.launch-lock"
+nohup sh /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc07-20261006/posterior-99.sh < /dev/null > "$diag_out/stdout.log" 2> "$diag_out/stderr.log" &
+printf '\''%s\n'\'' "$!" > "$diag_out/pid"
+cat "$diag_out/pid"'
+
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-215-rzw-xtcp 'set -eu
+diag_out=/home/rongzw/projects/TRAILS/outputs/crc_yunnan/crc07-20261006/posterior/shard-1
+mkdir "$diag_out/.launch-lock"
+nohup sh /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc07-20261006/posterior-215.sh < /dev/null > "$diag_out/stdout.log" 2> "$diag_out/stderr.log" &
+printf '\''%s\n'\'' "$!" > "$diag_out/pid"
+cat "$diag_out/pid"'
+
+# 2026-10-06 CRC 07已完成初筛的超参数和损失诊断：仅本地读取聚合CSV；按配方计数并比较37个单因素对照。
+# 输入remote-results/crc07-20261006-screen及screen-merged/recipe-plan；输出remote-results/crc07-20261006/diagnostics，不读取患者或test。
+MPLCONFIGDIR=/tmp/trails-07-mpl .venv/bin/python .remote-run/crc07-20261006/analyze_diagnostics.py
+
+# 2026-10-06 CRC 07后验诊断合并：191个初筛完成模型及两个入围配方的K3第三seed，仅聚合统计。
+# 本地/Users/rong/Project/TRAILS；对照outcome-free与outcome-conditioned的占簇/ARI，并汇总损失权重、方差与退化关系；不读test、不改选优。
+.venv/bin/python .remote-run/crc07-20261006/merge_posterior.py
+
+# 2026-10-06 CRC 07诊断补充：在同一权重策略内分层比较实际权重，并核对单类退化首次出现的正式轮次。
+# 仍只读取原聚合CSV，更新diagnostics目录；不训练、不读取test。
+.venv/bin/python .remote-run/crc07-20261006/merge_posterior.py
+
+# 2026-10-07 CRC 07两机K验证汇总：54单元（50新增、4复用）均终态，只读取白名单聚合统计。
+# 本地/Users/rong/Project/TRAILS；冻结协议和分配不变，按原占簇、BIC及one-standard-error规则选K；不读取test。
+MPLCONFIGDIR=/tmp/trails-07-mpl UV_CACHE_DIR=/tmp/uv-cache uv run --locked python -m scripts.crc_yunnan.07_search mode=merge merge_stage=validate trainer.device=cuda:0 trainer.min_epochs=100 trainer.max_epochs=300 trainer.early_stopping_patience=30 trainer.cindex_risk_score=median_survival shard.count=2 search.n_recipes=96 search.sampling_seed=20261006 search.screen_k=3 'search.screen_seeds=[20260908,20260909]' 'search.validation_seeds=[20260908,20260909,20260910]' 'search.candidates=[2,3,4,5,6,7,8,9,10]' search.min_cluster_fraction=0.05 search.top_n=3 split.seed=20260908 split.strategy=random split.dir=data/derived/crc_yunnan/preproc/v2/os/landmark-24m/E60/auto-log1p-robust/random/seed-20260908 inputs.assignment=remote-results/crc07-20261006/screen-merged/validation_assignment.json 'inputs.summaries=[remote-results/crc07-20261006-validate/default/crc07-20261006-validate-99/outputs/crc_yunnan/crc07-20261006/validate/shard-0/summary.json,remote-results/crc07-20261006-validate/tmu-215-rzw-xtcp/crc07-20261006-validate-215/outputs/crc_yunnan/crc07-20261006/validate/shard-1/summary.json]' paths.dir=remote-results/crc07-20261006/validate-merged
+
+# 2026-10-07 CRC 07一次test终评：锁定r089/K2/seed20260908，checkpoint SHA256 6e3dd63e520280d0c6286ac15e6099d500f1ec50cbb64b6c6d7a2e5b4fefeea8。
+# default=tmu-99-rzw-xtcp，工作目录/home/rongzw/projects/TRAILS；IPCW仅来自train，test不参与选优；持久run crc07-20261006-finalize-99。
+.venv/bin/python /Users/rong/Project/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc07-20261006-finalize-99 --apply -- python -m scripts.crc_yunnan.07_search mode=finalize shard.index=0 shard.count=2 shard.workers=2 shard.threads=4 trainer.device=cuda:0 trainer.min_epochs=100 trainer.max_epochs=300 trainer.early_stopping_patience=30 trainer.cindex_risk_score=median_survival search.n_recipes=96 search.sampling_seed=20261006 search.screen_k=3 'search.screen_seeds=[20260908,20260909]' 'search.validation_seeds=[20260908,20260909,20260910]' 'search.candidates=[2,3,4,5,6,7,8,9,10]' search.min_cluster_fraction=0.05 search.top_n=3 split.seed=20260908 split.strategy=random split.dir=data/derived/crc_yunnan/preproc/v2/os/landmark-24m/E60/auto-log1p-robust/random/seed-20260908 inputs.selection=outputs/crc_yunnan/crc07-20261006/final_selection.json inputs.checkpoint=/home/rongzw/projects/TRAILS/outputs/crc_yunnan/crc07-20261006/validate/shard-0/trials/r089/k2/seed-20260908/model.pt paths.dir=outputs/crc_yunnan/crc07-20261006/final
+
+# 2026-10-07 用户追加单seed占簇汇总：仅本地读取已完成54格验证聚合CSV，不训练、不读取test。
+# /Users/rong/Project/TRAILS；比较两个配方各seed在K2–10的无空簇次数和最小占比≥5%的次数，输出seed-occupancy。
+.venv/bin/python .remote-run/crc07-20261006/seed_occupancy_summary.py
+
+# 2026-10-07 用户指定r089/20260908补充比较K2–10：准备9个已完成模型输入，复用原单seed C-index+BIC分数。
+# 本地/Users/rong/Project/TRAILS；不训练，后续按验证分数选K，所有K的test生存比较作为探索性展示。
+.venv/bin/python .remote-run/crc07-20261006/prepare_single_seed.py
+
+# 2026-10-07 r089/seed20260908补充分析：99经临时SSH-agent直接从215取5个checkpoint，模型不经过本地。
+# 其余4个checkpoint已经在99；本次不训练，test仍留99；临时脚本和9模型清单为运行输入。
+sh .remote-run/crc07-20261006/prepare-single-seed-models.sh
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'mkdir -p /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc07-20261007-single-seed'
+scp -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes .remote-run/crc07-20261006/single_seed_evaluate.py .remote-run/crc07-20261006/single-seed-input.json tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc07-20261007-single-seed/
+
+# 2026-10-07 持久提交r089/20260908单seed K2–10验证/test探索比较；不使用ARI，直接按原混合分数排名。
+# default=tmu-99-rzw-xtcp，工作目录/home/rongzw/projects/TRAILS；4线程、cuda:0；只导出聚合指标、KM及风险表。
+.venv/bin/python /Users/rong/Project/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc07-20261007-r089-seed08-compare --apply -- env PYTHONPATH=. OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-07-single-seed-mpl python .remote-run/diagnostics/crc07-20261007-single-seed/single_seed_evaluate.py --plan .remote-run/diagnostics/crc07-20261007-single-seed/single-seed-input.json --data data/derived/crc_yunnan/preproc/v2/os/landmark-24m/E60/auto-log1p-robust/random/seed-20260908 --output outputs/crc_yunnan/crc07-20261007/r089-seed20260908 --device cuda:0 --threads 4
+
+# 2026-10-07 九K补充评价已exit0；修复KM风险表中文标签缺字，沿用原结果，不重算C-index/BIC或选K。
+# 99/home/rongzw/projects/TRAILS，cuda0/4线程；仅确定性预测后重绘英文风险表，患者数组不保存。
+scp -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes .remote-run/crc07-20261006/replot_single_seed.py tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc07-20261007-single-seed/
+.venv/bin/python /Users/rong/Project/skills/remote-run/scripts/remote_run.py --target default run --apply -- env PYTHONPATH=. OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-07-single-seed-mpl python .remote-run/diagnostics/crc07-20261007-single-seed/replot_single_seed.py --plan .remote-run/diagnostics/crc07-20261007-single-seed/single-seed-input.json --data data/derived/crc_yunnan/preproc/v2/os/landmark-24m/E60/auto-log1p-robust/random/seed-20260908 --output outputs/crc_yunnan/crc07-20261007/r089-seed20260908
+
+# 2026-10-07 r089/20260908单seed补充比较汇总：只读已取回18单元聚合指标、KM和簇对检验。
+# 本地/Users/rong/Project/TRAILS；生成comparison.csv及报告，按验证混合分数选K，test仅探索展示。
+.venv/bin/python .remote-run/crc07-20261006/analyze_single_seed.py
+
+# 2026-10-07 补充比较报告完善：核对九K两评价集人数及模型SHA，解释混合分数与两两生存差异。
+# 仅本地读取聚合产物，更新同一comparison.csv和report.md；不训练或重读远端患者数据。
+.venv/bin/python .remote-run/crc07-20261006/analyze_single_seed.py
+
+# 2026-10-07：本地核对CRC r089/seed20260908的01–05配置与K2/K5入口。
+# /Users/rong/Project/TRAILS；对照原推荐配置，检查四线程/GPU设置及新版本路径衔接；不读患者数据、不训练。
+MPLCONFIGDIR=/tmp/trails-mpl PYTHONPATH=. .venv/bin/python .remote-run/crc07-20261007-reproduction/verify_config.py
+
+# 2026-10-07：按用户要求仅保留run.yaml；复核r089单seed的K2–10及01–05路径衔接。
+# /Users/rong/Project/TRAILS；配置与运行设置检查，不读取患者数据、不训练。
+MPLCONFIGDIR=/tmp/trails-mpl PYTHONPATH=. .venv/bin/python .remote-run/crc07-20261007-reproduction/verify_config.py

@@ -395,6 +395,60 @@ class ClusterNumberSelector:
         )
 
     @staticmethod
+    def evaluate_fitted(
+        estimator: TrailsEstimator, data: ClinicalTimeSeriesDataset
+    ) -> dict[str, float]:
+        """评价已锁定的候选模型，不重新训练或划分数据。"""
+        return ClusterNumberSelector._calculate_candidate_metrics(estimator, data)
+
+    def summarize_completed(
+        self, run_metrics: pd.DataFrame, stability_pairs: pd.DataFrame
+    ) -> ClusterNumberSelectionResult:
+        """汇总独立进程完成的候选；数值失败和缺失 seed 不通过门槛。
+
+        输入每个 seed/K 一行，失败行的 status 为 numerical_failure。
+        stability_pairs 沿用 n_clusters/seed_a/seed_b/ari 四列，标签无需汇入。
+        """
+        if run_metrics.duplicated(["seed", "n_clusters"]).any():
+            raise ValueError("每个seed/K只能提供一个候选")
+        frames: list[pd.DataFrame] = []
+        winners: dict[int, int] = {}
+        for seed in self.config.seeds:
+            rows = run_metrics.loc[run_metrics["seed"].eq(seed)].copy()
+            required = [
+                "cindex",
+                "latent_mixture_bic",
+                "cluster_min_fraction",
+                "cluster_empty_count",
+            ]
+            for column in required:
+                if column not in rows:
+                    rows[column] = np.nan
+            finite = np.isfinite(rows[required].to_numpy(dtype=float)).all(axis=1)
+            if "status" in rows:
+                finite &= rows["status"].eq("completed").to_numpy()
+            valid = rows.loc[finite]
+            invalid = rows.loc[~finite].assign(
+                latent_mixture_bic_normalized=np.nan, selection_score=np.nan, rank=np.nan
+            )
+            if not valid.empty:
+                scored = self._score_and_rank_candidates(valid)
+                winners[seed] = int(scored.iloc[0]["n_clusters"])
+                frames.append(scored)
+            frames.append(invalid)
+        metrics = pd.concat(frames, ignore_index=True).sort_values(["n_clusters", "seed"])
+        summary = self._summarize_candidates(metrics, stability_pairs)
+        return ClusterNumberSelectionResult(
+            config=self.config,
+            selected_k=self._select_k(summary),
+            run_metrics=metrics,
+            stability_pairs=stability_pairs,
+            k_summary=summary,
+            seed_winners=winners,
+            estimators={},
+        )
+
+    @staticmethod
     def _calculate_candidate_metrics(
         estimator: TrailsEstimator,
         data: ClinicalTimeSeriesDataset,
@@ -489,8 +543,17 @@ class ClusterNumberSelector:
             aris = stability_pairs.loc[stability_pairs["n_clusters"] == n_clusters, "ari"]
             mean_ari = float(aris.mean()) if not aris.empty else float("nan")
             min_fraction = float(candidate_runs["cluster_min_fraction"].min())
-            max_empty = int(candidate_runs["cluster_empty_count"].max())
-            passes_gate = not self.config.require_non_empty or max_empty == 0
+            empty_counts = candidate_runs["cluster_empty_count"].dropna()
+            max_empty = int(empty_counts.max()) if not empty_counts.empty else n_clusters
+            complete = (
+                set(candidate_runs["seed"]) == set(self.config.seeds)
+                and len(candidate_runs) == len(self.config.seeds)
+                and bool(np.isfinite(scores.to_numpy()).all())
+            )
+            passes_gate = complete and (not self.config.require_non_empty or max_empty == 0)
+            if self.config.compute_stability and len(self.config.seeds) > 1:
+                expected = len(self.config.seeds) * (len(self.config.seeds) - 1) // 2
+                passes_gate &= len(aris) == expected and bool(np.isfinite(aris.to_numpy()).all())
             if self.config.min_cluster_fraction is not None:
                 passes_gate &= min_fraction >= self.config.min_cluster_fraction
             if self.config.min_mean_pairwise_ari is not None:
@@ -505,6 +568,7 @@ class ClusterNumberSelector:
                     "max_empty_clusters": max_empty,
                     "mean_pairwise_ari": mean_ari,
                     "passes_gate": passes_gate,
+                    "complete": complete,
                 }
             )
         return pd.DataFrame(summary_records).sort_values("n_clusters")

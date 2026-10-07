@@ -298,6 +298,12 @@ clean reusable method library.
   repeated latent plus visit-time input.
 - Clustering uses a VaDE-style learnable Gaussian mixture latent prior,
   initialized by deterministic k-means after warmup.
+- CRC `07_search` schedules isolated train/validation trials and uses the public
+  selector `evaluate_fitted`/`summarize_completed` methods. Screening fixes K=3,
+  then validates K within each recipe; test is read only after unique model locking.
+  Optional trainer controls cover warmup objective, mixture initialization, stage
+  resets/freezing, and native LR schedulers. Defaults preserve existing training and
+  format-3 checkpoint loading; diagnostic passes preserve Torch RNG state.
 - The core network is `TrailsModel`, replacing the old patient-level survival model.
   Its joint distribution is p(c)p(z|c)p(x|z)p(T|z,c). Training reconstruction,
   mixture-prior and survival branches share one reparameterized z; evaluation and
@@ -447,12 +453,21 @@ clean reusable method library.
 - `05_run.py` uses `split.dir` to reference the 04 bundle. It reads train and optional
   `validation` first, with `trainer.valid_size=0`. Other configured evaluation sets
   are read only after the estimator is locked. With validation, automatic K selection
-  retains occupancy gates, one-standard-error selection and final seed ranking by
-  selection score, C-index, BIC, then seed. Without validation, fixed K is mandatory
-  and early stopping monitors training data. Full-cohort preprocessing/training uses
+  retains occupancy gates, the configured best-mean or one-standard-error rule,
+  and final seed ranking by selection score, C-index, BIC, then seed. Without validation,
+  fixed K is mandatory and early stopping monitors training data. Full-cohort preprocessing/training uses
   all eligible patients and reports no independent validation/test when absent.
-  Current defaults use OS/24 months, E60, auto-log1p/robust, K=2–10 across seeds
-  20260908/09/10 and no SwanLab.
+  `configs/crc_yunnan/run.yaml` fixes the CRC baseline to search recipe r089,
+  K=2–10 and seed 20260908: GRU-D plus single-layer LSTM encoder/decoder, 30 epochs
+  of reconstruction warmup, shared global diagonal mixture variance, and fixed
+  reconstruction/survival/KL weights of 1/0.05/0.1. It retains OS/24 months, E60,
+  auto-log1p/robust preprocessing and no SwanLab. K selection uses the best
+  validation C-index/BIC score with occupancy gates and no seed stability calculation;
+  root-level `n_clusters=2` or `n_clusters=5` fixes K for separate analyses.
+  `CRCRunConfig` also exposes command-level runtime settings; CRC defaults fix
+  Torch intra/inter-op and BLAS/OpenMP threads to 4 and preserve the original
+  cuDNN/TF32 settings. GPU determinism remains disabled as in the original search;
+  matching configuration alone does not promise identical results across environments.
   Model, history, available-set predictions/metrics and a short provenance manifest
   are saved without copying datasets. Patient-level artifacts stay remote.
 - `06_evaluate.py` resolves `CRCEvaluationConfig`, follows 05/04/03 manifests back to

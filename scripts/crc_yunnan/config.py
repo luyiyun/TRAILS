@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator
+from scripts.configs import FrozenSplitConfig, TrailsApplicationConfig
+
+from trails import ModelConfig, TrainerConfig
 
 BASELINE_LABELS = {
     "Preoperative_CEA": "术前CEA",
@@ -21,6 +24,25 @@ BASELINE_LABELS = {
     "Perineural_invasion": "神经侵犯",
     "Adjuvant_chemotherapy": "辅助化疗",
 }
+
+
+class CRCRunRuntimeConfig(BaseModel):
+    """命令级计算设置；None保留当前进程设置，不进入模型checkpoint。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    torch_interop_threads: int | None = Field(default=None, gt=0)
+    cudnn_benchmark: bool | None = None
+    cudnn_deterministic: bool | None = None
+    deterministic_algorithms: bool | None = None
+    cuda_matmul_allow_tf32: bool | None = None
+    cudnn_allow_tf32: bool | None = None
+
+
+class CRCRunConfig(TrailsApplicationConfig):
+    """冻结划分建模配置，补充CRC实验的线程和GPU计算设置。"""
+
+    runtime: CRCRunRuntimeConfig = Field(default_factory=CRCRunRuntimeConfig)
 
 
 class CohortPathsConfig(BaseModel):
@@ -413,3 +435,132 @@ class CRCEvaluationConfig(BaseModel):
         if logs == output or output in logs.parents:
             raise ValueError("Hydra日志目录须独立于评价输出目录")
         return self
+
+
+class CRCSearchRecipe(BaseModel):
+    """07的配方因子；组合采样后统一校验并规范化不适用选项。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    warmup: Literal[0, 10, 30, 100] = 10
+    objective: Literal["reconstruction_survival", "reconstruction"] = "reconstruction_survival"
+    initialization: Literal["legacy5", "legacy50", "kmeans", "kmeans_global", "gmm"] = "legacy5"
+    variance_floor: float = Field(default=0.0001, gt=0)
+    prior: Literal["empirical", "uniform"] = "empirical"
+    train_prior: bool = False
+    reset_head: bool = False
+    reset_optimizer: bool = False
+    weighting: Literal[
+        "uncertainty_continue", "fixed", "uncertainty_reset", "uncertainty_freeze"
+    ] = "uncertainty_continue"
+    survival_weight: float = Field(default=0.2, gt=0)
+    kl_weight: float = Field(default=0.1, gt=0)
+    learning_rate: float = Field(default=0.001, gt=0)
+    scheduler: Literal["constant", "cosine", "plateau"] = "constant"
+    architecture: Literal["transformer", "gru", "lstm", "mtan"] = "transformer"
+    width: Literal[32, 64] = 64
+    latent: Literal[8, 16, 32] = 32
+    dropout: float = Field(default=0.0, ge=0, lt=1)
+    survival_layers: Literal[0, 1, 2] = 1
+    batch: Literal[64, 128, 256] = 128
+    monitor: Literal["loss", "cindex"] = "loss"
+
+    @model_validator(mode="after")
+    def normalize_inactive(self) -> Self:
+        if self.warmup == 0:
+            object.__setattr__(self, "objective", "reconstruction_survival")
+            object.__setattr__(self, "reset_head", False)
+            object.__setattr__(self, "reset_optimizer", False)
+            if self.weighting == "uncertainty_reset":
+                object.__setattr__(self, "weighting", "uncertainty_continue")
+            elif self.weighting == "uncertainty_freeze":
+                object.__setattr__(self, "weighting", "fixed")
+        return self
+
+
+class CRCSearchOptions(BaseModel):
+    """正式默认预算固定；缩小预算仅用于隔离的合成验证和GPU试跑。"""
+
+    model_config = ConfigDict(extra="forbid")
+    sampling_seed: int = Field(ge=0)
+    n_recipes: int = Field(ge=1, le=96)
+    screen_k: int = Field(ge=2)
+    screen_seeds: list[int] = Field(min_length=2, max_length=2)
+    validation_seeds: list[int] = Field(min_length=3, max_length=3)
+    candidates: list[Annotated[int, Field(ge=2)]] = Field(min_length=1)
+    top_n: int = Field(ge=1, le=3)
+    min_cluster_fraction: float = Field(ge=0.05, le=1)
+    recipe_ids: list[str]
+    train_count: int = Field(gt=0)
+    validation_count: int = Field(gt=0)
+    n_features: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_grid(self) -> Self:
+        if any(
+            len(values) != len(set(values))
+            for values in (
+                self.screen_seeds,
+                self.validation_seeds,
+                self.candidates,
+                self.recipe_ids,
+            )
+        ):
+            raise ValueError("搜索网格不允许重复")
+        if not set(self.screen_seeds).issubset(self.validation_seeds):
+            raise ValueError("初筛seed必须包含在验证seed中")
+        if self.screen_k not in self.candidates:
+            raise ValueError("初筛K必须包含在验证网格中")
+        return self
+
+
+class CRCSearchShard(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    index: int = Field(ge=0)
+    count: int = Field(ge=1, le=2)
+    workers: int = Field(ge=1, le=2)
+    threads: int = Field(ge=1, le=4)
+
+    @model_validator(mode="after")
+    def validate_index(self) -> Self:
+        if self.index >= self.count:
+            raise ValueError("shard.index必须小于shard.count")
+        return self
+
+
+class CRCSearchInputs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    summaries: list[Path]
+    assignment: Path | None
+    selection: Path | None
+    checkpoint: Path | None
+
+
+class CRCSearchPaths(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    dir: Path
+    screen_dir: Path
+
+
+class CRCSearchJob(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    recipe_id: str
+    n_clusters: int = Field(ge=2)
+    seed: int = Field(ge=0)
+
+
+class CRCSearchConfig(BaseModel):
+    """07只负责调度和汇总；训练参数仍使用核心配置模型。"""
+
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["plan", "screen", "validate", "merge", "finalize", "worker"]
+    merge_stage: Literal["screen", "validate"]
+    resume: bool
+    split: FrozenSplitConfig
+    model: ModelConfig
+    trainer: TrainerConfig
+    search: CRCSearchOptions
+    shard: CRCSearchShard
+    inputs: CRCSearchInputs
+    paths: CRCSearchPaths
+    job: CRCSearchJob
+    survival: EvaluationSurvivalConfig
