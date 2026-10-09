@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import hydra
 import pandas as pd
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from scripts.crc_yunnan.config import CRCRunConfig
 from threadpoolctl import threadpool_limits
 
@@ -20,7 +21,6 @@ from trails import (
     resolve_batch_size,
 )
 from trails.artifacts import save_history_csv, save_json
-from trails.metrics import cluster_assignment_diagnostics, concordance_index
 from trails.survival import SURVIVAL_FORMAT_VERSION
 from trails_simulate.config import resolved_payload
 
@@ -28,29 +28,25 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _save_split_outputs(
-    run_dir: Path,
-    split_name: str,
-    dataset: ClinicalTimeSeriesDataset,
-    estimator: TrailsEstimator,
-) -> dict[str, float | int]:
-    """一次推理保存完整预测与简明患者表，并返回同口径的基础指标。"""
+    run_dir: Path, name: str, dataset: ClinicalTimeSeriesDataset, estimator: TrailsEstimator
+) -> dict[str, Any]:
+    """保存既有患者预测，复用公开方法报告生存、潜空间与占簇指标。"""
     prediction = estimator.predict(dataset)
-    labels = prediction.predict()
     trainer = estimator.config.trainer
+    labels = prediction.predict()
     risk = prediction.risk_score(trainer.risk_horizon, method=trainer.cindex_risk_score)
-    median_time = prediction.median_survival_time()
-    survival_time = torch.stack([sample.survival_time for sample in dataset.samples])
-    event = torch.stack([sample.event for sample in dataset.samples])
-    split_dir = run_dir / split_name
+    times = torch.stack([sample.survival_time for sample in dataset.samples])
+    events = torch.stack([sample.event for sample in dataset.samples])
+    split_dir = run_dir / name
     prediction.save(split_dir / "model_prediction.pt")
     frame = pd.DataFrame(
         {
             "patient_id": dataset.metadata["patient_ids"],
             "pred_cluster": labels.numpy(),
-            "predicted_median_time_days": median_time.numpy(),
+            "predicted_median_time_days": prediction.median_survival_time().numpy(),
             "risk_score": risk.numpy(),
-            "survival_time": survival_time.numpy(),
-            "event": event.numpy(),
+            "survival_time": times.numpy(),
+            "event": events.numpy(),
         }
     )
     probabilities = pd.DataFrame(
@@ -60,154 +56,180 @@ def _save_split_outputs(
         ],
     )
     pd.concat([frame, probabilities], axis=1).to_csv(split_dir / "patient_outputs.csv", index=False)
+    metrics = ClusterNumberSelector.evaluate_fitted(estimator, dataset)
+    if not bool(events.any()):
+        metrics["cindex"] = float("nan")
+    fractions = torch.bincount(labels, minlength=estimator.config.model.n_clusters) / len(dataset)
     return {
         "n_patients": len(dataset),
-        "n_events": int(event.sum().item()),
-        "cindex": float(concordance_index(risk, survival_time, event)),
-        **cluster_assignment_diagnostics(labels, n_clusters=estimator.config.model.n_clusters),
+        "n_events": int(events.sum()),
+        "metric_reason": "无事件，C-index不可计算" if not bool(events.any()) else "",
+        **metrics,
+        **{f"cluster_{k}_fraction": float(value) for k, value in enumerate(fractions)},
     }
 
 
-def run(config: CRCRunConfig) -> dict[str, object]:
-    # ==================================================================================
-    # 一、定位04产物和新输出目录，只读取 train 及可选的 validation。
-    # ==================================================================================
-    split_dir = config.split.dir.resolve()
-    run_dir = config.paths.dir.resolve()
-    selection_dir = (run_dir / config.k_selection.result_dir).resolve()
-    manifest_path = run_dir / config.outputs.summary
-    split_manifest = json.loads((split_dir / "preproc_manifest.json").read_text(encoding="utf-8"))
-    split_names = split_manifest["datasets"]
-    reserved = {"model.pt", "training_history.csv", "metrics.csv", str(config.outputs.summary)}
-    if config.n_clusters is None:
-        reserved.add(str(config.k_selection.result_dir))
-    if reserved.intersection(split_names):
-        raise ValueError("数据集名称不能与模型、指标或K选择产物冲突")
-    has_validation = "validation" in split_names
-    if not has_validation and config.n_clusters is None:
-        raise ValueError("无独立validation时必须指定固定n_clusters，不执行自动K选择")
+def run(config: CRCRunConfig) -> dict[str, Any]:
+    ##################################################
+    # 一、沿用冻结04产物，只读取训练及可选验证集。
+    ##################################################
+    split_dir, root = config.split.dir.resolve(), config.paths.dir.resolve()
+    manifest = json.loads((split_dir / "preproc_manifest.json").read_text())
+    names = manifest["datasets"]
+    if root == split_dir or split_dir in root.parents or root in split_dir.parents:
+        raise ValueError("建模输出不得写入冻结04目录")
+    reserved = {"model.pt", "training_history.csv", "metrics.csv", "resolved_config.yaml"}
+    if reserved.intersection(names):
+        raise ValueError("数据集名称不能与候选模型产物冲突")
     if config.swanlab.enabled:
-        raise ValueError("CRC建模仅保存训练历史和日志，请设置swanlab.enabled=false")
-    if run_dir == split_dir or split_dir in run_dir.parents:
-        raise ValueError("建模输出不得写入冻结split目录")
+        raise ValueError("CRC建模请设置swanlab.enabled=false")
     targets = [
-        run_dir / "model.pt",
-        run_dir / "training_history.csv",
-        run_dir / "metrics.csv",
-        manifest_path,
-        *(run_dir / name for name in split_names),
+        root / name
+        for name in (
+            "models",
+            "run_manifest.json",
+            "run_metrics.csv",
+            "k_summary.csv",
+            "resolved_config.yaml",
+        )
     ]
-    if config.n_clusters is None:
-        targets.append(selection_dir)
     if existing := [str(path) for path in targets if path.exists()]:
         raise FileExistsError(f"拒绝覆盖已有建模产物：{existing}")
-    run_dir.mkdir(parents=True, exist_ok=True)
     datasets = {
         name: ClinicalTimeSeriesDataset.load(split_dir / name / "dataset.pt")
         for name in ("train", "validation")
-        if name in split_names
+        if name in names
     }
     train, validation = datasets["train"], datasets.get("validation")
-    LOGGER.info(
-        "预处理数据 %s：train=%d，validation=%s",
-        split_dir,
-        len(train),
-        len(validation) if validation is not None else "无",
-    )
+    clusters = config.n_clusters if isinstance(config.n_clusters, list) else [config.n_clusters]
+    root.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(config.model_dump(mode="json"), root / "resolved_config.yaml")
 
-    # ==================================================================================
-    # 二、复用训练预设；显式传入冻结验证集，不再内部切分。
-    # ==================================================================================
-    initial_k = config.n_clusters or config.k_selection.candidate_clusters[0]
-    trails_config = TrailsConfig(
-        data=DataConfig(n_features=train.n_features),
-        model=config.model.model_copy(update={"n_clusters": initial_k}),
-        trainer=config.trainer.model_copy(
-            update={
-                "batch_size": resolve_batch_size(len(train), config.trainer.batch_size),
-                "valid_size": 0.0,
-            }
-        ),
-        seed=config.trainer.seed,
-    )
+    ##################################################
+    # 二、串行训练全部seed/K；不排序、不选择、不使用test早停。
+    ##################################################
+    models: list[dict[str, Any]] = []
+    for seed in config.seeds:
+        for k in clusters:
+            LOGGER.info(
+                "候选 %d/%d：seed=%d，K=%d",
+                len(models) + 1,
+                len(config.seeds) * len(clusters),
+                seed,
+                k,
+            )
+            model_config = TrailsConfig(
+                data=DataConfig(n_features=train.n_features),
+                model=config.model.model_copy(update={"n_clusters": k}),
+                trainer=config.trainer.model_copy(
+                    update={
+                        "seed": seed,
+                        "valid_size": 0.0,
+                        "batch_size": resolve_batch_size(len(train), config.trainer.batch_size),
+                    }
+                ),
+                seed=seed,
+            )
+            estimator = TrailsEstimator(model_config).fit(train, validation_data=validation)
+            directory = Path("models") / f"seed-{seed}" / f"k{k}"
+            estimator.save(root / directory / "model.pt")
+            save_history_csv(root / directory / "training_history.csv", estimator.history)
+            OmegaConf.save(
+                model_config.model_dump(mode="json"), root / directory / "resolved_config.yaml"
+            )
+            models.append(
+                {
+                    "n_clusters": k,
+                    "seed": seed,
+                    "model": str(directory / "model.pt"),
+                    "prediction_dir": str(directory),
+                    "training_history": str(directory / "training_history.csv"),
+                    "metrics": str(directory / "metrics.csv"),
+                }
+            )
+            del estimator
 
-    # ==================================================================================
-    # 三、只在 train/validation 上选择 K，再在入选 K 内确定最终 seed。
-    # ==================================================================================
-    if config.n_clusters is None:
-        selection = config.k_selection
-        selector = ClusterNumberSelector(
-            selection.candidate_clusters,
-            seeds=selection.seeds,
-            selection_rule=selection.selection_rule,
-            require_non_empty=selection.require_non_empty,
-            min_cluster_fraction=selection.min_cluster_fraction,
-            min_mean_pairwise_ari=selection.min_mean_pairwise_ari,
-            compute_stability=selection.compute_stability,
-            estimator_config=trails_config,
-        )
-        result = selector.select(train, validation_data=validation)
-        result.save(selection_dir)
-        if result.selected_k is None:
-            raise RuntimeError("没有候选K通过配置门槛；选择结果已保存，test尚未读取")
-        candidates = result.run_metrics.loc[result.run_metrics["n_clusters"] == result.selected_k]
-        best = candidates.sort_values(
-            ["selection_score", "cindex", "latent_mixture_bic", "seed"],
-            ascending=[False, False, True, True],
-        ).iloc[0]
-        selected_seed = int(best["seed"])
-        estimator = result.selected_estimators[selected_seed]
-    else:
-        selected_seed = config.trainer.seed
-        estimator = TrailsEstimator(trails_config).fit(train, validation_data=validation)
-
-    # ==================================================================================
-    # 四、锁定并保存模型后读取其余评价集；仅输出实际配置的数据集。
-    # ==================================================================================
-    selected_k = estimator.config.model.n_clusters
-    LOGGER.info("模型已锁定：K=%d，seed=%d；开始预测 %s", selected_k, selected_seed, split_names)
-    estimator.save(run_dir / "model.pt")
-    save_history_csv(run_dir / "training_history.csv", estimator.history)
-    for name in split_names:
+    ##################################################
+    # 三、所有模型冻结后读取其余集，报告各集指标和占簇诊断。
+    ##################################################
+    for name in names:
         if name not in datasets:
             datasets[name] = ClinicalTimeSeriesDataset.load(split_dir / name / "dataset.pt")
-    metrics = pd.DataFrame(
-        [
-            {"split": name, **_save_split_outputs(run_dir, name, datasets[name], estimator)}
-            for name in split_names
-        ]
+    runs: list[pd.DataFrame] = []
+    for record in models:
+        estimator = TrailsEstimator.load(root / record["model"], device=config.trainer.device)
+        rows = []
+        for name in names:
+            metrics = _save_split_outputs(
+                root / record["prediction_dir"], name, datasets[name], estimator
+            )
+            reasons = []
+            if metrics["cluster_empty_count"]:
+                reasons.append("存在空簇")
+            if metrics["cluster_min_fraction"] < config.min_cluster_fraction:
+                reasons.append(f"最小簇占比低于{config.min_cluster_fraction:.0%}")
+            rows.append(
+                {
+                    "seed": record["seed"],
+                    "n_clusters": record["n_clusters"],
+                    "dataset": name,
+                    **metrics,
+                    "passes_occupancy": not reasons,
+                    "occupancy_reason": "; ".join(reasons),
+                }
+            )
+        table = pd.DataFrame(rows)
+        table.to_csv(root / record["metrics"], index=False)
+        runs.append(table)
+        del estimator
+    metrics = pd.concat(runs, ignore_index=True)
+    metrics.to_csv(root / "run_metrics.csv", index=False)
+    numeric = [
+        column
+        for column in metrics.select_dtypes(include="number")
+        if column not in {"seed", "n_clusters"}
+    ]
+    grouped = metrics.groupby(["n_clusters", "dataset"], sort=True)
+    summaries = grouped[numeric].agg(["mean", "std"])
+    summaries.columns = [f"{column}_{statistic}" for column, statistic in summaries.columns]
+    summaries = summaries.join(
+        grouped.agg(
+            n_seeds=("seed", "nunique"),
+            all_seeds_pass_occupancy=("passes_occupancy", "all"),
+            minimum_cluster_fraction=("cluster_min_fraction", "min"),
+            maximum_empty_clusters=("cluster_empty_count", "max"),
+        )
     )
-    metrics.to_csv(run_dir / "metrics.csv", index=False)
+    summaries.reset_index().to_csv(root / "k_summary.csv", index=False)
 
-    # ==================================================================================
-    # 五、最后保存简短运行引用；原数据、模型与患者结果均保留在远端。
-    # ==================================================================================
-    manifest: dict[str, object] = {
-        "schema_version": 2,
+    ##################################################
+    # 四、沿用运行清单引用全部模型，患者产物留在远端。
+    ##################################################
+    result = {
+        "schema_version": 3,
         "split_dir": str(split_dir),
         "preproc_manifest": str(split_dir / "preproc_manifest.json"),
-        "training_scope": split_manifest["training_scope"],
-        "datasets": split_names,
-        "has_independent_validation": has_validation,
-        "evaluation_datasets": [
-            name for name in split_names if name not in {"train", "validation"}
-        ],
-        "outcome": split_manifest["outcome"],
-        "landmark_days": split_manifest["landmark_days"],
-        "panel": split_manifest["panel"],
-        "selected_k": selected_k,
-        "selected_seed": selected_seed,
-        "cindex_risk_score": estimator.config.trainer.cindex_risk_score,
-        "survival_loss": estimator.config.model.survival_loss,
+        "training_scope": manifest["training_scope"],
+        "datasets": names,
+        "has_independent_validation": validation is not None,
+        "evaluation_datasets": [name for name in names if name not in {"train", "validation"}],
+        "outcome": manifest["outcome"],
+        "landmark_days": manifest["landmark_days"],
+        "panel": manifest["panel"],
+        "models": models,
+        "metrics": "run_metrics.csv",
+        "k_summary": "k_summary.csv",
+        "min_cluster_fraction": config.min_cluster_fraction,
+        "cindex_risk_score": config.trainer.cindex_risk_score,
+        "survival_loss": config.model.survival_loss,
         "survival_format_version": SURVIVAL_FORMAT_VERSION,
-        "model": "model.pt",
-        "training_history": "training_history.csv",
-        "metrics": "metrics.csv",
-        "k_selection_dir": str(selection_dir) if config.n_clusters is None else None,
+        "interpretation": (
+            "候选报告实际可用集指标；人工参考test指标选择K时属于探索评价，test不参与训练或早停。"
+        ),
     }
-    save_json(manifest_path, manifest)
-    LOGGER.info("CRC TRAILS建模完成：%s", run_dir)
-    return manifest
+    save_json(root / "run_manifest.json", result)
+    LOGGER.info("CRC候选训练及指标汇总完成，未自动选择模型：%s", root)
+    return result
 
 
 @hydra.main(config_path="../../configs", config_name="crc_yunnan/run", version_base="1.3")

@@ -11,18 +11,10 @@ split:
   dir: data/derived/crc_yunnan/preproc/v2/os/landmark-24m/E60/auto-log1p-robust/${split.strategy}/seed-${split.seed}
 
 # 使用OS、24个月landmark、E60、auto-log1p、robust预处理方案。
-# null启用下面的K选择；整数使用trainer.seed训练固定K。
-n_clusters: null
-k_selection:
-  enabled: true
-  candidate_clusters: [2, 3, 4, 5, 6, 7, 8, 9, 10]
-  seeds: [20260908]
-  selection_rule: best_mean
-  require_non_empty: true
-  min_cluster_fraction: 0.05
-  compute_stability: false
-  min_mean_pairwise_ari: null
-  result_dir: k_selection
+# 每个seed/K独立训练并报告三集指标，由06/07显式指定要展示的K。
+n_clusters: [2, 3, 4, 5, 6, 7, 8, 9, 10]
+seeds: [20260908]
+min_cluster_fraction: 0.05
 
 model:
   survival_loss: weibull
@@ -107,8 +99,6 @@ artifacts:
   names: [history]
 swanlab:
   enabled: false
-outputs:
-  summary: run_manifest.json
 paths:
   dir: outputs/crc_yunnan/modeling/run-${now:%Y%m%d-%H%M%S-%f}
 

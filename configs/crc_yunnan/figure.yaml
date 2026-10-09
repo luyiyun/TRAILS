@@ -1,0 +1,61 @@
+# @package _global_
+inputs:
+  run_dir: ???
+# 明确指定K或K列表；多seed时须指定model_seed。
+n_clusters: ???
+model_seed: null
+datasets: [train, validation, test]
+umap:
+  n_neighbors: 15
+  min_dist: 0.1
+  metric: euclidean
+  seed: 20260908
+survival:
+  months: [12, 36, 60]
+  curve_step_months: 1
+  calibration_bins: 5
+trajectory_bin_days: 90
+seed: 20260908
+device: cuda:0
+plot:
+  dpi: 600
+  font_families: ["DejaVu Sans", "Arial", "Liberation Sans"]
+figure:
+  profile_dataset: train
+  display_datasets: [validation, test]
+  cox_dataset: test
+  phase_days: [0, 90, 360, 720]
+  display_months: 60
+  risk_months: [0, 12, 36, 60]
+  min_observed: 10
+  width_mm: 180
+  height_mm: 215
+  atlas:
+    - {feature: CEA, label: CEA}
+    - {feature: CA199, label: CA19-9}
+    - {feature: CA242, label: CA242}
+    - {feature: 血红蛋白, label: Hb}
+    - {feature: 红细胞平均体积, label: MCV}
+    - {feature: 平均血红蛋白量, label: MCH}
+    - {feature: 血清白蛋白, label: Albumin}
+    - {feature: 前白蛋白, label: Prealbumin}
+    - {feature: 中性粒细胞绝对值, label: Neutrophils}
+    - {feature: 淋巴细胞绝对值, label: Lymphocytes}
+    - {feature: 碱性磷酸酶, label: ALP}
+    - {feature: r谷氨酰转移酶, label: GGT}
+    - {feature: PT_INR, label: INR}
+  trajectories:
+    - {feature: CEA, label: CEA, unit: ng/mL, scale: log}
+    - {feature: 血红蛋白, label: Hb, unit: g/L}
+    - {feature: 红细胞平均体积, label: MCV, unit: fL}
+    - {feature: 血清白蛋白, label: Albumin, unit: g/L}
+    - {feature: 前白蛋白, label: Prealbumin, unit: mg/L}
+    - {feature: 中性粒细胞绝对值, label: Neutrophils, unit: 10^9/L}
+paths:
+  dir: ${inputs.run_dir}/../figure
+  run_dir: ${inputs.run_dir}/../logs/06_figure
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.run_dir}

@@ -186,6 +186,23 @@ def run(config: CRCCohortConfig) -> None:
     )
     value = columns.value
     observations[value] = pd.to_numeric(observations[value], errors="coerce")
+    feature = columns.feature
+    bounds = processing.observation_value_bounds
+    if missing := set(bounds) - set(observations[feature].dropna()):
+        raise ValueError(f"检测值范围配置包含源表没有的指标：{sorted(missing)}")
+    lower_bounds = {name: bound.min for name, bound in bounds.items()}
+    upper_bounds = {name: bound.max for name, bound in bounds.items()}
+    lower = observations[feature].map(lower_bounds)  # type: ignore[reportArgumentType]
+    upper = observations[feature].map(upper_bounds)  # type: ignore[reportArgumentType]
+    # 仅剔除有限数值中超界的原始记录，先于同日聚合；不推测错误单位或小数点。
+    observations["_outside_value_bounds"] = np.isfinite(observations[value]) & (
+        observations[value].lt(lower) | observations[value].gt(upper)
+    )
+    raw_removed = (
+        observations.loc[observations["_outside_value_bounds"], feature]
+        .value_counts()
+        .reindex(list(bounds), fill_value=0)
+    )
 
     observations = observations.merge(
         patients.loc[included, [source_id, "patient_id", surgery_date]],
@@ -196,7 +213,6 @@ def run(config: CRCCohortConfig) -> None:
     observations["time_days"] = (
         observations[measurement_date] - observations[surgery_date]
     ).dt.days
-    feature = columns.feature
     feature_group = columns.feature_group
     valid_observation = (
         observations[measurement_date].notna()
@@ -204,7 +220,26 @@ def run(config: CRCCohortConfig) -> None:
         & np.isfinite(observations[value])
         & observations["time_days"].notna()
     )
-    observations = observations.loc[valid_observation]
+    if bounds:
+        eligible_removed = (
+            observations.loc[valid_observation & observations["_outside_value_bounds"], feature]
+            .value_counts()
+            .reindex(list(bounds), fill_value=0)
+        )
+        summary["检测值范围筛选"] = {
+            "原始记录剔除数": int(raw_removed.sum()),
+            "有效队列观测剔除数": int(eligible_removed.sum()),
+            "分指标": {
+                name: {
+                    "原始记录剔除数": int(raw_removed.loc[name]),
+                    "有效队列观测剔除数": int(eligible_removed.loc[name]),
+                }
+                for name in bounds
+            },
+        }
+    observations = observations.loc[
+        valid_observation & ~observations["_outside_value_bounds"]
+    ].drop(columns="_outside_value_bounds")
 
     same_day_keys = ["patient_id", feature, "time_days"]
     prepared_observations: pd.DataFrame = (

@@ -2,21 +2,423 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
+import umap
 from lifelines import CoxPHFitter, KaplanMeierFitter
 from lifelines.statistics import multivariate_logrank_test
 from scipy import stats
+from scipy.special import xlogy
 
-from trails import TrailsPrediction
+from trails import ClinicalTimeSeriesDataset, TrailsEstimator, TrailsPrediction
+from trails.artifacts import flatten_history
 from trails.metrics import SurvivalMetrics, concordance_index
 
-from .config import BASELINE_LABELS, CRCEvaluationConfig
+from .config import BASELINE_LABELS, CRCPostprocessConfig, CRCSupplementaryConfig
 
 SPLIT_LABELS = {"train": "训练集", "validation": "验证集", "test": "测试集"}
+
+
+@dataclass(frozen=True)
+class EvaluationModel:
+    """已明确请求的单个模型；路径来自05清单，不另存患者中间产物。"""
+
+    n_clusters: int
+    seed: int
+    checkpoint: Path
+    predictions: Path | None
+    output: Path
+
+
+def available_models(source: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """统一新版全部候选和历史入选/候选模型的路径。"""
+    if manifest["schema_version"] == 3:
+        return [
+            {
+                **row,
+                "checkpoint": source / row["model"],
+                "predictions": source / row["prediction_dir"],
+            }
+            for row in manifest["models"]
+        ]
+    if manifest["schema_version"] != 2:
+        raise ValueError(f"不支持05清单版本：{manifest['schema_version']}")
+    models = [
+        {
+            "n_clusters": manifest["selected_k"],
+            "seed": manifest["selected_seed"],
+            "checkpoint": source / manifest["model"],
+            "predictions": source,
+        }
+    ]
+    if manifest["k_selection_dir"] is not None:
+        directory = Path(manifest["k_selection_dir"])
+        if not directory.is_absolute():
+            directory = directory.resolve()
+        table = pd.read_csv(directory / "run_metrics.csv")
+        for seed, k in table[["seed", "n_clusters"]].itertuples(index=False, name=None):
+            if (seed, k) != (manifest["selected_seed"], manifest["selected_k"]):
+                models.append(
+                    {
+                        "n_clusters": int(k),
+                        "seed": int(seed),
+                        "checkpoint": directory / f"seed-{seed}/k{k}/model.pt",
+                        "predictions": None,
+                    }
+                )
+    return models
+
+
+def evaluation_requests(
+    config: CRCPostprocessConfig,
+) -> tuple[dict[str, Any], list[EvaluationModel]]:
+    """全部请求预检通过后才能创建输出，绝不自动选择K或多seed代表模型。"""
+    source = config.inputs.run_dir.resolve()
+    manifest = json.loads((source / "run_manifest.json").read_text())
+    if missing := set(config.datasets) - set(manifest["datasets"]):
+        raise ValueError(f"05不存在请求的数据集：{sorted(missing)}")
+    models = available_models(source, manifest)
+    requested = config.n_clusters if isinstance(config.n_clusters, list) else [config.n_clusters]
+    seeds = {row["seed"] for row in models}
+    seed = config.model_seed
+    if seed is None:
+        if len(seeds) != 1:
+            raise ValueError(f"存在多个模型seed，请显式指定model_seed：{sorted(seeds)}")
+        seed = seeds.pop()
+    requests = []
+    for k in requested:
+        matched = [row for row in models if row["n_clusters"] == k and row["seed"] == seed]
+        if not matched:
+            raise ValueError(f"05没有保存请求的K={k}、seed={seed}")
+        row = matched[0]
+        if not row["checkpoint"].is_file():
+            raise FileNotFoundError(row["checkpoint"])
+        output = config.paths.dir.resolve() / f"k{k}"
+        if output.exists():
+            raise FileExistsError(f"拒绝覆盖既有结果：{output}")
+        data_root = Path(manifest["split_dir"])
+        if output == data_root or data_root in output.parents or output in data_root.parents:
+            raise ValueError("评价输出须独立于04预处理目录")
+        requests.append(EvaluationModel(k, seed, row["checkpoint"], row["predictions"], output))
+    return manifest, requests
+
+
+@dataclass
+class EvaluationData:
+    data_root: Path
+    metadata: pd.DataFrame
+    parameters: pd.DataFrame
+    predictions: dict[str, TrailsPrediction]
+    frames: dict[str, pd.DataFrame]
+    history: pd.DataFrame
+    reference: int
+    risk_method: str
+
+
+def load_evaluation_data(
+    config: CRCPostprocessConfig, manifest: dict[str, Any], model: EvaluationModel
+) -> EvaluationData:
+    """共用冻结数据追溯、预测读取和训练风险参考簇，不重新拟合模型。"""
+    root = Path(manifest["split_dir"])
+    preproc = json.loads((root / "preproc_manifest.json").read_text())
+    split = json.loads(
+        (Path(preproc["source_datasets"]["train"]) / "dataset_manifest.json").read_text()
+    )
+    metadata = pd.read_csv(Path(split["cohort_root"]) / "feature_metadata.csv")
+    parameters = pd.read_csv(root / "preprocessing_parameters.csv")
+    estimator, predictions = load_evaluation_predictions(
+        model.checkpoint,
+        root,
+        config.datasets,
+        model.n_clusters,
+        model.seed,
+        config.device,
+        saved_predictions=model.predictions,
+    )
+    trainer = estimator.config.trainer
+    frames = {}
+    for name, prediction in predictions.items():
+        frame = pd.read_csv(root / name / "patients.csv", dtype={"patient_id": "string"})
+        probabilities = prediction.predict_proba().numpy()
+        frame["pred_cluster"] = prediction.predict().numpy()
+        frame["risk_score"] = prediction.risk_score(
+            trainer.risk_horizon, method=trainer.cindex_risk_score
+        ).numpy()
+        frame["confidence"] = probabilities.max(axis=1)
+        frame["entropy"] = -xlogy(probabilities, probabilities).sum(axis=1) / np.log(
+            model.n_clusters
+        )
+        frames[name] = frame
+    risks = frames["train"].groupby("pred_cluster")["risk_score"].mean()
+    reference = int(risks.idxmin())
+    return EvaluationData(
+        root,
+        metadata,
+        parameters,
+        predictions,
+        frames,
+        pd.DataFrame(flatten_history(estimator.history)),
+        reference,
+        trainer.cindex_risk_score,
+    )
+
+
+def latent_projection(
+    data: EvaluationData, config: CRCPostprocessConfig
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """仅拟合训练latent mean；患者坐标只保留在当前进程。"""
+    if len(data.frames["train"]) <= config.umap.n_neighbors:
+        return {}, {"不可计算原因": "训练人数须大于配置的邻居数，不自动改变UMAP参数"}
+    reducer = umap.UMAP(
+        n_components=2,
+        **config.umap.model_dump(exclude={"seed"}),
+        random_state=config.umap.seed,
+        transform_seed=config.umap.seed,
+        n_jobs=1,
+    )
+    reducer.fit(data.predictions["train"].latent_representation.numpy())
+    projections = {
+        name: np.asarray(
+            reducer.embedding_
+            if name == "train"
+            else reducer.transform(data.predictions[name].latent_representation.numpy())
+        )
+        for name in config.datasets
+    }
+    return projections, {
+        "拟合数据集": "训练集",
+        "参数": config.umap.model_dump(),
+        "不可计算原因": "",
+    }
+
+
+def evaluation_summary(
+    config: CRCPostprocessConfig,
+    manifest: dict[str, Any],
+    model: EvaluationModel,
+    data: EvaluationData,
+) -> dict[str, Any]:
+    return {
+        "来源": {
+            "建模目录": str(config.inputs.run_dir.resolve()),
+            "预处理目录": str(data.data_root),
+            "模型": str(model.checkpoint),
+            "评价目录": str(model.output),
+        },
+        "结局": manifest["outcome"].upper(),
+        "landmark天数": manifest["landmark_days"],
+        "面板": manifest["panel"],
+        "评价K": model.n_clusters,
+        "模型seed": model.seed,
+        "统计口径": {
+            "生存时间": "从landmark起算，每月30天",
+            "轨迹时间": "从手术起算",
+            "Cox参考簇": data.reference,
+            "参考规则": "训练集平均预测风险最低的簇",
+            "C-index风险定义": data.risk_method,
+            "训练范围": manifest["training_scope"],
+            "解释边界": [
+                "人工指定K，不重新训练或自动选择模型",
+                "候选可报告test指标；人工参考这些指标选择K属于探索评价",
+                "历史已查看的test不构成新的独立验证",
+                "UMAP分离不证明有效性，单seed不证明稳定性",
+            ],
+        },
+        "数据集": {},
+    }
+
+
+def write_summary(path: Path, summary: dict[str, Any]) -> None:
+    """保留小P值精度，并将不可计算数值写成标准JSON null。"""
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: clean(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clean(item) for item in value]
+        if isinstance(value, np.generic):
+            return clean(value.item())
+        if isinstance(value, float) and not np.isfinite(value):
+            return None
+        return value
+
+    path.write_text(
+        json.dumps(clean(summary), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
+    )
+
+
+def observation_summaries(
+    observations: pd.DataFrame,
+    patients: pd.DataFrame,
+    parameters: pd.DataFrame,
+    metadata: pd.DataFrame,
+    n_clusters: int,
+    phase_days: list[float],
+    bin_days: int,
+) -> dict[str, pd.DataFrame]:
+    """阶段中位数先按患者计算；覆盖率及采样间隔保留明确分母。"""
+    features = parameters["feature"].tolist()
+    params = parameters.set_index("feature")
+    groups = metadata.set_index("feature")["feature_group"].to_dict()
+    counts = patients["pred_cluster"].value_counts().reindex(range(n_clusters), fill_value=0)
+    visits = observations.groupby("patient_id")["time_days"].nunique()
+    measurements = (
+        observations[features].notna().sum(axis=1).groupby(observations["patient_id"]).sum()
+    )
+    gaps = (
+        observations.sort_values(["patient_id", "time_days"])
+        .groupby("patient_id")["time_days"]
+        .diff()
+    )
+    patient_density = pd.DataFrame(
+        {
+            "visits": visits,
+            "measurements": measurements,
+            "median_gap_days": gaps.groupby(observations["patient_id"]).median(),
+        }
+    ).join(patients.set_index("patient_id")["pred_cluster"])
+    density = []
+    for cluster in [-1, *range(n_clusters)]:
+        subset = (
+            patient_density
+            if cluster == -1
+            else patient_density.loc[patient_density["pred_cluster"].eq(cluster)]
+        )
+        record: dict[str, Any] = {"cluster": cluster, "n": len(subset)}
+        for column in ["visits", "measurements", "median_gap_days"]:
+            for suffix, value in zip(
+                ["q25", "median", "q75"],
+                subset[column].quantile([0.25, 0.5, 0.75]).to_numpy(),
+                strict=True,
+            ):
+                record[f"{column}_{suffix}"] = value
+        density.append(record)
+    long = observations.melt(
+        id_vars=["patient_id", "time_days"],
+        value_vars=features,
+        var_name="feature",
+        value_name="scaled_value",
+    ).dropna(subset=["scaled_value"])
+    long = long.merge(patients[["patient_id", "pred_cluster"]], on="patient_id")
+    n_phases = len(phase_days) - 1
+    long["phase"] = np.minimum(
+        np.searchsorted(phase_days, long["time_days"], side="right") - 1, n_phases - 1
+    )
+    n_bins = int(np.ceil(phase_days[-1] / bin_days))
+    long["bin"] = np.minimum((long["time_days"] // bin_days).astype(int), n_bins - 1)
+    original = long["scaled_value"] * long["feature"].map(params["scale"].to_dict().get) + long[
+        "feature"
+    ].map(params["center"].to_dict().get)
+    logged = long["feature"].map(params["transform"].to_dict().get).eq("log1p")
+    original.loc[logged] = np.expm1(original.loc[logged])
+    long["original_value"] = original
+    per_patient = long.groupby(["patient_id", "pred_cluster", "phase", "feature"], observed=True)[
+        ["scaled_value", "original_value"]
+    ].median()
+    grouped = per_patient.groupby(["pred_cluster", "phase", "feature"], observed=True)
+    profiles = grouped.agg(
+        n=("scaled_value", "size"),
+        scaled_median=("scaled_value", "median"),
+        original_median=("original_value", "median"),
+    )
+    for value, prefix in [("scaled_value", "scaled"), ("original_value", "original")]:
+        quartiles = grouped[value].quantile(np.array([0.25, 0.75])).unstack()
+        quartiles.columns = [f"{prefix}_q25", f"{prefix}_q75"]
+        profiles = profiles.join(quartiles)
+    index = pd.MultiIndex.from_product(
+        [range(n_clusters), range(n_phases), features], names=["pred_cluster", "phase", "feature"]
+    )
+    profiles = profiles.reindex(index).reset_index().rename(columns={"pred_cluster": "cluster"})
+    profiles["n"] = profiles["n"].fillna(0).astype(int)
+    profiles["cluster_n"] = profiles["cluster"].map(counts.to_dict().get)
+    profiles["coverage_fraction"] = profiles["n"] / profiles["cluster_n"].replace(0, np.nan)
+    profiles["feature_group"] = profiles["feature"].map(groups.get)
+    observed_counts: pd.Series = long.groupby(["bin", "feature"])["patient_id"].nunique()  # type: ignore[reportAssignmentType]
+    coverage = (
+        observed_counts.reindex(
+            pd.MultiIndex.from_product([range(n_bins), features], names=["bin", "feature"]),
+            fill_value=0,
+        )
+        .rename("n_observed")
+        .reset_index()
+    )
+    coverage["n_population"] = len(patients)
+    coverage["coverage_fraction"] = coverage["n_observed"] / len(patients)
+    coverage["feature_group"] = coverage["feature"].map(groups.get)
+    domains: pd.DataFrame = coverage.groupby(
+        ["bin", "feature_group"], as_index=False, observed=True
+    ).agg(  # type: ignore[reportAssignmentType]
+        mean_feature_coverage=("coverage_fraction", "mean"), n_features=("feature", "size")
+    )
+    return {
+        "Atlas": profiles,
+        "Density": pd.DataFrame(density),
+        "Feature_coverage": coverage,
+        "Domain_coverage": domains,
+    }
+
+
+def km_source_data(
+    patients: pd.DataFrame,
+    models: dict[int, KaplanMeierFitter],
+    n_clusters: int,
+    months: list[float],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """完整KM及其95%CI，不因绘图显示上限而截断统计随访。"""
+    curves = []
+    for cluster, km in models.items():
+        table = km.survival_function_.join(km.confidence_interval_)
+        table.columns = ["survival", "ci_lower", "ci_upper"]
+        table = table.rename_axis("month").reset_index()
+        table.insert(0, "cluster", cluster)
+        curves.append(table)
+    risk = [
+        {
+            "cluster": cluster,
+            "month": month,
+            "at_risk": int(
+                (
+                    patients.loc[patients["pred_cluster"].eq(cluster), "survival_time"]
+                    >= month * 30
+                ).sum()
+            ),
+        }
+        for cluster in range(n_clusters)
+        for month in months
+    ]
+    return pd.concat(curves, ignore_index=True), pd.DataFrame(risk)
+
+
+def load_evaluation_predictions(
+    checkpoint: Path,
+    data_root: Path,
+    datasets: list[str],
+    n_clusters: int,
+    seed: int,
+    device: str,
+    saved_predictions: Path | None = None,
+) -> tuple[TrailsEstimator, dict[str, TrailsPrediction]]:
+    """按指定K加载同一seed的模型；非入选K在冻结数据上推理，不训练或保存患者产物。"""
+    estimator = TrailsEstimator.load(
+        checkpoint, device="cpu" if saved_predictions is not None else device
+    )
+    if estimator.config.model.n_clusters != n_clusters or estimator.config.trainer.seed != seed:
+        raise ValueError(f"模型不匹配请求的K={n_clusters}、seed={seed}：{checkpoint}")
+    predictions = {
+        name: (
+            TrailsPrediction.load(saved_predictions / name / "model_prediction.pt")
+            if saved_predictions is not None
+            else estimator.predict(ClinicalTimeSeriesDataset.load(data_root / name / "dataset.pt"))
+        )
+        for name in dict.fromkeys(["train", *datasets])
+    }
+    return estimator, predictions
 
 
 def cluster_statistics(frame: pd.DataFrame, n_clusters: int) -> pd.DataFrame:
@@ -43,7 +445,9 @@ def cluster_survival(
     records: list[dict[str, Any]] = []
     for _, group in frame.groupby("pred_cluster", observed=True):
         label = int(group["pred_cluster"].iloc[0])
-        km = KaplanMeierFitter(label=f"簇{label}").fit(group["survival_time"] / 30, group["event"])
+        km = KaplanMeierFitter(label=f"Cluster {label}").fit(
+            group["survival_time"] / 30, group["event"]
+        )
         models[label] = km
         for month in months:
             supported = month <= group["survival_time"].max() / 30
@@ -148,7 +552,7 @@ def adjusted_cox(frame: pd.DataFrame, reference: int) -> tuple[pd.DataFrame, dic
 
 
 def clinical_characteristics(
-    frame: pd.DataFrame, n_clusters: int, config: CRCEvaluationConfig
+    frame: pd.DataFrame, n_clusters: int, config: CRCSupplementaryConfig
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """基线描述和总体检验；分类比例的分母包括缺失患者。"""
     numeric, categorical = config.columns.numeric_baseline, config.columns.categorical_baseline
@@ -298,7 +702,7 @@ def survival_evaluation(
     frame: pd.DataFrame,
     train: pd.DataFrame,
     prediction: TrailsPrediction,
-    config: CRCEvaluationConfig,
+    config: CRCSupplementaryConfig,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """预测指标只使用训练删失分布；校准和KM均按当前评价集观察结局计算。"""
     event = frame["event"].to_numpy(dtype=bool)

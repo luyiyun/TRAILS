@@ -566,3 +566,251 @@ MPLCONFIGDIR=/tmp/trails-mpl PYTHONPATH=. .venv/bin/python .remote-run/crc07-202
 # 2026-10-07：按用户要求仅保留run.yaml；复核r089单seed的K2–10及01–05路径衔接。
 # /Users/rong/Project/TRAILS；配置与运行设置检查，不读取患者数据、不训练。
 MPLCONFIGDIR=/tmp/trails-mpl PYTHONPATH=. .venv/bin/python .remote-run/crc07-20261007-reproduction/verify_config.py
+
+# 2026-10-07：按当前run.yaml在99重跑05；r089、seed20260908、K2–10，train/validation选K后读取test。
+# tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS；cuda:0、单进程/4线程，复用OS24/E60冻结v2输入。
+# 新输出outputs/crc_yunnan/r089-20261007-current-05-06/modeling；成功后另行记录并提交06，不重用旧预测。
+.venv/bin/python /Users/rong/Project/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc05-r089-20261007-current01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-r089-20261007-current-mpl python -m scripts.crc_yunnan.05_run split.dir=data/derived/crc_yunnan/preproc/v2/os/landmark-24m/E60/auto-log1p-robust/random/seed-20260908 split.seed=20260908 split.strategy=random n_clusters=null 'k_selection.candidate_clusters=[2,3,4,5,6,7,8,9,10]' 'k_selection.seeds=[20260908]' k_selection.selection_rule=best_mean k_selection.require_non_empty=true k_selection.min_cluster_fraction=0.05 k_selection.compute_stability=false trainer.seed=20260908 trainer.device=cuda:0 parallel.workers=1 parallel.torch_threads=4 paths.dir=outputs/crc_yunnan/r089-20261007-current-05-06/modeling
+
+# 2026-10-07：99重跑05已exit0且选中r089/K2/seed20260908；运行06生成三集临床、轨迹、生存和选择诊断。
+# tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS；cuda:0/4线程，输入本次新modeling，不重训练或重选K。
+# 输出outputs/crc_yunnan/r089-20261007-current-05-06/evaluation；患者数据、checkpoint、预测均留远端。
+.venv/bin/python /Users/rong/Project/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc06-r089-20261007-current01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 NUMBA_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-r089-20261007-current-mpl python -m scripts.crc_yunnan.06_evaluate inputs.run_dir=outputs/crc_yunnan/r089-20261007-current-05-06/modeling 'datasets=[train,validation,test]' seed=20260908 device=cuda:0 paths.dir=outputs/crc_yunnan/r089-20261007-current-05-06/evaluation paths.run_dir=outputs/crc_yunnan/r089-20261007-current-05-06/logs/06_evaluate
+
+# 2026-10-07：本地读取99已成功06的聚合摘要和工作簿，核对表结构及指标；不重新统计患者数据。
+# /Users/rong/Project/TRAILS；输入remote-results/default/crc06-r089-20261007-current01，seed20260908/K2。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m json.tool remote-results/default/crc06-r089-20261007-current01/outputs/crc_yunnan/r089-20261007-current-05-06/evaluation/evaluation_summary.json
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -c 'import pandas as pd; p="remote-results/default/crc06-r089-20261007-current01/outputs/crc_yunnan/r089-20261007-current-05-06/evaluation/evaluation_tables.xlsx"; t=pd.read_excel(p,sheet_name=None); print({k:(v.shape,list(v.columns)) for k,v in t.items()})'
+
+# 2026-10-07：本地核对06已有聚合表的簇人数、调整HR、临床q值和预设时间点指标；seed20260908/K2。
+# /Users/rong/Project/TRAILS；只读取同一evaluation_tables.xlsx，不重拟合、不访问患者数据。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -c 'import pandas as pd; p="remote-results/default/crc06-r089-20261007-current01/outputs/crc_yunnan/r089-20261007-current-05-06/evaluation/evaluation_tables.xlsx"; t=pd.read_excel(p,sheet_name=None); print(t["簇概况"].to_string(index=False)); print(t["校正Cox"].to_string(index=False)); print(t["临床总体检验"].to_string(index=False)); print(t["时间预测指标"].loc[lambda x:x["月份"].isin([12,36,60])].to_string()); print(t["簇生存"].to_string(index=False))'
+
+# 2026-10-07：本地读取06已有临床中位数、校准和轨迹聚合表；seed20260908/K2，不新增科学计算。
+# /Users/rong/Project/TRAILS；仅取回的evaluation_tables.xlsx，核对测试集描述性差异与观测覆盖。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -c 'import pandas as pd; p="remote-results/default/crc06-r089-20261007-current01/outputs/crc_yunnan/r089-20261007-current-05-06/evaluation/evaluation_tables.xlsx"; t=pd.read_excel(p,sheet_name=None); print(t["临床特征"].loc[lambda x:(x["数据集"]=="测试集") & (x["类型"]=="数值")].to_string(index=False)); print(t["生存校准"].loc[lambda x:x["数据集"]=="测试集"].to_string(index=False)); print(t["纵向轨迹"].loc[lambda x:(x["数据集"]=="测试集") & (x["特征"]=="CEA")].to_string(index=False))'
+
+# 2026-10-07：按变量名称读取06测试集数值型临床聚合统计，补充簇间方向解释；seed20260908/K2。
+# /Users/rong/Project/TRAILS；只读同一evaluation_tables.xlsx，不重新分析患者数据。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -c 'import pandas as pd; p="remote-results/default/crc06-r089-20261007-current01/outputs/crc_yunnan/r089-20261007-current-05-06/evaluation/evaluation_tables.xlsx"; t=pd.read_excel(p,sheet_name="临床特征"); print(t.loc[(t["数据集"]=="测试集") & t["变量"].isin(["术前CEA","术前CA242","年龄"])].to_string(index=False))'
+
+# 2026-10-08：本地合成数据冒烟验证06多K入口和英文绘图；不接触真实CRC数据。
+# /Users/rong/Project/TRAILS；合成双特征/三集，seed20260908，CPU；输入与输出均在.remote-run/crc06-multik-20261008。
+# 生成临时K2/K5模型（正式训练仅2/3轮）后，06分别评价；用于代码验证，不是研究结果。
+env OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 MPLCONFIGDIR=/tmp/trails-crc06-multik-smoke PYTHONPATH=. .venv/bin/python .remote-run/crc06-multik-20261008/make_synthetic_fixture.py
+env OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 NUMBA_NUM_THREADS=2 MPLCONFIGDIR=/tmp/trails-crc06-multik-smoke .venv/bin/python -m scripts.crc_yunnan.06_evaluate inputs.run_dir=.remote-run/crc06-multik-20261008/modeling 'n_clusters=[2,5]' 'datasets=[train,validation,test]' seed=20260908 device=cpu plot.dpi=60 paths.dir=.remote-run/crc06-multik-20261008/evaluation paths.run_dir=.remote-run/crc06-multik-20261008/logs
+
+# 2026-10-08：同一合成输入验证06默认入选K2入口，核对与多K运行的测试集统计一致。
+# 本地主机 /Users/rong/Project/TRAILS；seed20260908、CPU，输入modeling，输出独立evaluation-default。
+env OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 NUMBA_NUM_THREADS=2 MPLCONFIGDIR=/tmp/trails-crc06-multik-smoke .venv/bin/python -m scripts.crc_yunnan.06_evaluate inputs.run_dir=.remote-run/crc06-multik-20261008/modeling n_clusters=null 'datasets=[test]' seed=20260908 device=cpu plot.dpi=60 paths.dir=.remote-run/crc06-multik-20261008/evaluation-default paths.run_dir=.remote-run/crc06-multik-20261008/logs-default
+
+# 2026-10-08：按用户要求在99用新06分别评价r089/K2、K5，seed20260908；沿用20261007新05冻结输入及模型。
+# tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS；cuda:0/4线程，不训练或重选K，英文绘图及默认统计选项。
+# 新输出outputs/crc_yunnan/r089-20261007-current-05-06/evaluation-k2-k5-20261008；仅取回聚合报告及图表。
+.venv/bin/python /Users/rong/Project/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc06-r089-20261008-k2k5-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 NUMBA_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-crc06-k2k5-20261008-mpl python -m scripts.crc_yunnan.06_evaluate inputs.run_dir=outputs/crc_yunnan/r089-20261007-current-05-06/modeling 'n_clusters=[2,5]' 'datasets=[train,validation,test]' seed=20260908 device=cuda:0 paths.dir=outputs/crc_yunnan/r089-20261007-current-05-06/evaluation-k2-k5-20261008 paths.run_dir=outputs/crc_yunnan/r089-20261007-current-05-06/logs/06_evaluate-k2-k5-20261008
+
+# 2026-10-08：06多K重跑exit0后，本地读取K2/K5聚合表，比较占簇、生存预测、调整Cox和临床描述。
+# /Users/rong/Project/TRAILS；输入crc06-r089-20261008-k2k5-01取回的workbook，seed20260908；不读取患者数据或重新拟合。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -c 'from pathlib import Path; import pandas as pd; p=Path("remote-results/default/crc06-r089-20261008-k2k5-01/outputs/crc_yunnan/r089-20261007-current-05-06/evaluation-k2-k5-20261008/k2/evaluation_tables.xlsx"); t=pd.read_excel(p,sheet_name=None); print(t["簇概况"].to_string(index=False)); print(t["生存预测"].to_string(index=False)); print(t["校正Cox"].to_string(index=False)); print(t["时间预测指标"].loc[lambda x:x["月份"].isin([12,36,60])].to_string(index=False))'
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -c 'from pathlib import Path; import pandas as pd; p=Path("remote-results/default/crc06-r089-20261008-k2k5-01/outputs/crc_yunnan/r089-20261007-current-05-06/evaluation-k2-k5-20261008/k5/evaluation_tables.xlsx"); t=pd.read_excel(p,sheet_name=None); print(t["簇概况"].to_string(index=False)); print(t["生存预测"].to_string(index=False)); print(t["校正Cox"].to_string(index=False)); print(t["时间预测指标"].loc[lambda x:x["月份"].isin([12,36,60])].to_string(index=False)); print(t["临床总体检验"].loc[lambda x:x["数据集"]=="测试集"].to_string(index=False)); print(t["生存校准"].loc[lambda x:x["数据集"]=="测试集"].to_string(index=False))'
+
+# 2026-10-08：只读K5聚合轨迹人数/临床数值及K2校准表，核对小簇图形与精确分位统计。
+# 本地 /Users/rong/Project/TRAILS；同一seed20260908取回工作簿，不重新拟合、不访问患者数据。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -c 'from pathlib import Path; import pandas as pd; p=Path("remote-results/default/crc06-r089-20261008-k2k5-01/outputs/crc_yunnan/r089-20261007-current-05-06/evaluation-k2-k5-20261008/k5/evaluation_tables.xlsx"); t=pd.read_excel(p,sheet_name=None); print({k:(v.shape,list(v.columns)) for k,v in t.items()}); print(t["纵向轨迹"].loc[lambda x:(x["数据集"]=="测试集") & (x["簇"]==4) & x["特征"].isin(["CEA","CA242","CA199"])].to_string(index=False)); print(t["临床特征"].loc[lambda x:(x["数据集"]=="测试集") & x["变量"].isin(["术前CEA","术前CA242","年龄"])].to_string(index=False))'
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -c 'import pandas as pd; t=pd.read_excel("remote-results/default/crc06-r089-20261008-k2k5-01/outputs/crc_yunnan/r089-20261007-current-05-06/evaluation-k2-k5-20261008/k2/evaluation_tables.xlsx",sheet_name="生存校准"); print(t.loc[t["数据集"]=="测试集"].to_string(index=False))'
+
+# 2026-10-08：G14实现的合成输入检查，验证范围端点、逐条剔除计数、同日聚合和有效访视筛选。
+# 本地 /Users/rong/Project/TRAILS；seed20260908，输入由保留的临时脚本生成，输出.remote-run/g14-20261008/synthetic。
+# 不读取真实患者数据，不训练模型；范围使用本轮确认的G14探索界限。
+PYTHONPATH=. .venv/bin/python .remote-run/g14-20261008/validate_synthetic.py
+
+# 2026-10-08：按确认的宽界限清洗G14指标，依次运行01→03→04；不改变既有v2患者主划分。
+# tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS；OS/720天、G14、auto-log1p/robust、seed20260908、4线程。
+# 输出独立v2-g14-clean-20261008数据目录；仅复制聚合摘要、配置和预处理参数到outputs供取回。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc-g14-prep-20261008-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 NUMBA_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-g14-20261008-mpl bash -c 'set -e
+python -m scripts.crc_yunnan.01_cohort version=v2-g14-clean-20261008 '\''processing.observation_value_bounds={CEA:{min:0},CA242:{min:0},CA125:{min:0},血清白蛋白:{min:0,max:100},总蛋白:{min:0,max:200},白球比:{min:0,max:10},前白蛋白:{min:0,max:1000},胆碱酯酶:{min:0,max:50000},红细胞:{min:0.1,max:20},红细胞平均体积:{min:20,max:300},平均血小板体积:{min:1,max:50},中性粒细胞绝对值:{min:0,max:200},乳酸脱氢酶:{min:0,max:20000},尿素:{min:0,max:100}}'\'' processing.research_id_seed=20260908 paths.run_dir=outputs/crc_yunnan/g14-20261008/logs/01_cohort
+python -m scripts.crc_yunnan.03_split version=v2-g14-clean-20261008 split_version=v2 '\''split.strategies=[random]'\'' '\''split.seeds=[20260908]'\'' paths.dir=data/derived/crc_yunnan/splits/v2-g14-clean-20261008 paths.run_dir=outputs/crc_yunnan/g14-20261008/logs/03_split
+python -m scripts.crc_yunnan.04_preproc version=v2-g14-clean-20261008 features.panel=G14 outcome=os landmark_months=24 min_observation_dates=2 preprocessing.log_transform=auto-log1p preprocessing.scaling=robust preprocessing.skew_threshold=1.0 paths.run_dir=outputs/crc_yunnan/g14-20261008/logs/04_preproc
+mkdir -p outputs/crc_yunnan/g14-20261008/preparation
+cp data/derived/crc_yunnan/cohort/v2-g14-clean-20261008/cohort_summary.json outputs/crc_yunnan/g14-20261008/preparation/cohort_summary.json
+cp data/derived/crc_yunnan/cohort/v2-g14-clean-20261008/resolved_config.yaml outputs/crc_yunnan/g14-20261008/preparation/cohort_config.yaml
+cp data/derived/crc_yunnan/preproc/v2-g14-clean-20261008/os/landmark-24m/G14/auto-log1p-robust/random/seed-20260908/preproc_manifest.json outputs/crc_yunnan/g14-20261008/preparation/preproc_manifest.json
+cp data/derived/crc_yunnan/preproc/v2-g14-clean-20261008/os/landmark-24m/G14/auto-log1p-robust/random/seed-20260908/preprocessing_parameters.csv outputs/crc_yunnan/g14-20261008/preparation/preprocessing_parameters.csv
+cp data/derived/crc_yunnan/preproc/v2-g14-clean-20261008/os/landmark-24m/G14/auto-log1p-robust/random/seed-20260908/resolved_config.yaml outputs/crc_yunnan/g14-20261008/preparation/preproc_config.yaml'
+
+# 2026-10-08：上方G14准备命令未提交；配置预览发现Hydra不支持未引号保护的中文字典键。
+# 以下使用OmegaConf内置oc.create解析JSON，已核验全部14项阈值；输入/输出、seed及科学规则不变。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc-g14-prep-20261008-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 NUMBA_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-g14-20261008-mpl bash -c 'set -e
+python -m scripts.crc_yunnan.01_cohort version=v2-g14-clean-20261008 '\''processing.observation_value_bounds="${oc.create:'\''\'\'''\''{\"CEA\":{\"min\":0},\"CA242\":{\"min\":0},\"CA125\":{\"min\":0},\"血清白蛋白\":{\"min\":0,\"max\":100},\"总蛋白\":{\"min\":0,\"max\":200},\"白球比\":{\"min\":0,\"max\":10},\"前白蛋白\":{\"min\":0,\"max\":1000},\"胆碱酯酶\":{\"min\":0,\"max\":50000},\"红细胞\":{\"min\":0.1,\"max\":20},\"红细胞平均体积\":{\"min\":20,\"max\":300},\"平均血小板体积\":{\"min\":1,\"max\":50},\"中性粒细胞绝对值\":{\"min\":0,\"max\":200},\"乳酸脱氢酶\":{\"min\":0,\"max\":20000},\"尿素\":{\"min\":0,\"max\":100}}'\''\'\'''\''}"'\'' processing.research_id_seed=20260908 paths.run_dir=outputs/crc_yunnan/g14-20261008/logs/01_cohort
+python -m scripts.crc_yunnan.03_split version=v2-g14-clean-20261008 split_version=v2 '\''split.strategies=[random]'\'' '\''split.seeds=[20260908]'\'' paths.dir=data/derived/crc_yunnan/splits/v2-g14-clean-20261008 paths.run_dir=outputs/crc_yunnan/g14-20261008/logs/03_split
+python -m scripts.crc_yunnan.04_preproc version=v2-g14-clean-20261008 features.panel=G14 outcome=os landmark_months=24 min_observation_dates=2 preprocessing.log_transform=auto-log1p preprocessing.scaling=robust preprocessing.skew_threshold=1.0 paths.run_dir=outputs/crc_yunnan/g14-20261008/logs/04_preproc
+mkdir -p outputs/crc_yunnan/g14-20261008/preparation
+cp data/derived/crc_yunnan/cohort/v2-g14-clean-20261008/cohort_summary.json outputs/crc_yunnan/g14-20261008/preparation/cohort_summary.json
+cp data/derived/crc_yunnan/cohort/v2-g14-clean-20261008/resolved_config.yaml outputs/crc_yunnan/g14-20261008/preparation/cohort_config.yaml
+cp data/derived/crc_yunnan/preproc/v2-g14-clean-20261008/os/landmark-24m/G14/auto-log1p-robust/random/seed-20260908/preproc_manifest.json outputs/crc_yunnan/g14-20261008/preparation/preproc_manifest.json
+cp data/derived/crc_yunnan/preproc/v2-g14-clean-20261008/os/landmark-24m/G14/auto-log1p-robust/random/seed-20260908/preprocessing_parameters.csv outputs/crc_yunnan/g14-20261008/preparation/preprocessing_parameters.csv
+cp data/derived/crc_yunnan/preproc/v2-g14-clean-20261008/os/landmark-24m/G14/auto-log1p-robust/random/seed-20260908/resolved_config.yaml outputs/crc_yunnan/g14-20261008/preparation/preproc_config.yaml'
+
+# 2026-10-08：01→03→04 exit0后，只读核对G14基础患者表和三集主ID归属，与原v2逐字节比较。
+# tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS；读取现有聚合摘要，核对14项/OS/720天、剔除数及GPU。
+'ssh' '-o' 'BatchMode=yes' '-o' 'ConnectTimeout=15' '-o' 'ClearAllForwardings=yes' 'tmu-99-rzw-xtcp' 'cd /home/rongzw/projects/TRAILS
+cmp data/derived/crc_yunnan/cohort/v2/patients.csv data/derived/crc_yunnan/cohort/v2-g14-clean-20261008/patients.csv
+for name in train validation test; do cmp data/derived/crc_yunnan/splits/v2/random/seed-20260908/$name/ids.csv data/derived/crc_yunnan/splits/v2-g14-clean-20261008/random/seed-20260908/$name/ids.csv || exit; done
+sha256sum data/derived/crc_yunnan/cohort/v2-g14-clean-20261008/patients.csv data/real/crc_yunnan/*csv
+cat outputs/crc_yunnan/g14-20261008/preparation/cohort_summary.json outputs/crc_yunnan/g14-20261008/preparation/preproc_manifest.json
+nvidia-smi --query-gpu=name,memory.used,utilization.gpu --format=csv,noheader'
+
+# 2026-10-08：G14单seed K=2–10探索；01→03→04原子exit0，107条原始观测剔除，基础4100人与主归属不变。
+# tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS；OS/720天、G14、auto-log1p/robust、r089、seed20260908、cuda:0、4线程。
+# 输入1853/444/586人；仅验证集选择K，保留无空簇/最小5%门槛；仅取回聚合结果，患者级产物留在99。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc05-g14-20261008-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 NUMBA_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-g14-20261008-mpl python -m scripts.crc_yunnan.05_run split.dir=data/derived/crc_yunnan/preproc/v2-g14-clean-20261008/os/landmark-24m/G14/auto-log1p-robust/random/seed-20260908 split.seed=20260908 split.strategy=random paths.dir=outputs/crc_yunnan/g14-20261008/modeling n_clusters=null k_selection.enabled=true 'k_selection.candidate_clusters=[2,3,4,5,6,7,8,9,10]' 'k_selection.seeds=[20260908]' k_selection.selection_rule=best_mean k_selection.require_non_empty=true k_selection.min_cluster_fraction=0.05 k_selection.compute_stability=false k_selection.min_mean_pairwise_ari=null trainer.seed=20260908 trainer.device=cuda:0 trainer.valid_size=0 trainer.batch_size=64 trainer.learning_rate=0.001 trainer.warmup_epochs=30 trainer.warmup_objective=reconstruction trainer.min_epochs=100 trainer.max_epochs=300 trainer.early_stopping_monitor=loss trainer.early_stopping_patience=30 model.latent_dim=32 model.dropout=0 model.survival_loss=weibull model.survival_head_hidden_layers=1 model.loss.weighting=fixed model.loss.reconstruction_weight=1 model.loss.survival_weight=0.05 model.loss.cluster_weight=0.1 parallel.workers=1 parallel.torch_threads=4 runtime.torch_interop_threads=4 swanlab.enabled=false
+
+# 2026-10-08：论文Results第三部分，固定原E60 r089/K5/seed20260908；只读生成画像、稀疏性与完整KM聚合。
+# 99:/home/rongzw/projects/TRAILS；CPU/4线程，G14训练另在运行，不同步或覆盖其源码；脚本与模型SHA单独记录。
+# 已授权的一次性聚合脚本保留在outputs/crc_yunnan/manuscript_results3/reproducibility；患者级数据与模型留99。
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'test ! -e /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-fig3-20261008-01 && mkdir -p /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-fig3-20261008-01 && test ! -e /home/rongzw/projects/TRAILS/outputs/crc_yunnan/manuscript_results3_aggregate-20261008'
+scp -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes outputs/crc_yunnan/manuscript_results3/reproducibility/aggregate_k5.py outputs/crc_yunnan/manuscript_results3/reproducibility/launch_aggregate.sh tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-fig3-20261008-01/
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'cd /home/rongzw/projects/TRAILS && test ! -e /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-fig3-20261008-01/pid && { nohup sh /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-fig3-20261008-01/launch_aggregate.sh >/home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-fig3-20261008-01/stdout.log 2>/home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-fig3-20261008-01/stderr.log </dev/null & paper_pid=$!; printf "%s\n" "$paper_pid" >/home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-fig3-20261008-01/pid; printf "%s\n" "$paper_pid"; }'
+
+# 2026-10-08：本地制作K5六面板论文图及Source Data中间表；只用已SHA核验的三集聚合数据。
+# /Users/rong/Project/TRAILS；seed20260908，训练集定义画像、测试集KM/Cox；输出manuscript_results3。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 outputs/crc_yunnan/manuscript_results3/reproducibility/make_figure.py
+
+# 2026-10-08：bundled Python未提供Matplotlib；改用项目已有绘图库绘图，输入与科学口径相同。
+# 本地 /Users/rong/Project/TRAILS；不安装依赖，Source Data工作簿仍使用bundled Node/artifact-tool。
+.venv/bin/python outputs/crc_yunnan/manuscript_results3/reproducibility/make_figure.py
+
+# 2026-10-09：按180×195 mm最终尺寸校对六面板，矢量热图、英文单位、KM风险表及Cox文字位置。
+# 本地 /Users/rong/Project/TRAILS；仍用原E60/K5/seed20260908聚合输入，统计结果及显示门槛不变。
+env MPLCONFIGDIR=/tmp/trails-paper-fig3-mpl .venv/bin/python outputs/crc_yunnan/manuscript_results3/reproducibility/make_figure.py
+
+# 2026-10-09：将固定K5三集聚合值和K2/K5比较表写入Source Data；无新增模型、检验或患者级数据。
+# 本地 /Users/rong/Project/TRAILS；bundled Node/artifact-tool，输入source_data_payload.json，输出SourceData.xlsx。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node outputs/crc_yunnan/manuscript_results3/reproducibility/make_source_data.mjs
+
+# 2026-10-09：只读三集阶段画像，逐项核对C0肝胆指标、C1/C2红细胞指标和C4营养/中性粒细胞方向。
+# 本地 /Users/rong/Project/TRAILS；原K5/seed20260908聚合中位数，不拟合、不检验，供论文文字核对。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -c 'import json; import pandas as pd; from pathlib import Path; p=json.loads(Path("outputs/crc_yunnan/manuscript_results3/source_data/source_data_payload.json").read_text()); t=pd.DataFrame(p["Atlas"]["records"]); print(t.loc[t.feature.isin(["血红蛋白","红细胞平均体积","平均血红蛋白量","血清白蛋白","前白蛋白","中性粒细胞绝对值"]) & t.phase.eq("0–3m"),["dataset","cluster","feature","n","original_median"]].to_string(index=False)); print(t.loc[t.feature.isin(["碱性磷酸酶","r谷氨酰转移酶"]) & t.phase.eq("3–12m") & t.cluster.isin([0,3]),["dataset","cluster","feature","n","original_median"]].to_string(index=False))'
+
+# 2026-10-09：源表phase使用0/1/2编码，上方文字筛选为空；改为对应的0–3与3–12月整数编码读取。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -c 'import json; import pandas as pd; from pathlib import Path; p=json.loads(Path("outputs/crc_yunnan/manuscript_results3/source_data/source_data_payload.json").read_text()); t=pd.DataFrame(p["Atlas"]["records"]); print(t.loc[t.feature.isin(["血红蛋白","红细胞平均体积","平均血红蛋白量","血清白蛋白","前白蛋白","中性粒细胞绝对值"]) & t.phase.eq(0),["dataset","cluster","feature","n","original_median"]].to_string(index=False)); print(t.loc[t.feature.isin(["碱性磷酸酶","r谷氨酰转移酶"]) & t.phase.eq(1) & t.cluster.isin([0,3]),["dataset","cluster","feature","n","original_median"]].to_string(index=False))'
+
+# 2026-10-09：补充主图观测人数索引和Source Data时间编码说明；重导出同一套最终图与源表。
+# 本地 /Users/rong/Project/TRAILS；原E60/K5/seed20260908统计值不变，仅显示与元数据完善。
+env MPLCONFIGDIR=/tmp/trails-paper-fig3-mpl .venv/bin/python outputs/crc_yunnan/manuscript_results3/reproducibility/make_figure.py
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node outputs/crc_yunnan/manuscript_results3/reproducibility/make_source_data.mjs
+
+# 2026-10-09：最终输出校对，消除矢量色标接缝、Source Data长列名换行和极小P值显示为0的问题。
+# 本地 /Users/rong/Project/TRAILS；只改图形/工作簿显示，固定K5/seed20260908聚合数值不变。
+env MPLCONFIGDIR=/tmp/trails-paper-fig3-mpl .venv/bin/python outputs/crc_yunnan/manuscript_results3/reproducibility/make_figure.py
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node outputs/crc_yunnan/manuscript_results3/reproducibility/make_source_data.mjs
+
+# 2026-10-09：原有CEA上轴限250未容纳最大支持IQR 373.325；仅将对数轴上限调至500以完整显示。
+# 本地 /Users/rong/Project/TRAILS；固定K5/seed20260908源数据、观测支持门槛及统计值不变。
+env MPLCONFIGDIR=/tmp/trails-paper-fig3-mpl .venv/bin/python outputs/crc_yunnan/manuscript_results3/reproducibility/make_figure.py
+
+# 2026-10-09：按用户修订将d改为验证/测试latent z UMAP；固定原E60 r089/K5/seed20260908，训练集拟合。
+# 99:/home/rongzw/projects/TRAILS；CPU/4线程，沿用06 UMAP参数；不训练、不新检验、不同步在训G14源码。
+# 只取回渲染图、聚合占簇数和参数元数据，患者坐标/模型/预测留99；脚本SHA单独核对。
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'test ! -e /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-01 && mkdir -p /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-01 && test ! -e /home/rongzw/projects/TRAILS/outputs/crc_yunnan/manuscript_results3_umap-20261009'
+scp -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes outputs/crc_yunnan/manuscript_results3/reproducibility/render_umap.py outputs/crc_yunnan/manuscript_results3/reproducibility/launch_umap.sh tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-01/
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'cd /home/rongzw/projects/TRAILS && test ! -e .remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-01/pid && { nohup sh .remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-01/launch_umap.sh >.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-01/stdout.log 2>.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-01/stderr.log </dev/null & paper_pid=$!; printf "%s\n" "$paper_pid" >.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-01/pid; printf "%s\n" "$paper_pid"; }'
+
+# 2026-10-09：UMAP初版exit0、人数与SHA一致；去掉重复横轴标题以消除与下图标题重叠，独立输出v2。
+# 99:/home/rongzw/projects/TRAILS；原E60/K5/seed20260908与UMAP参数不变；原脚本保留initial副本。
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'test ! -e /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-02 && mkdir -p /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-02 && test ! -e /home/rongzw/projects/TRAILS/outputs/crc_yunnan/manuscript_results3_umap-20261009-v2'
+scp -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes outputs/crc_yunnan/manuscript_results3/reproducibility/render_umap.py outputs/crc_yunnan/manuscript_results3/reproducibility/launch_umap.sh tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-02/
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'cd /home/rongzw/projects/TRAILS && test ! -e .remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-02/pid && { nohup sh .remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-02/launch_umap.sh >.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-02/stdout.log 2>.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-02/stderr.log </dev/null & paper_pid=$!; printf "%s\n" "$paper_pid" >.remote-run/diagnostics/crc-paper-r089-k5-umap-20261009-02/pid; printf "%s\n" "$paper_pid"; }'
+
+# 2026-10-09：修订主图180×215 mm，双集UMAP及44×36 mm双KM；仅使用已核验的聚合表与渲染图。
+# 本地 /Users/rong/Project/TRAILS；原E60/r089/K5/seed20260908，Cox保持测试集；原稿留versions/v1_20261009。
+env MPLCONFIGDIR=/tmp/trails-paper-fig3-mpl .venv/bin/python outputs/crc_yunnan/manuscript_results3/reproducibility/make_figure.py
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 outputs/crc_yunnan/manuscript_results3/reproducibility/compose_figure.py
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node outputs/crc_yunnan/manuscript_results3/reproducibility/make_source_data.mjs
+
+# 2026-10-09：Source Data极小P值导出保留浮点有效数字，不按固定小数位截断；图形与统计口径不变。
+# 本地 /Users/rong/Project/TRAILS；最终重导出固定K5/seed20260908主图、14表源数据与两集UMAP图件合成。
+env MPLCONFIGDIR=/tmp/trails-paper-fig3-mpl .venv/bin/python outputs/crc_yunnan/manuscript_results3/reproducibility/make_figure.py
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 outputs/crc_yunnan/manuscript_results3/reproducibility/compose_figure.py
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node outputs/crc_yunnan/manuscript_results3/reproducibility/make_source_data.mjs
+
+# 2026-10-09：G14 05原子exit0，9/9候选完整，原门槛选中K2/seed20260908后执行06。
+# tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS；OS/720天、G14、r089、cuda:0/4线程；输入modeling，输出独立evaluation。
+# 仅评价入选K的三集、landmark后12/36/60月及1–60月积分；模型/患者数据留99，只取回聚合产物。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc06-g14-20261008-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 NUMBA_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-g14-20261008-mpl python -m scripts.crc_yunnan.06_evaluate inputs.run_dir=outputs/crc_yunnan/g14-20261008/modeling n_clusters=null 'datasets=[train,validation,test]' seed=20260908 device=cuda:0 'survival.months=[12,36,60]' survival.curve_step_months=1 survival.calibration_bins=5 paths.dir=outputs/crc_yunnan/g14-20261008/evaluation paths.run_dir=outputs/crc_yunnan/g14-20261008/logs/06_evaluate
+
+# 2026-10-09：只读已授权取回的G14与历史E60 K2聚合工作簿，核对字段和三集评价口径。
+# 本地 /Users/rong/Project/TRAILS；两组均seed20260908/OS/720天，不新增训练、检验或患者级数据。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 .remote-run/g14-20261008/inspect_aggregates.py
+
+# 2026-10-09：只核对G14精确白名单95份聚合文件；远端SHA/尺寸由只读ssh取得，患者级数据仍留99。
+# 本地 /Users/rong/Project/TRAILS；比较历史E60 K2与G14 K2/seed20260908，输出比较CSV和检查摘要。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 .remote-run/g14-20261008/analyze_aggregates.py --inventory-only
+
+# 2026-10-09：99:/home/rongzw/projects/TRAILS；只读核对准备5份/05聚合35份/06聚合55份的SHA及尺寸。
+# 精确95项路径随本任务脚本保留；校验后只在本地比较OS/720天、K2、seed20260908的两组聚合结果。
+bash .remote-run/g14-20261008/verify_remote_artifacts.sh
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 .remote-run/g14-20261008/analyze_aggregates.py
+
+# 2026-10-09：补充G14/E60共同14项的原量纲轨迹与覆盖聚合对照，簇编号不作患者匹配。
+# 本地 /Users/rong/Project/TRAILS；不新增统计检验，保留各组原有90天分箱及全部时间箱数值。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 .remote-run/g14-20261008/analyze_aggregates.py
+
+# 2026-10-09：用户追加要求查看G14 K4/K6生存差异；只评价05保存的同seed候选，原K2选择不变。
+# 99:/home/rongzw/projects/TRAILS；OS/720天、seed20260908、cuda:0/4线程、三集KM/Cox与既有评价；不训练。
+# K4/K6原占簇门槛未通过，仅作补充探索；独立输出，不覆盖K2，患者级产物留99。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc06-g14-k4k6-20261009-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 NUMBA_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-g14-k4k6-20261009-mpl python -m scripts.crc_yunnan.06_evaluate inputs.run_dir=outputs/crc_yunnan/g14-20261008/modeling 'n_clusters=[4,6]' 'datasets=[train,validation,test]' seed=20260908 device=cuda:0 'survival.months=[12,36,60]' survival.curve_step_months=1 survival.calibration_bins=5 umap.seed=20260908 paths.dir=outputs/crc_yunnan/g14-20261008/evaluation-k4-k6-20261009 paths.run_dir=outputs/crc_yunnan/g14-20261008/logs/06_evaluate-k4-k6-20261009
+
+# 2026-10-09：上方K4在test调整Cox不收敛，原子exit1；K6尚未执行，现单独完成用户已授权的K6评价。
+# 99:/home/rongzw/projects/TRAILS；输入/seed20260908/统计口径不变；独立K6目录，不覆盖K4失败产物。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc06-g14-k6-20261009-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 NUMBA_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-g14-k6-20261009-mpl python -m scripts.crc_yunnan.06_evaluate inputs.run_dir=outputs/crc_yunnan/g14-20261008/modeling n_clusters=6 'datasets=[train,validation,test]' seed=20260908 device=cuda:0 'survival.months=[12,36,60]' survival.curve_step_months=1 survival.calibration_bins=5 umap.seed=20260908 paths.dir=outputs/crc_yunnan/g14-20261008/evaluation-k4-k6-20261009 paths.run_dir=outputs/crc_yunnan/g14-20261008/logs/06_evaluate-k6-20261009
+
+# 2026-10-09：上方独立K6命令未提交；用户确认一次性汇总K4/K6的KM/log-rank及Cox失败标记。
+# 99:/home/rongzw/projects/TRAILS；临时脚本复用原函数、固定模型/seed20260908/四协变量；无惩罚或合并。
+# 脚本/模型SHA记录，患者级产物留99，原06失败目录保留，独立聚合目录g14-k4k6-survival-20261009。
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'test ! -e /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-g14-k4k6-survival-20261009-01 && mkdir -p /home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-g14-k4k6-survival-20261009-01'
+scp -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes .remote-run/g14-20261008/aggregate_k4k6_survival.py tmu-99-rzw-xtcp:/home/rongzw/projects/TRAILS/.remote-run/diagnostics/crc-g14-k4k6-survival-20261009-01/
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc-g14-k4k6-survival-20261009-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 MPLCONFIGDIR=/tmp/trails-g14-k4k6-survival-20261009-mpl python .remote-run/diagnostics/crc-g14-k4k6-survival-20261009-01/aggregate_k4k6_survival.py
+
+# 2026-10-09：完整阶段日志纠正短日志判断：原06实际已完成K4，随后K6 test调整Cox失败，整体exit1。
+# K6单独06从未提交；用户确认的一次性两K汇总exit0，K4 Cox成功，K6 test失败与train警告明确保留。
+# 本地只读16份生存聚合文件，核对SHA/尺寸/图件及原K4工作簿，不新增统计或患者级输出。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 .remote-run/g14-20261008/analyze_k4k6_survival.py
+
+
+
+
+# 2026-10-09：补充核对原06已完整产出的K4工作簿和摘要，尺寸/SHA及三张生存聚合表一致性。
+# 本地 /Users/rong/Project/TRAILS；原模型和统计函数不变，Cox失败归属更正为K6 test，未新增检验。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 .remote-run/g14-20261008/analyze_k4k6_survival.py
+
+# 2026-10-09：CSV的三列Torch诊断以float32短小数写出，Excel保留其double表示；恢复原float32后比较。
+# 人数、事件、KM和Cox仍按原精度核对；只恢复导出类型，不改统计或重算远端结果。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 .remote-run/g14-20261008/analyze_k4k6_survival.py
+
+# 2026-10-09：本地合成输入检查05候选汇总及06/07独立流程，不使用患者数据。
+# 主机：本机；工作目录：/Users/rong/Project/TRAILS；合成输入/输出：/tmp/trails-crc-postprocess-smoke；seed=20260908/20260909。
+UV_CACHE_DIR=/tmp/uv-cache PYTHONPATH=/Users/rong/Project/TRAILS uv run python /tmp/trails_crc_postprocess_smoke.py
+
+# 2026-10-09：复用上述合成模型继续检查06/07；修正临时检查中/tmp与/private/tmp的路径比较，不再训练。
+# 主机：本机；工作目录：/Users/rong/Project/TRAILS；输入/输出：/tmp/trails-crc-postprocess-smoke；seed=20260908。
+UV_CACHE_DIR=/tmp/uv-cache PYTHONPATH=/Users/rong/Project/TRAILS uv run python /tmp/trails_crc_postprocess_check.py
+
+# 2026-10-09：复用已保存合成模型核对完整占簇指标、历史兼容、低支持显示及最终矢量版面，不再训练。
+# 主机：本机；工作目录：/Users/rong/Project/TRAILS；输入/输出：/tmp/trails-crc-postprocess-smoke；K2/K5/K10，seed20260908。
+UV_CACHE_DIR=/tmp/uv-cache MPLCONFIGDIR=/tmp/trails-crc-mpl PYTHONPATH=/Users/rong/Project/TRAILS uv run python /tmp/trails_crc_final_check.py
+
+# 2026-10-09：继续最终本地检查，复用已完成的modeling-final；修正检查夹具的cluster_label=None，不再训练或覆盖05产物。
+UV_CACHE_DIR=/tmp/uv-cache MPLCONFIGDIR=/tmp/trails-crc-mpl PYTHONPATH=/Users/rong/Project/TRAILS uv run python /tmp/trails_crc_final_check.py
+
+# 2026-10-09：最终色条矢量化核对、历史07及单seed分支；复用合成模型，不训练、不访问患者数据或99。
+# 主机：本机；工作目录：/Users/rong/Project/TRAILS；输入/输出：/tmp/trails-crc-postprocess-smoke；K2/K5/K10，seed20260908。
+UV_CACHE_DIR=/tmp/uv-cache MPLCONFIGDIR=/tmp/trails-crc-mpl PYTHONPATH=/Users/rong/Project/TRAILS uv run python /tmp/trails_crc_export_check.py
+
+# 2026-10-09：最终正文版面及14张Source Data表验收，复用合成模型；不训练、不访问患者数据或99。
+# 主机：本机；工作目录：/Users/rong/Project/TRAILS；输入/输出：/tmp/trails-crc-postprocess-smoke；K2/K5/K10，seed20260908，600 dpi。
+UV_CACHE_DIR=/tmp/uv-cache MPLCONFIGDIR=/tmp/trails-crc-mpl PYTHONPATH=/Users/rong/Project/TRAILS uv run python /tmp/trails_crc_acceptance.py
+
+# 2026-10-09：仅用既有r089 Source Data复绘并核对人数/参考簇/画像/轨迹/KM/Cox，不拟合、不读患者表或UMAP坐标；d为明确标注的检查占位。
+# 主机：本机；工作目录：/Users/rong/Project/TRAILS；输入：outputs/crc_yunnan/manuscript_results3/SourceData.xlsx；输出：/tmp/trails-crc-real-aggregate-replay；K5，seed20260908。
+UV_CACHE_DIR=/tmp/uv-cache MPLCONFIGDIR=/tmp/trails-crc-mpl PYTHONPATH=/Users/rong/Project/TRAILS uv run python /tmp/trails_crc_aggregate_replay.py

@@ -48,6 +48,8 @@ processing:
   max_outcome_days: 7305
   outcome_time_unit_days: 30
   refuse_overwrite: true
+  # 默认为空；探索性范围筛选通过命令行显式指定，区间端点保留。
+  observation_value_bounds: {}
 
 date_corrections:
   patients:

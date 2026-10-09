@@ -1,7 +1,8 @@
-"""06单图绘制函数；统计结果由主流程提供，统一中文标签和簇颜色。"""
+"""06单图绘制函数；统计结果由主流程提供，统一英文标签和簇颜色。"""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,20 +12,154 @@ import pandas as pd
 from lifelines import KaplanMeierFitter
 from lifelines.plotting import add_at_risk_counts
 
-from .config import BASELINE_LABELS
+from .config import CRCPostprocessConfig
 from .evaluation import SPLIT_LABELS
 
 matplotlib.use("Agg")
 import seaborn as sns  # noqa: E402
+from matplotlib import font_manager  # noqa: E402
 from matplotlib import pyplot as plt  # noqa: E402
+from matplotlib.collections import Collection  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
+
+CLUSTER_COLORS = [
+    "#0072B2",
+    "#E69F00",
+    "#CC79A7",
+    "#666666",
+    "#D55E00",
+    "#009E73",
+    "#56B4E9",
+    "#F0E442",
+    "#000000",
+]
+CLUSTER_MARKERS = ["o", "^", "s", "D", "P", "v", "X", "<", ">", "h"]
+CLUSTER_STYLES = ["-", "--", "-.", ":"]
+
+
+def configure_plotting(config: CRCPostprocessConfig, n_clusters: int) -> dict[int, Any]:
+    fonts = {font.name for font in font_manager.fontManager.ttflist}
+    selected = [name for name in config.plot.font_families if name in fonts]
+    if not selected:
+        raise ValueError("未找到配置中的绘图字体")
+    plt.rcParams.update(
+        {
+            "font.family": selected,
+            "axes.unicode_minus": False,
+            "pdf.fonttype": 42,
+            "svg.fonttype": "none",
+            "font.size": 9,
+        }
+    )
+    return {
+        k: CLUSTER_COLORS[k]
+        if k < len(CLUSTER_COLORS)
+        else plt.get_cmap("tab20")((k - len(CLUSTER_COLORS)) % 20)
+        for k in range(n_clusters)
+    }
+
+
+ENGLISH_LABELS = {
+    "train": "Training",
+    "validation": "Validation",
+    "test": "Test",
+    "训练集": "Training",
+    "验证集": "Validation",
+    "测试集": "Test",
+    "缺失": "Missing",
+    "未记录": "Unrecorded",
+    "Preoperative_CEA": "Preoperative CEA",
+    "Preoperative_CA242": "Preoperative CA242",
+    "Age": "Age",
+    "Sex": "Sex",
+    "Primary_site": "Primary site",
+    "Surgical_approach": "Surgical approach",
+    "Tumor_differentiation": "Tumor differentiation",
+    "AJCC_8th_ed_Stage": "AJCC 8th edition stage",
+    "Lymph_node_yield": "Lymph node yield",
+    "Mucinous_colloid_type": "Mucinous/colloid type",
+    "Lymphovascular_invasion": "Lymphovascular invasion",
+    "Perineural_invasion": "Perineural invasion",
+    "Adjuvant_chemotherapy": "Adjuvant chemotherapy",
+    "Tumor_marker": "Tumor markers",
+    "Liver_and_kidney_function": "Liver and kidney function",
+    "Blood_routine_examination": "Complete blood count",
+    "Coagulation_function": "Coagulation function",
+    "血清白蛋白": "Serum albumin",
+    "血红蛋白": "Hemoglobin",
+    "中性粒细胞绝对值": "Absolute neutrophil count",
+    "淋巴细胞绝对值": "Absolute lymphocyte count",
+    "血小板": "Platelet count",
+    "肌酐": "Creatinine",
+    "前白蛋白": "Prealbumin",
+    "谷丙转氨酶": "ALT",
+    "总胆红素": "Total bilirubin",
+    "白细胞绝对值": "White blood cell count",
+    "单核细胞绝对值": "Absolute monocyte count",
+    "尿素": "Urea",
+    "尿酸": "Uric acid",
+    "谷草转氨酶": "AST",
+    "直接胆红素": "Direct bilirubin",
+    "碱性磷酸酶": "Alkaline phosphatase",
+    "r谷氨酰转移酶": "Gamma-glutamyl transferase",
+    "嗜碱性粒细胞绝对值": "Absolute basophil count",
+    "嗜酸性粒细胞绝对值": "Absolute eosinophil count",
+    "大型血小板比率": "Large platelet ratio",
+    "平均血小板体积": "Mean platelet volume",
+    "平均血红蛋白浓度": "Mean corpuscular hemoglobin concentration",
+    "平均血红蛋白量": "Mean corpuscular hemoglobin",
+    "红细胞": "Red blood cell count",
+    "红细胞体积分布宽度": "Red cell distribution width (SD)",
+    "红细胞体积变异系数": "Red cell distribution width (CV)",
+    "红细胞压积": "Hematocrit",
+    "红细胞平均体积": "Mean corpuscular volume",
+    "血小板分布宽度": "Platelet distribution width",
+    "血小板压积": "Plateletcrit",
+    "PT_INR": "PT-INR",
+    "凝血酶原时间": "Prothrombin time",
+    "凝血酶时间": "Thrombin time",
+    "活化部分凝血活酶时间": "Activated partial thromboplastin time",
+    "纤维蛋白原": "Fibrinogen",
+    "部分凝血活酶时间比率": "Partial thromboplastin time ratio",
+    "C反应蛋白": "C-reactive protein",
+    "aL岩藻糖甘酶": "Alpha-L-fucosidase",
+    "a羟丁酸脱氢酶": "Alpha-hydroxybutyrate dehydrogenase",
+    "乳酸脱氢酶": "Lactate dehydrogenase",
+    "总胆固醇": "Total cholesterol",
+    "总胆汁酸": "Total bile acids",
+    "总蛋白": "Total protein",
+    "白球比": "Albumin/globulin ratio",
+    "肌酸激酶": "Creatine kinase",
+    "肌酸激酶同工酶": "Creatine kinase isoenzyme",
+    "胆碱酯酶": "Cholinesterase",
+    "腺苷脱氨酶": "Adenosine deaminase",
+    "血清低密度脂蛋白": "Serum LDL",
+    "血清球蛋白": "Serum globulin",
+    "血清高密度脂蛋白": "Serum HDL",
+    "谷草_谷丙比值": "AST/ALT ratio",
+    "间接胆红素": "Indirect bilirubin",
+    "完整病例无事件": "No events among complete cases",
+    "完整病例不足两个有患者的簇": "Fewer than two occupied clusters among complete cases",
+    "当前数据集没有训练集确定的参考簇": "Training-defined reference cluster absent",
+}
+
+
+def english_label(value: str) -> str:
+    """只翻译展示标签，不改变原始字段、类别顺序或统计分组。"""
+    label = ENGLISH_LABELS.get(value, value.replace("_", " "))
+    if re.search(r"[\u3400-\u9fff]", label):
+        raise ValueError(f"缺少绘图标签的英文翻译：{value}")
+    return label
 
 
 def save_figure(figure: Figure, stem: Path, dpi: int) -> None:
-    """每张图同时提供屏幕PNG和可排版PDF。"""
+    """每张图提供PNG和可编辑PDF/SVG，不自动栅格化色条。"""
     stem.parent.mkdir(parents=True, exist_ok=True)
+    for collection in figure.findobj(match=Collection):
+        collection.set_rasterized(False)
     figure.savefig(stem.with_suffix(".png"), dpi=dpi, bbox_inches="tight")
     figure.savefig(stem.with_suffix(".pdf"), bbox_inches="tight")
+    figure.savefig(stem.with_suffix(".svg"), bbox_inches="tight")
     plt.close(figure)
 
 
@@ -41,12 +176,12 @@ def plot_cluster_sizes(table: pd.DataFrame, colors: dict[int, Any], stem: Path, 
         axis.bar_label(
             bars,
             labels=[
-                f"{n}人\n{p:.1f}%" for n, p in zip(subset["人数"], subset["占比（%）"], strict=True)
+                f"n={n}\n{p:.1f}%" for n, p in zip(subset["人数"], subset["占比（%）"], strict=True)
             ],
             padding=3,
         )
-        axis.set(title=name, xlabel="簇", ylabel="患者占比（%）", ylim=(0, 110))
-    figure.suptitle("最终模型的簇规模")
+        axis.set(title=english_label(name), xlabel="Cluster", ylabel="Patients (%)", ylim=(0, 110))
+    figure.suptitle("Cluster sizes")
     figure.tight_layout()
     save_figure(figure, stem, dpi)
 
@@ -80,8 +215,8 @@ def plot_umap(
                 s=8,
                 alpha=0.65,
                 color=color,
-                label=f"簇{cluster}",
-                rasterized=True,
+                label=f"Cluster {cluster}",
+                rasterized=False,
             )
         axes[0, column].legend(markerscale=2, fontsize=9)
         scatter = axes[1, column].scatter(
@@ -95,13 +230,14 @@ def plot_umap(
             rasterized=True,
         )
         for row in range(2):
-            axes[row, column].set(
-                title=SPLIT_LABELS.get(name, name), xlabel="UMAP 1", ylabel="UMAP 2"
-            )
+            axes[row, column].set(title=english_label(name), xlabel="UMAP 1", ylabel="UMAP 2")
     if scatter is not None:
-        figure.colorbar(scatter, ax=list(axes[1]), label="预测风险（越高越危险）", shrink=0.8)
+        figure.colorbar(
+            scatter, ax=list(axes[1]), label="Predicted risk (higher = greater risk)", shrink=0.8
+        )
     figure.suptitle(
-        "潜空间结构：上排按簇，下排按预测风险\nUMAP仅在训练集拟合；二维分离不代表聚类有效性"
+        "Latent space: clusters (top) and predicted risk (bottom)\n"
+        "UMAP fitted on training data only; 2D separation does not establish cluster validity"
     )
     save_figure(figure, stem, dpi)
 
@@ -114,7 +250,10 @@ def plot_confidence(
     )
     for column, (name, frame) in enumerate(frames.items()):
         for row, (metric, label) in enumerate(
-            (("confidence", "最大簇后验概率"), ("entropy", "归一化后验熵"))
+            (
+                ("confidence", "Maximum cluster probability"),
+                ("entropy", "Normalized posterior entropy"),
+            )
         ):
             sns.boxplot(
                 data=frame,
@@ -129,9 +268,11 @@ def plot_confidence(
                 ax=axes[row, column],
             )
             axes[row, column].set(
-                title=SPLIT_LABELS.get(name, name), xlabel="簇", ylabel=label, ylim=(0, 1.03)
+                title=english_label(name), xlabel="Cluster", ylabel=label, ylim=(0, 1.03)
             )
-    figure.suptitle("簇分配不确定性（箱线图不显示离群点，统计包含全部患者）")
+    figure.suptitle(
+        "Cluster assignment uncertainty (outliers hidden; summaries include all patients)"
+    )
     save_figure(figure, stem, dpi)
 
 
@@ -150,11 +291,13 @@ def plot_km(
                 ax=axis, color=colors[cluster], ci_show=True, show_censors=True
             )
         p_value = summaries[name]["总体log-rank_p值"]
-        text = f"总体log-rank p={p_value:.3g}" if p_value is not None else "log-rank不可计算"
+        text = (
+            f"Overall log-rank p={p_value:.3g}" if p_value is not None else "Log-rank unavailable"
+        )
         axis.set(
-            title=f"{SPLIT_LABELS.get(name, name)}\n{text}",
-            xlabel="landmark后月份",
-            ylabel=f"{outcome.upper()}生存率",
+            title=f"{english_label(name)}\n{text}",
+            xlabel="Months after landmark",
+            ylabel=f"{outcome.upper()} survival probability",
             ylim=(0, 1.03),
             xlim=(0, None),
         )
@@ -165,15 +308,8 @@ def plot_km(
             ypos=-0.4,
             at_risk_count_from_start_of_period=True,
         )
-    figure.suptitle("各簇Kaplan–Meier生存曲线（阴影为95% CI）")
+    figure.suptitle("Kaplan–Meier survival by cluster (shading: 95% CI)")
     figure.subplots_adjust(bottom=0.3, top=0.85, wspace=0.3)
-    # lifelines固定的英文风险表标签在该图中统一翻译。
-    for axis in figure.axes:
-        labels = [
-            label.get_text().replace("At risk", "风险人数") for label in axis.get_xticklabels()
-        ]
-        if any("风险人数" in label for label in labels):
-            axis.set_xticks(axis.get_xticks(), labels=labels)
     save_figure(figure, stem, dpi)
 
 
@@ -193,7 +329,7 @@ def plot_cox(
             axis.text(
                 0.5,
                 0.5,
-                summary["不可计算原因"],
+                english_label(summary["不可计算原因"]),
                 ha="center",
                 va="center",
                 transform=axis.transAxes,
@@ -222,15 +358,18 @@ def plot_cox(
         axis.set(
             yticks=range(len(rows)),
             yticklabels=[
-                f"簇{int(row['簇'])}" + ("（参考）" if row["参考簇"] else "")
+                f"Cluster {int(row['簇'])}" + (" (reference)" if row["参考簇"] else "")
                 for _, row in rows.iterrows()
             ],
-            xlabel="调整HR及95% CI（对数刻度）",
-            title=SPLIT_LABELS.get(name, name),
+            xlabel="Adjusted HR with 95% CI (log scale)",
+            title=english_label(name),
             ylim=(-0.6, len(rows) - 0.4),
         )
         axis.invert_yaxis()
-    figure.suptitle("簇间调整后生存关联\n调整年龄、性别、AJCC分期、原发部位；参考簇由训练集确定")
+    figure.suptitle(
+        "Adjusted survival association by cluster\n"
+        "Adjusted for age, sex, AJCC stage and primary site; reference defined in training data"
+    )
     save_figure(figure, stem, dpi)
 
 
@@ -266,11 +405,13 @@ def plot_numeric_baseline(
                 ax=axis,
             )
             axis.set(
-                xlabel="簇",
-                ylabel=BASELINE_LABELS.get(variable, variable),
-                title=SPLIT_LABELS.get(name, name),
+                xlabel="Cluster",
+                ylabel=english_label(variable),
+                title=english_label(name),
             )
-    figure.suptitle("连续基线特征（统计含全部有效值；箱线图不显示离群点）")
+    figure.suptitle(
+        "Continuous baseline characteristics (all observed values summarized; outliers hidden)"
+    )
     save_figure(figure, stem, dpi)
 
 
@@ -300,12 +441,18 @@ def plot_categorical_baseline(
             bottom = np.zeros(n_clusters)
             for level, color in zip(levels, palette, strict=True):
                 values = proportions[level].to_numpy()
-                axis.bar(np.arange(n_clusters), values, bottom=bottom, color=color, label=level)
+                axis.bar(
+                    np.arange(n_clusters),
+                    values,
+                    bottom=bottom,
+                    color=color,
+                    label=english_label(level),
+                )
                 bottom += values
             axis.set(
-                title=f"{SPLIT_LABELS.get(name, name)}：{BASELINE_LABELS.get(variable, variable)}",
-                xlabel="簇",
-                ylabel="簇内比例（%，含缺失）",
+                title=f"{english_label(name)}: {english_label(variable)}",
+                xlabel="Cluster",
+                ylabel="Within-cluster proportion (%; missing included)",
                 xticks=range(n_clusters),
                 ylim=(0, 100),
             )
@@ -339,7 +486,7 @@ def plot_trajectories(
                 rows["中位数"].to_numpy(dtype=float),
                 marker=".",
                 color=color,
-                label=f"簇{cluster}",
+                label=f"Cluster {cluster}",
             )
             axis.fill_between(
                 x,
@@ -348,13 +495,20 @@ def plot_trajectories(
                 color=color,
                 alpha=0.15,
             )
-        axis.set(title=feature, xlabel="术后月份", ylabel="原始尺度中位数（IQR）")
+        axis.set(
+            title=english_label(feature),
+            xlabel="Months after surgery",
+            ylabel="Median (IQR), original scale",
+        )
         axis.grid(alpha=0.2)
     for axis in list(axes.flat)[len(features) :]:
         axis.set_axis_off()
     handles, labels = axes.flat[0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="outside lower center", ncols=len(colors))
-    figure.suptitle(title + "\n先取患者箱内中位数，再汇总各簇；缺失箱不连线，样本量见Excel")
+    figure.suptitle(
+        english_label(title) + "\nPatient medians within bins, then cluster summaries; "
+        "gaps remain unconnected; sample sizes in workbook"
+    )
     save_figure(figure, stem, dpi)
 
 
@@ -386,11 +540,17 @@ def plot_trajectory_coverage(
             cmap="viridis",
             ax=axis,
             cbar=cluster == list(colors)[-1],
-            cbar_kws={"label": "覆盖率（%）"},
+            cbar_kws={"label": "Coverage (%)"},
+            yticklabels=[english_label(feature) for feature in features],
         )
-        axis.set(title=f"簇{cluster}", xlabel="术后月份（时间箱中点）", ylabel="特征")
+        axis.set(
+            title=f"Cluster {cluster}",
+            xlabel="Months after surgery (bin midpoint)",
+            ylabel="Feature",
+        )
     figure.suptitle(
-        title + "：轨迹覆盖率\n分母为该数据集该簇全部患者；分子为箱内该特征至少一次观测的患者"
+        english_label(title) + ": trajectory coverage\n"
+        "Patients with at least one feature measurement per bin / all patients in the cluster"
     )
     save_figure(figure, stem, dpi)
 
@@ -402,24 +562,31 @@ def plot_survival_metrics(
     positions = np.arange(len(metrics))
     for offset, metric, label in [
         (-0.18, "Harrell_C-index", "Harrell"),
-        (0.18, "IPCW_C-index", f"IPCW（{months[-1]}月内）"),
+        (0.18, "IPCW_C-index", f"IPCW (within {months[-1]} months)"),
     ]:
         bars = axes[0].bar(
             positions + offset, metrics[metric].astype(float), width=0.36, label=label
         )
         axes[0].bar_label(bars, fmt="%.3f", fontsize=8)
-    axes[0].set(xticks=positions, xticklabels=metrics["数据集"], ylim=(0, 1), ylabel="C-index")
+    axes[0].set(
+        xticks=positions,
+        xticklabels=[english_label(name) for name in metrics["数据集"]],
+        ylim=(0, 1),
+        ylabel="C-index",
+    )
     axes[0].legend()
     for name, rows in curves.groupby("数据集", sort=False):
-        axes[1].plot(rows["月份"], rows["动态AUC"], label=name)
-        axes[2].plot(rows["月份"], rows["Brier"], label=name)
-    for axis, ylabel in zip(axes[1:], ("动态AUC", "Brier分数"), strict=True):
+        axes[1].plot(rows["月份"], rows["动态AUC"], label=english_label(str(name)))
+        axes[2].plot(rows["月份"], rows["Brier"], label=english_label(str(name)))
+    for axis, ylabel in zip(axes[1:], ("Time-dependent AUC", "Brier score"), strict=True):
         for month in months:
             axis.axvline(month, color=".7", linestyle=":", linewidth=0.8)
-        axis.set(xlabel="landmark后月份", ylabel=ylabel, ylim=(0, 1), xticks=months)
+        axis.set(xlabel="Months after landmark", ylabel=ylabel, ylim=(0, 1), xticks=months)
         axis.legend()
         axis.grid(alpha=0.2)
-    figure.suptitle("个体生存预测表现（删失分布仅由训练集估计）")
+    figure.suptitle(
+        "Individual survival prediction (censoring distribution estimated from training data only)"
+    )
     save_figure(figure, stem, dpi)
 
 
@@ -457,14 +624,16 @@ def plot_calibration(table: pd.DataFrame, stem: Path, dpi: int) -> None:
                     fontsize=8,
                 )
             axis.set(
-                title=f"{name}：{month}个月",
-                xlabel="平均预测生存率",
-                ylabel="KM观察生存率（95% CI）",
+                title=f"{english_label(name)}: {month} months",
+                xlabel="Mean predicted survival probability",
+                ylabel="Observed KM survival probability (95% CI)",
                 xlim=(0, 1),
                 ylim=(0, 1),
             )
             axis.set_aspect("equal")
-    figure.suptitle("生存校准：按各时间点预测生存率分位分组")
+    figure.suptitle(
+        "Survival calibration: quantile groups of predicted survival at each time point"
+    )
     save_figure(figure, stem, dpi)
 
 
@@ -476,8 +645,8 @@ def plot_overall_survival(table: pd.DataFrame, stem: Path, dpi: int) -> None:
     for axis, name in zip(axes.flat, datasets, strict=True):
         rows = table.loc[table["数据集"].eq(name)]
         x = rows["月份"].to_numpy(dtype=float)
-        axis.plot(x, rows["平均预测生存率"], label="平均预测生存率")
-        axis.step(x, rows["KM生存率"], where="post", label="KM观察生存率")
+        axis.plot(x, rows["平均预测生存率"], label="Mean predicted survival")
+        axis.step(x, rows["KM生存率"], where="post", label="Observed KM survival")
         axis.fill_between(
             x,
             rows["95%CI下限"].to_numpy(dtype=float),
@@ -485,36 +654,41 @@ def plot_overall_survival(table: pd.DataFrame, stem: Path, dpi: int) -> None:
             step="post",
             alpha=0.2,
         )
-        axis.set(title=name, xlabel="landmark后月份", ylabel="生存率", ylim=(0, 1.03))
+        axis.set(
+            title=english_label(name),
+            xlabel="Months after landmark",
+            ylabel="Survival probability",
+            ylim=(0, 1.03),
+        )
         axis.legend()
-    figure.suptitle("整体预测与观察生存曲线（阴影为KM的95% CI）")
+    figure.suptitle("Overall predicted and observed survival (shading: KM 95% CI)")
     save_figure(figure, stem, dpi)
 
 
 def plot_training(history: pd.DataFrame, stem: Path, dpi: int) -> None:
     figure, axes = plt.subplots(2, 3, figsize=(16, 9), layout="constrained")
     panels = [
-        ("reconstruction_loss", "原始重构损失"),
-        ("survival_loss", "原始生存损失"),
-        ("vade_kl_loss", "原始聚类损失"),
-        ("loss", "加权总损失"),
+        ("reconstruction_loss", "Raw reconstruction loss"),
+        ("survival_loss", "Raw survival loss"),
+        ("vade_kl_loss", "Raw clustering loss"),
+        ("loss", "Weighted total loss"),
         ("cindex", "C-index"),
     ]
     for axis, (metric, title) in zip(axes.flat, panels, strict=False):
-        for prefix, label in [("", "训练"), ("val_", "验证")]:
+        for prefix, label in [("", "Training"), ("val_", "Validation")]:
             if prefix + metric in history:
                 axis.plot(history["global_epoch"], history[prefix + metric], label=label)
-        axis.set(title=title, xlabel="全局epoch")
+        axis.set(title=title, xlabel="Global epoch")
         axis.legend()
     weight_axis = axes.flat[-1]
     for metric, label in [
-        ("reconstruction_loss_weight", "重构"),
-        ("survival_loss_weight", "生存"),
-        ("vade_kl_loss_weight", "聚类"),
+        ("reconstruction_loss_weight", "Reconstruction"),
+        ("survival_loss_weight", "Survival"),
+        ("vade_kl_loss_weight", "Clustering"),
     ]:
         if metric in history:
             weight_axis.plot(history["global_epoch"], history[metric], label=label)
-    weight_axis.set(title="学习到的损失权重", xlabel="全局epoch")
+    weight_axis.set(title="Loss weights", xlabel="Global epoch")
     weight_axis.legend()
     changes = history.loc[history["stage"].ne(history["stage"].shift())]
     checkpoint = (
@@ -528,53 +702,57 @@ def plot_training(history: pd.DataFrame, stem: Path, dpi: int) -> None:
                 changes["global_epoch"].iloc[1] - 0.5,
                 linestyle="--",
                 color=".5",
-                label="warmup结束",
+                label="End of warmup",
             )
         if checkpoint is not None:
-            axis.axvline(checkpoint, linestyle=":", color="#009E73", label="保存检查点")
+            axis.axvline(checkpoint, linestyle=":", color="#009E73", label="Saved checkpoint")
         axis.grid(alpha=0.2)
     axes.flat[0].legend(fontsize=8)
-    figure.suptitle("最终模型训练过程；总损失的下降应结合原始分量和权重解释")
+    figure.suptitle(
+        "Model training history; interpret total loss together with raw components and weights"
+    )
     save_figure(figure, stem, dpi)
 
 
-def plot_k_selection(
-    runs: pd.DataFrame, summary: pd.DataFrame, selected_k: int, minimum: float, stem: Path, dpi: int
-) -> None:
-    figure, axes = plt.subplots(2, 2, figsize=(12, 9), layout="constrained")
-    for axis, metric, title in zip(
-        axes.flat,
-        ["selection_score", "cindex", "cluster_min_fraction", "cluster_empty_count"],
-        ["验证选择分数", "验证C-index", "验证最小簇比例", "验证空簇数"],
-        strict=True,
-    ):
-        for seed, rows in runs.groupby("seed", sort=True):
-            axis.plot(rows["n_clusters"], rows[metric], ".--", alpha=0.6, label=str(seed))
-        axis.axvline(selected_k, color="black", linestyle=":", label="选中K")
-        axis.set(title=title, xlabel="候选K", xticks=summary["n_clusters"])
-        axis.grid(alpha=0.2)
-    axes[0, 0].errorbar(
-        summary["n_clusters"],
-        summary["mean_selection_score"],
-        yerr=summary["se_selection_score"],
-        color="black",
-        fmt="o-",
-        label="跨seed均值±SE",
+def plot_k_metrics(runs: pd.DataFrame, minimum: float, stem: Path, dpi: int) -> None:
+    """各数据集分别展示原始指标，取消排名和自动入选标记。"""
+    datasets = runs["dataset"].drop_duplicates().tolist()
+    metrics = [
+        ("cindex", "C-index"),
+        ("latent_mixture_bic", "Latent-mixture BIC"),
+        ("cluster_min_fraction", "Minimum cluster fraction"),
+        ("cluster_empty_count", "Empty clusters"),
+    ]
+    figure, axes = plt.subplots(
+        len(datasets), 4, figsize=(17, 4 * len(datasets)), squeeze=False, layout="constrained"
     )
-    passes = summary.loc[summary["passes_gate"]]
-    axes[0, 0].scatter(
-        passes["n_clusters"],
-        passes["mean_selection_score"],
-        s=140,
-        facecolors="none",
-        edgecolors="#009E73",
-        linewidths=2,
-        label="通过全部seed门槛",
+    for row, name in enumerate(datasets):
+        subset = runs.loc[runs["dataset"].eq(name)]
+        for axis, (metric, title) in zip(axes[row], metrics, strict=True):
+            if metric not in subset:
+                axis.text(
+                    0.5,
+                    0.5,
+                    "Not available in historical run",
+                    transform=axis.transAxes,
+                    ha="center",
+                )
+            else:
+                for seed, values in subset.groupby("seed"):
+                    values = values.sort_values("n_clusters")
+                    axis.plot(values["n_clusters"], values[metric], "o-", label=f"Seed {seed}")
+                axis.legend(fontsize=7)
+            if metric == "cluster_min_fraction":
+                axis.axhline(minimum, color="#D55E00", linestyle="--", linewidth=0.8)
+            axis.set(
+                title=f"{english_label(name)}: {title}",
+                xlabel="Number of clusters (K)",
+                xticks=sorted(subset["n_clusters"].unique()),
+            )
+            axis.grid(alpha=0.15)
+    figure.suptitle(
+        "Candidate-model metrics: manual K choice; test-informed comparisons are exploratory"
     )
-    axes[1, 0].axhline(minimum, color="red", linestyle="--", label=f"{minimum:.0%}门槛")
-    axes[1, 0].legend(fontsize=8)
-    axes[0, 0].legend(fontsize=8)
-    figure.suptitle("K选择诊断（展示既有选择，不重新选K或seed）")
     save_figure(figure, stem, dpi)
 
 
@@ -584,15 +762,28 @@ def plot_stability(pairs: pd.DataFrame, selected_k: int, stem: Path, dpi: int) -
         mean=("ARI", "mean"), min=("ARI", "min"), max=("ARI", "max")
     )
     x = summary.index.to_numpy(dtype=int)
-    axes[0].plot(x, summary["mean"], "o-", label="两两ARI均值")
+    axes[0].plot(x, summary["mean"], "o-", label="Mean pairwise ARI")
     axes[0].fill_between(
-        x, summary["min"].to_numpy(), summary["max"].to_numpy(), alpha=0.2, label="最小–最大范围"
+        x,
+        summary["min"].to_numpy(),
+        summary["max"].to_numpy(),
+        alpha=0.2,
+        label="Minimum–maximum range",
     )
     invalid = pairs.loc[~pairs["两候选均通过占用门槛"]]
-    axes[0].scatter(invalid["K"], invalid["ARI"], color="red", marker="x", label="含退化候选的比较")
-    axes[0].axvline(selected_k, color="black", linestyle=":")
+    axes[0].scatter(
+        invalid["K"],
+        invalid["ARI"],
+        color="red",
+        marker="x",
+        label="Comparison includes degenerate candidates",
+    )
     axes[0].set(
-        xlabel="候选K", ylabel="ARI", xticks=x, ylim=(-1, 1.05), title="固定验证集上的跨seed一致性"
+        xlabel="Candidate K",
+        ylabel="ARI",
+        xticks=x,
+        ylim=(-1, 1.05),
+        title="Cross-seed agreement on frozen validation data",
     )
     axes[0].legend(fontsize=8)
     selected = pairs.loc[pairs["K"].eq(selected_k)]
@@ -613,6 +804,9 @@ def plot_stability(pairs: pd.DataFrame, selected_k: int, stem: Path, dpi: int) -
             square=True,
             ax=axes[1],
         )
-    axes[1].set_title(f"选中K={selected_k}：两两ARI")
-    figure.suptitle("稳定性附录候选图；ARI需结合空簇和最小簇占比解释")
+    axes[1].set_title(f"Evaluated K={selected_k}: pairwise ARI")
+    figure.suptitle(
+        "Stability appendix: interpret ARI together with empty clusters "
+        "and minimum cluster fraction"
+    )
     save_figure(figure, stem, dpi)

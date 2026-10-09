@@ -389,7 +389,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv run pytest
 ```
 
 
-## CRC 云南六阶段流程
+## CRC 云南建模与绘图流程
 
 新产物使用 `v2`，旧目录不覆盖。观测表统一为中格式：
 `patient_id,time_days,特征1,特征2,...`；缺失观测保留 NaN。
@@ -400,7 +400,8 @@ uv run python -m scripts.crc_yunnan.02_eda
 uv run python -m scripts.crc_yunnan.03_split
 uv run python -m scripts.crc_yunnan.04_preproc
 uv run python -m scripts.crc_yunnan.05_run
-uv run python -m scripts.crc_yunnan.06_evaluate inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling
+uv run python -m scripts.crc_yunnan.06_figure inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling n_clusters=5
+uv run python -m scripts.crc_yunnan.07_supplementary inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling n_clusters=5
 ```
 
 01 完成基础清洗与纳排，另存特征分组和中文排除汇总。02 输出中文
@@ -535,31 +536,68 @@ K本身只用train/validation选择，代表seed沿用05的验证指标排序。
 模型、预测及患者表留在执行服务器。
 `--dry-run`只解析候选配置，不读取真实数据、创建结果目录或启动训练。
 
-### 评价与可视化
+### 候选指标、正文图与补充图
 
-06 用 `CRCEvaluationConfig` 解析 Hydra 配置，只需指定 `inputs.run_dir`。它从 05
-运行清单追溯 04 数据、01 特征分组及候选模型，沿用已锁定的 K、seed、结局、
-面板和 landmark。默认评价 train、validation、test；单集使用 `'datasets=[train]'`。
-默认输出建模目录同级的 `evaluation/`，日志位于 `logs/06_evaluate/`，拒绝覆盖旧结果。
+05 使用同一个 `run.yaml`，默认串行训练 K2–10、seed20260908。
+`n_clusters=5` 或 `'n_clusters=[2,5]'` 控制候选K，`'seeds=[20260908]'` 控制模型seed。
+所有模型训练完成后才读取test，报告三集 C-index、潜空间混合 BIC/NLL、簇占用、
+人数和事件数。无自动入选K、最佳seed或综合排名。空簇和最小占比5%只作为诊断，
+不阻止明确指定的候选评价。test不参与训练/早停；人工参考test指标选择K属于探索。
 
-产物包括中文 `evaluation_summary.json`、一个 `evaluation_tables.xlsx`，以及 PNG/PDF
-图：簇规模、后验置信度/熵、UMAP、KM及风险人数、校正Cox、全部基线变量、全部面板
-特征的轨迹和覆盖率、生存预测/校准、训练过程、K选择和跨seed ARI。单张长绘图封装
-于 `evaluation_plots.py`；各数据集复用的统计位于 `evaluation.py`。
+模型与历史位于 `models/seed-<seed>/k<K>/`，各数据集预测也在该候选目录下。
+根目录 `run_metrics.csv` 保存逐seed/K/数据集指标，`k_summary.csv` 保存跨seed均值、
+标准差及占簇诊断，`run_manifest.json`（schema 3）引用全部候选。
 
-- UMAP仅在训练embedding上拟合，其他集调用同一投影器的transform；二维形状不作为
-  聚类质量证明。所有图沿用05簇编号，按簇着色时保持一致。
-- Cox调整年龄（每10岁）、性别、AJCC分期及原发部位；参考簇由训练平均预测风险
-  最低者确定。结果属于调整后的描述性关联，不自动删协变量或增加惩罚。
-- 临床变量报告缺失人数、连续变量中位数/IQR和分类人数/比例；总体检验使用
-  Kruskal–Wallis、χ²或稀疏表Monte Carlo Fisher，每个数据集内作BH校正。
-- 轨迹按04保存的参数逆变换到原始尺度，术后至landmark每90天分箱，末箱包含
-  landmark。先取患者箱内中位数再取簇中位数/IQR；覆盖率分母为该集该簇全部患者。
-- 生存时间从landmark起算，每月30天。报告05同口径Harrell C-index、60个月截断
-  IPCW C-index、1–60个月动态AUC/Brier/IBS，以及12/36/60个月的分位组KM校准。
-  删失分布仅来自训练集；不支持的时间点保留并标记原因，不自动缩短积分区间。
-- ARI在同一冻结验证集上逐个加载全部候选模型推理，不重训、不重新选择K或seed。
-  固定K无候选结果时跳过该部分；ARI结合空簇和最小簇比例解释。
+06与07独立读取05，均必须显式传入K。默认各自输出到同级 `figure/`、
+`supplementary/` 下的 `k<K>/`，日志分别在 `logs/06_figure/`、
+`logs/07_supplementary/`。只有一个模型seed时推断使用；多个seed须指定
+`model_seed`。图件/统计随机seed由 `seed` 和 `umap.seed` 分别控制，不选择模型seed。
+历史schema-2模型及候选也可以读取；历史未保存预测的候选在冻结数据上推理，不训练。
 
-输出仅含聚合结果，不导出患者级embedding坐标。真实数据评价在远端运行；模型、
-预测和患者表留在远端，结果取回范围遵守该轮分析的授权。
+```bash
+uv run python -m scripts.crc_yunnan.05_run \
+  split.dir=data/derived/crc_yunnan/<04产物目录> \
+  'n_clusters=[2,5]' 'seeds=[20260908]' \
+  paths.dir=outputs/crc_yunnan/<运行名>/modeling
+
+uv run python -m scripts.crc_yunnan.06_figure \
+  inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling \
+  'n_clusters=[2,5]' model_seed=20260908
+
+uv run python -m scripts.crc_yunnan.07_supplementary \
+  inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling \
+  'n_clusters=[2,5]' model_seed=20260908
+```
+
+以上是未执行的示例；实际运行前将确切命令追加至 `history.sh`。
+
+06 的 `figure.yaml` 默认复现认可的六面板结构：稀疏临床设置、阶段画像、
+代表轨迹、验证/测试UMAP、验证/测试窄高KM，以及测试集调整Cox。
+每个K输出 `Figure_K<K>.pdf/svg/png`、`SourceData.xlsx`、
+`figure_summary.json` 和 `resolved_config.yaml`；PNG默认600 dpi，文字可编辑。
+180×215 mm为基准，指标、簇或展示集增加时扩展布局。图内全部为英文。
+`figure.atlas` / `figure.trajectories` 明确配置 feature、英文label、原始unit和
+线性/log轴；缺失指标不会被自动省略。改用G14等面板时须先修改这些列表，
+不推测单位。`figure.phase_days` 默认 [0,90,360,720]，必须覆盖模型窗口；
+各面板数据集由 profile_dataset、display_datasets、cox_dataset 明确控制。
+
+07 的 `supplementary.yaml` 保留完整临床检验、全指标轨迹/覆盖、占簇/置信度、
+UMAP、KM/Cox、预测/校准、训练历史、候选指标和跨seed验证集ARI。
+输出中文 `evaluation_tables.xlsx` / `evaluation_summary.json`、英文PNG/PDF/SVG，
+以及根目录 `k_comparison.csv`。单seed不计算稳定性，摘要明确说明原因。
+候选指标图分别展示各数据集，不标记自动入选K。
+
+- UMAP仅拟合训练latent mean，再投影其他集；同一模型两入口使用同样参数、颜色及簇编号，
+  不导出坐标。二维分离不证明聚类有效性或稳定性。
+- 阶段画像及时间箱轨迹均先计算患者中位数，再计算簇中位数/IQR；不插值，
+  不平均已有箱中位数。画像沿用04训练尺度，轨迹按既有参数逆变换。
+  正文 n<10 灰显并断线，完整统计与覆盖率保留在Source Data。
+- KM及95%CI来自完整随访；显示0–60个月不改变log-rank或Cox。风险人数按
+  survival_time >= month*30计算。Cox沿用年龄、性别、分期、原发部位及完整病例，
+  参考簇由训练平均预测风险确定，不能固定为历史C3，也不自动加惩罚。
+- 临床总体检验及BH校正、生存预测时间点和train-only IPCW沿用原评价口径。
+  不支持的指标保留null和原因；真正的计算错误保留原始traceback。
+- 明确指定的低占簇K可以评价，但摘要保留诊断；已查看的test及test-informed人工K选择
+  不构成新的独立验证。患者数据、模型和预测留远端，仅取回授权聚合产物。
+- 共用计算位于 `evaluation.py`，单图位于 `evaluation_plots.py`，
+  正文组图位于 `figure_plots.py`；旧06_evaluate入口及evaluate.yaml已移除。

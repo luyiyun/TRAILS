@@ -1,6 +1,9 @@
 # @package _global_
 inputs:
   run_dir: ???
+# 必须明确指定K；多个模型seed时须提供model_seed。
+n_clusters: ???
+model_seed: null
 datasets: [train, validation, test]
 columns:
   numeric_baseline: [Preoperative_CEA, Preoperative_CA242, Age]
@@ -23,10 +26,10 @@ seed: 20260908
 device: cuda:0
 plot:
   dpi: 220
-  font_families: ["Noto Sans CJK SC", "Noto Sans CJK JP", "PingFang SC", "Songti SC", "Microsoft YaHei", "SimHei"]
+  font_families: ["DejaVu Sans", "Arial", "Liberation Sans"]
 paths:
-  dir: ${inputs.run_dir}/../evaluation
-  run_dir: ${inputs.run_dir}/../logs/06_evaluate
+  dir: ${inputs.run_dir}/../supplementary
+  run_dir: ${inputs.run_dir}/../logs/07_supplementary
 hydra:
   job:
     chdir: false

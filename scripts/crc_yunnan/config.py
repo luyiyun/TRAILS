@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator
-from scripts.configs import FrozenSplitConfig, TrailsApplicationConfig
+from scripts.configs import FrozenSplitConfig
 
-from trails import ModelConfig, TrainerConfig
+from trails_simulate.config import OutputPathsConfig, TrainingConfig
 
 BASELINE_LABELS = {
     "Preoperative_CEA": "术前CEA",
@@ -39,10 +39,27 @@ class CRCRunRuntimeConfig(BaseModel):
     cudnn_allow_tf32: bool | None = None
 
 
-class CRCRunConfig(TrailsApplicationConfig):
-    """冻结划分建模配置，补充CRC实验的线程和GPU计算设置。"""
+class CRCRunConfig(TrainingConfig):
+    """逐个训练seed/K并报告指标，不自动选择代表模型。"""
 
+    split: FrozenSplitConfig
+    n_clusters: (
+        Annotated[int, Field(ge=2)]
+        | Annotated[list[Annotated[int, Field(ge=2)]], Field(min_length=1)]
+    )
+    seeds: list[Annotated[int, Field(ge=0, lt=2**32)]] = Field(min_length=1)
+    min_cluster_fraction: FiniteFloat = Field(ge=0, le=1)
+    paths: OutputPathsConfig
+    description: str
     runtime: CRCRunRuntimeConfig = Field(default_factory=CRCRunRuntimeConfig)
+
+    @model_validator(mode="after")
+    def validate_runs(self) -> Self:
+        if isinstance(self.n_clusters, list) and len(set(self.n_clusters)) != len(self.n_clusters):
+            raise ValueError("n_clusters不能重复")
+        if len(set(self.seeds)) != len(self.seeds):
+            raise ValueError("seeds不能重复")
+        return self
 
 
 class CohortPathsConfig(BaseModel):
@@ -92,6 +109,23 @@ class CohortColumnsConfig(BaseModel):
         return value
 
 
+class ObservationValueBounds(BaseModel):
+    """原始检测值的可选上下界；端点保留，不进行单位换算。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    min: FiniteFloat | None = None
+    max: FiniteFloat | None = None
+
+    @model_validator(mode="after")
+    def validate_interval(self) -> Self:
+        if self.min is None and self.max is None:
+            raise ValueError("检测值范围至少需要一个界限")
+        if self.min is not None and self.max is not None and self.min > self.max:
+            raise ValueError("检测值下界不能大于上界")
+        return self
+
+
 class CohortProcessingConfig(BaseModel):
     """基础清洗选项及数值约束，在读取数据前完成校验。"""
 
@@ -107,6 +141,9 @@ class CohortProcessingConfig(BaseModel):
     max_outcome_days: FiniteFloat | None = Field(gt=0)
     outcome_time_unit_days: int = Field(gt=0)
     refuse_overwrite: bool
+    observation_value_bounds: dict[CohortColumnName, ObservationValueBounds] = Field(
+        default_factory=dict
+    )
 
 
 class CohortDateCorrectionsConfig(BaseModel):
@@ -407,18 +444,20 @@ class EvaluationSurvivalConfig(BaseModel):
         return self
 
 
-class CRCEvaluationConfig(BaseModel):
-    """06的统计和绘图选项；结局、landmark及面板沿用05。"""
+class CRCPostprocessConfig(BaseModel):
+    """06/07共用的显式模型请求；结局、landmark及面板沿用05。"""
 
     model_config = ConfigDict(extra="forbid")
     inputs: EvaluationInputsConfig
+    n_clusters: (
+        Annotated[int, Field(ge=2)]
+        | Annotated[list[Annotated[int, Field(ge=2)]], Field(min_length=1)]
+    )
+    model_seed: Annotated[int, Field(ge=0, lt=2**32)] | None = None
     datasets: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
-    columns: EDAColumnsConfig
     umap: EvaluationUMAPConfig
     survival: EvaluationSurvivalConfig
     trajectory_bin_days: int = Field(gt=0)
-    trajectory_panels_per_page: int = Field(ge=1, le=24)
-    fisher_resamples: int = Field(ge=100)
     seed: int = Field(ge=0, lt=2**32)
     device: str = Field(min_length=1)
     plot: EDAPlotConfig
@@ -426,6 +465,8 @@ class CRCEvaluationConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_requests(self) -> Self:
+        if isinstance(self.n_clusters, list) and len(set(self.n_clusters)) != len(self.n_clusters):
+            raise ValueError("n_clusters不能重复")
         if len(set(self.datasets)) != len(self.datasets):
             raise ValueError("datasets不能重复")
         output, logs = self.paths.dir.resolve(), self.paths.run_dir.resolve()
@@ -437,130 +478,69 @@ class CRCEvaluationConfig(BaseModel):
         return self
 
 
-class CRCSearchRecipe(BaseModel):
-    """07的配方因子；组合采样后统一校验并规范化不适用选项。"""
+class CRCSupplementaryConfig(CRCPostprocessConfig):
+    """07完整统计、补充图和候选K比较。"""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    warmup: Literal[0, 10, 30, 100] = 10
-    objective: Literal["reconstruction_survival", "reconstruction"] = "reconstruction_survival"
-    initialization: Literal["legacy5", "legacy50", "kmeans", "kmeans_global", "gmm"] = "legacy5"
-    variance_floor: float = Field(default=0.0001, gt=0)
-    prior: Literal["empirical", "uniform"] = "empirical"
-    train_prior: bool = False
-    reset_head: bool = False
-    reset_optimizer: bool = False
-    weighting: Literal[
-        "uncertainty_continue", "fixed", "uncertainty_reset", "uncertainty_freeze"
-    ] = "uncertainty_continue"
-    survival_weight: float = Field(default=0.2, gt=0)
-    kl_weight: float = Field(default=0.1, gt=0)
-    learning_rate: float = Field(default=0.001, gt=0)
-    scheduler: Literal["constant", "cosine", "plateau"] = "constant"
-    architecture: Literal["transformer", "gru", "lstm", "mtan"] = "transformer"
-    width: Literal[32, 64] = 64
-    latent: Literal[8, 16, 32] = 32
-    dropout: float = Field(default=0.0, ge=0, lt=1)
-    survival_layers: Literal[0, 1, 2] = 1
-    batch: Literal[64, 128, 256] = 128
-    monitor: Literal["loss", "cindex"] = "loss"
-
-    @model_validator(mode="after")
-    def normalize_inactive(self) -> Self:
-        if self.warmup == 0:
-            object.__setattr__(self, "objective", "reconstruction_survival")
-            object.__setattr__(self, "reset_head", False)
-            object.__setattr__(self, "reset_optimizer", False)
-            if self.weighting == "uncertainty_reset":
-                object.__setattr__(self, "weighting", "uncertainty_continue")
-            elif self.weighting == "uncertainty_freeze":
-                object.__setattr__(self, "weighting", "fixed")
-        return self
+    columns: EDAColumnsConfig
+    trajectory_panels_per_page: int = Field(ge=1, le=24)
+    fisher_resamples: int = Field(ge=100)
 
 
-class CRCSearchOptions(BaseModel):
-    """正式默认预算固定；缩小预算仅用于隔离的合成验证和GPU试跑。"""
+class FigureFeatureConfig(BaseModel):
+    """明确指定指标、英文标签和原始单位，不按可用性静默删指标。"""
 
     model_config = ConfigDict(extra="forbid")
-    sampling_seed: int = Field(ge=0)
-    n_recipes: int = Field(ge=1, le=96)
-    screen_k: int = Field(ge=2)
-    screen_seeds: list[int] = Field(min_length=2, max_length=2)
-    validation_seeds: list[int] = Field(min_length=3, max_length=3)
-    candidates: list[Annotated[int, Field(ge=2)]] = Field(min_length=1)
-    top_n: int = Field(ge=1, le=3)
-    min_cluster_fraction: float = Field(ge=0.05, le=1)
-    recipe_ids: list[str]
-    train_count: int = Field(gt=0)
-    validation_count: int = Field(gt=0)
-    n_features: int = Field(gt=0)
+    feature: str = Field(min_length=1)
+    label: str = Field(min_length=1, pattern=r"^[^\u3400-\u9fff]+$")
+    unit: str = Field(default="", pattern=r"^[^\u3400-\u9fff]*$")
+    scale: Literal["linear", "log"] = "linear"
+
+
+class FigurePanelsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    profile_dataset: str = Field(min_length=1)
+    display_datasets: list[str] = Field(min_length=1)
+    cox_dataset: str = Field(min_length=1)
+    atlas: list[FigureFeatureConfig] = Field(min_length=1)
+    trajectories: list[FigureFeatureConfig] = Field(min_length=1)
+    phase_days: list[Annotated[FiniteFloat, Field(ge=0)]] = Field(min_length=2)
+    display_months: FiniteFloat = Field(gt=0)
+    risk_months: list[Annotated[FiniteFloat, Field(ge=0)]] = Field(min_length=1)
+    min_observed: int = Field(ge=1)
+    width_mm: FiniteFloat = Field(gt=0)
+    height_mm: FiniteFloat = Field(gt=0)
 
     @model_validator(mode="after")
-    def validate_grid(self) -> Self:
-        if any(
-            len(values) != len(set(values))
-            for values in (
-                self.screen_seeds,
-                self.validation_seeds,
-                self.candidates,
-                self.recipe_ids,
-            )
+    def validate_panels(self) -> Self:
+        if self.phase_days[0] != 0 or self.phase_days != sorted(set(self.phase_days)):
+            raise ValueError("phase_days须从0开始且严格递增")
+        if (
+            self.risk_months != sorted(set(self.risk_months))
+            or self.risk_months[-1] > self.display_months
         ):
-            raise ValueError("搜索网格不允许重复")
-        if not set(self.screen_seeds).issubset(self.validation_seeds):
-            raise ValueError("初筛seed必须包含在验证seed中")
-        if self.screen_k not in self.candidates:
-            raise ValueError("初筛K必须包含在验证网格中")
+            raise ValueError("risk_months须严格递增且不超过display_months")
+        if len(set(self.display_datasets)) != len(self.display_datasets):
+            raise ValueError("display_datasets不能重复")
+        for specs in (self.atlas, self.trajectories):
+            if len({spec.feature for spec in specs}) != len(specs):
+                raise ValueError("正文指标不能重复")
+        if any(not spec.unit.strip() for spec in self.trajectories):
+            raise ValueError("轨迹指标须明确提供原始单位")
         return self
 
 
-class CRCSearchShard(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    index: int = Field(ge=0)
-    count: int = Field(ge=1, le=2)
-    workers: int = Field(ge=1, le=2)
-    threads: int = Field(ge=1, le=4)
+class CRCFigureConfig(CRCPostprocessConfig):
+    """06正文六面板组图及其Source Data。"""
+
+    figure: FigurePanelsConfig
 
     @model_validator(mode="after")
-    def validate_index(self) -> Self:
-        if self.index >= self.count:
-            raise ValueError("shard.index必须小于shard.count")
+    def validate_panel_datasets(self) -> Self:
+        names = {
+            self.figure.profile_dataset,
+            self.figure.cox_dataset,
+            *self.figure.display_datasets,
+        }
+        if names - set(self.datasets):
+            raise ValueError("正文各面板的数据集须包含在datasets中")
         return self
-
-
-class CRCSearchInputs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    summaries: list[Path]
-    assignment: Path | None
-    selection: Path | None
-    checkpoint: Path | None
-
-
-class CRCSearchPaths(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    dir: Path
-    screen_dir: Path
-
-
-class CRCSearchJob(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    recipe_id: str
-    n_clusters: int = Field(ge=2)
-    seed: int = Field(ge=0)
-
-
-class CRCSearchConfig(BaseModel):
-    """07只负责调度和汇总；训练参数仍使用核心配置模型。"""
-
-    model_config = ConfigDict(extra="forbid")
-    mode: Literal["plan", "screen", "validate", "merge", "finalize", "worker"]
-    merge_stage: Literal["screen", "validate"]
-    resume: bool
-    split: FrozenSplitConfig
-    model: ModelConfig
-    trainer: TrainerConfig
-    search: CRCSearchOptions
-    shard: CRCSearchShard
-    inputs: CRCSearchInputs
-    paths: CRCSearchPaths
-    job: CRCSearchJob
-    survival: EvaluationSurvivalConfig

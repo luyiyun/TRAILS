@@ -65,8 +65,9 @@ clean reusable method library.
 - Generate MIMIC patient splits and tensor datasets: `uv run python -m scripts.mimic.06_split`
 - Split CRC Yunnan patients and middle-format observations: `uv run python -m scripts.crc_yunnan.03_split`
 - Prepare CRC Yunnan model datasets: `uv run python -m scripts.crc_yunnan.04_preproc`
-- Run CRC Yunnan K selection and TRAILS on one frozen split: `uv run python -m scripts.crc_yunnan.05_run`
-- Evaluate a completed CRC Yunnan run: `uv run python -m scripts.crc_yunnan.06_evaluate inputs.run_dir=outputs/crc_yunnan/<run>/modeling`
+- Train and report CRC Yunnan candidates on one frozen split: `uv run python -m scripts.crc_yunnan.05_run`
+- Draw a CRC main figure: `uv run python -m scripts.crc_yunnan.06_figure inputs.run_dir=outputs/crc_yunnan/<run>/modeling n_clusters=5`
+- Produce CRC supplementary evaluation: `uv run python -m scripts.crc_yunnan.07_supplementary inputs.run_dir=outputs/crc_yunnan/<run>/modeling n_clusters=5`
 - Run MIMIC modeling with configured or automatically selected K: `uv run python -m scripts.mimic.07_run`
 - Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517`
 - Evaluate frozen MIMIC predictions: `uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<primary-run>,outputs/mimic_case/<other-runs>]' 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
@@ -298,9 +299,9 @@ clean reusable method library.
   repeated latent plus visit-time input.
 - Clustering uses a VaDE-style learnable Gaussian mixture latent prior,
   initialized by deterministic k-means after warmup.
-- CRC `07_search` schedules isolated train/validation trials and uses the public
-  selector `evaluate_fitted`/`summarize_completed` methods. Screening fixes K=3,
-  then validates K within each recipe; test is read only after unique model locking.
+- CRC modeling uses `05_run` followed by independent `06_figure`/`07_supplementary`; the standalone recipe-search
+  command and its dedicated configuration have been removed. Shared selector APIs
+  and trainer controls remain available to existing modeling workflows.
   Optional trainer controls cover warmup objective, mixture initialization, stage
   resets/freezing, and native LR schedulers. Defaults preserve existing training and
   format-3 checkpoint loading; diagnostic passes preserve Torch RNG state.
@@ -398,8 +399,8 @@ clean reusable method library.
   only for internal early stopping, and saves the converted dataset, model,
   history, predictions, patient-level clusters, cluster summaries, feature
   summaries, and `case_summary.json` under `paths.dir`.
-- CRC Yunnan uses `01_cohort -> 02_eda -> 03_split -> 04_preproc -> 05_run -> 06_evaluate`,
-  with Hydra configs `cohort`, `eda`, `split`, `preproc`, `run`, and `evaluate` under
+- CRC Yunnan uses `01_cohort -> 02_eda -> 03_split -> 04_preproc -> 05_run -> 06_figure / 07_supplementary`,
+  with Hydra configs `cohort`, `eda`, `split`, `preproc`, `run`, `figure`, and `supplementary` under
   `configs/crc_yunnan`. New cohort/split/preproc artifacts use v2; historical v1
   artifacts remain unchanged and are not accepted by the new workflow.
   Downstream commands trust upstream schemas, keys, outcome values and dataset
@@ -418,6 +419,10 @@ clean reusable method library.
   feature, and NaN for unobserved values. Feature groups live in
   `feature_metadata.csv`; baseline covariates and outcomes remain in patients.csv.
   A Chinese cohort summary reports overlapping rule counts and sequential exclusions.
+  Optional `processing.observation_value_bounds` uses inclusive per-feature min/max
+  bounds before same-day aggregation; the default empty mapping preserves existing
+  cleaning. It removes individual observations without correcting units or decimals,
+  and reports raw-record and eligible-cohort removal counts by feature.
 - `02_eda.py` resolves Hydra config through `scripts/crc_yunnan/config.py::CRCEDAConfig`
   before calling its typed `run`; the model owns path/type conversion, baseline column
   validation, positive time/plot parameters, and landmark ordering. It consumes the
@@ -450,39 +455,42 @@ clean reusable method library.
   finite float32. Each set saves patients, IDs, transformed middle CSV and dataset.pt;
   the root saves four-column preprocessing parameters, resolved config and
   preproc_manifest.json. It builds aligned samples directly from middle matrices.
-- `05_run.py` uses `split.dir` to reference the 04 bundle. It reads train and optional
-  `validation` first, with `trainer.valid_size=0`. Other configured evaluation sets
-  are read only after the estimator is locked. With validation, automatic K selection
-  retains occupancy gates, the configured best-mean or one-standard-error rule,
-  and final seed ranking by selection score, C-index, BIC, then seed. Without validation,
-  fixed K is mandatory and early stopping monitors training data. Full-cohort preprocessing/training uses
-  all eligible patients and reports no independent validation/test when absent.
-  `configs/crc_yunnan/run.yaml` fixes the CRC baseline to search recipe r089,
-  K=2–10 and seed 20260908: GRU-D plus single-layer LSTM encoder/decoder, 30 epochs
-  of reconstruction warmup, shared global diagonal mixture variance, and fixed
-  reconstruction/survival/KL weights of 1/0.05/0.1. It retains OS/24 months, E60,
-  auto-log1p/robust preprocessing and no SwanLab. K selection uses the best
-  validation C-index/BIC score with occupancy gates and no seed stability calculation;
-  root-level `n_clusters=2` or `n_clusters=5` fixes K for separate analyses.
-  `CRCRunConfig` also exposes command-level runtime settings; CRC defaults fix
-  Torch intra/inter-op and BLAS/OpenMP threads to 4 and preserve the original
-  cuDNN/TF32 settings. GPU determinism remains disabled as in the original search;
-  matching configuration alone does not promise identical results across environments.
-  Model, history, available-set predictions/metrics and a short provenance manifest
-  are saved without copying datasets. Patient-level artifacts stay remote.
-- `06_evaluate.py` resolves `CRCEvaluationConfig`, follows 05/04/03 manifests back to
-  the frozen data and cohort metadata, and writes Chinese aggregate JSON, one Excel
-  workbook, and PNG/PDF figures to a separate evaluation directory. It preserves
-  cluster labels and colors, fits UMAP only on train, and computes clinical summaries,
-  KM/log-rank, unpenalized adjusted Cox, original-scale patient-weighted trajectories,
-  confidence, prediction/calibration metrics, training and K-selection diagnostics.
-  Survival times use 30-day months after landmark; trajectory times start at surgery.
-  Censoring weights come only from train. Unsupported metrics retain their configured
-  time points with null values and reasons; genuine computation errors propagate.
-  Cross-seed ARI uses all saved candidate models on frozen validation, without fitting
-  or changing model selection. Fixed-K runs without candidates skip ARI explicitly.
-  No patient-level embedding coordinates or new manifests are exported. Shared CRC
-  statistics and single-figure functions live in `evaluation.py` and `evaluation_plots.py`.
+- `05_run.py` serially trains every configured seed/K on the frozen train and optional
+  validation sets (`valid_size=0`), saves all checkpoints/histories/configurations, then
+  reads other available datasets after all training is complete. It reports train,
+  validation and test C-index, latent-mixture BIC/NLL and occupancy without selecting
+  K, a seed winner, ranks or a root-level final model. `n_clusters` is an integer or list;
+  defaults are K2–10 and `seeds=[20260908]`. Empty clusters and minimum fraction <5%
+  are reported diagnostics and do not veto explicitly requested postprocessing.
+  Runtime, model and training parameters retain the r089 baseline. Shared core
+  selection APIs and MIMIC behavior remain unchanged. The existing run manifest
+  uses schema 3 and references each model under `models/seed-<seed>/k<K>/`; prediction
+  payloads and patient tables remain remote. Test-informed manual K choice is exploratory.
+- `06_figure.py` and `07_supplementary.py` independently read the 05 bundle and
+  require an explicit integer/list `n_clusters`. Multiple available model seeds
+  require `model_seed`; a sole seed is inferred. Both read historical schema-2
+  selected/candidate bundles without training. Every requested model and output is
+  checked before starting; each K writes into `k<K>/` and never overwrites outputs.
+  Common model reading and statistics live in `evaluation.py`, individual figures
+  in `evaluation_plots.py`, and the main composite in `figure_plots.py`.
+- 06 produces the six-panel main figure (setting/sparsity, phase atlas, trajectories,
+  latent-z UMAP, validation/test narrow KM, and default test adjusted Cox), PDF/SVG,
+  600-dpi PNG, aggregate Source Data, resolved configuration and JSON summary.
+  Features/English labels/units, phase boundaries and display datasets are explicit
+  configuration; missing features and phase/window mismatch fail instead of silently
+  adapting scientific content. The 180×215 mm baseline grows with content. Patient
+  phase/bin medians precede cluster medians/IQR; n<10 is grey/disconnected, with full
+  numerical values retained. Training preprocessing stays unchanged.
+- 07 retains full-panel trajectories/coverage, cluster occupancy/confidence, clinical
+  summaries/tests, KM/Cox, UMAP, prediction/calibration, training, candidate metrics,
+  cross-seed validation ARI and cross-K tables. Candidate metrics have no automatically
+  selected K marker. Single-seed ARI retains an explicit non-computable reason.
+  UMAP fits only training latent means and transforms other sets; coordinates remain
+  in memory. IPCW uses train only. KM/log-rank/Cox use full available follow-up;
+  unsupported metrics retain null/reasons. Cox is unpenalized, complete-case and
+  adjusts age/sex/stage/site with the training-lowest-mean-risk reference. Genuine
+  errors propagate without changing statistical settings. Historical test reuse
+  and test-informed manual K choice must not be described as new independent validation.
 - MIMIC concept preprocessing is executed directly from the pinned external
   mimic-code SQL files by `01_build_sepsis.py`; downstream extraction reads the
   resulting official tables and adds study-specific cohort/window aggregation.

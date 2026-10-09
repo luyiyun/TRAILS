@@ -1,6 +1,6 @@
 # CRC r089 复现配置
 
-`scripts/crc_yunnan/01_cohort.py` 至 `05_run.py` 使用本目录的 Hydra 配置。
+`scripts/crc_yunnan/01_cohort.py` 至 `07_supplementary.py` 使用本目录的 Hydra 配置。
 01、03、04 的科学参数已与原实验保存的配置核对；02 仅做描述性分析，不改变建模输入。
 `run.yaml` 的模型和训练参数与 r089/seed20260908 的 K2、K5 原模型配置一致。
 
@@ -10,7 +10,9 @@
 | 02 EDA | `eda.yaml` | OS 描述性分析 |
 | 03 划分 | `split.yaml` | seed20260908，DFS/OS 联合分层，random 64%/16%/20% |
 | 04 预处理 | `preproc.yaml` | OS、720天 landmark、E60 固定顺序、至少2个观测日期、train 拟合 auto-log1p/robust |
-| 05 K 扫描 | `run.yaml` | r089，单 seed20260908，K2–10，验证集 C-index/BIC 综合选择 |
+| 05 候选训练 | `run.yaml` | r089，seed20260908，K2–10；三集指标汇总，不自动选择 |
+| 06 正文图 | `figure.yaml` | 显式指定K；六面板、Source Data、可编辑PDF/SVG及600 dpi PNG |
+| 07 补充图 | `supplementary.yaml` | 显式指定K；完整评价、补充图及跨K比较 |
 
 r089 使用 GRU-D + 单层 LSTM 编码器/解码器，宽度64、latent32、dropout0、生存头1层。
 先做30轮仅重建预训练，再执行多启动 K-means++（10次、最多200轮），
@@ -26,6 +28,19 @@ batch64、学习率0.001且恒定；正式训练100–300轮，验证 loss 早�
 
 ## 运行方式
 
+01 支持通过 `processing.observation_value_bounds` 显式配置检测值的 `min/max`；
+界限可单边指定，端点保留，默认空字典不筛选检测值。有限数值中的超界原始记录
+在同日聚合前剔除，不换算单位、不改小数点，也不直接删除患者。队列摘要分别报告
+原始记录和基础队列内有效日期观测的剔除数；原有无效数值/日期规则仍独立执行。
+探索规则应随实际命令记录，不能将正常参考区间直接作为删除范围。
+中文字典键可通过 OmegaConf 内置 `oc.create` 从引号保护的 JSON 插值加载；
+G14 的完整可复现命令保存在根目录 `history.sh`。
+
+04 增加可选 `features.panel=G14`，依次使用 CEA、CA242、CA125、血清白蛋白、
+总蛋白、白球比、前白蛋白、胆碱酯酶、红细胞、红细胞平均体积、平均血小板体积、
+中性粒细胞绝对值、乳酸脱氢酶、尿素。默认仍为 E60；面板与清洗同时改变时，
+与历史结果的差异只能作联合改变后的探索解释。
+
 原实验在99服务器 `/home/rongzw/projects/TRAILS` 运行：Python3.12.12、
 PyTorch2.12.0+cu130、CUDA13.0、NVIDIA L20。依赖使用 `uv run --locked`。
 源码中的数据处理、损失和训练逻辑也须保持对应版本；更改源码后应重新验证。
@@ -40,13 +55,28 @@ uv run --locked --python 3.12.12 python -m scripts.crc_yunnan.04_preproc
 uv run --locked --python 3.12.12 python -m scripts.crc_yunnan.05_run
 ```
 
-05 仅使用 `run.yaml`，按 seed20260908 依次训练 K2–10，各候选都沿用同一 r089
-配方，K2/K5 的模型和训练参数分别与原实验一致。全部候选的模型、历史和
-C-index/BIC 表保存到输出目录的 `k_selection/`；K2/K5 的模型路径分别为
-`k_selection/seed-20260908/k2/model.pt`、`k_selection/seed-20260908/k5/model.pt`。
-05 只为选中的 K 导出 train/validation/test 预测。KM、log-rank 和详细临床分析
-由06完成；非入选 K 的详细评价还需要单独连接对应候选模型，不能把选中 K 的
-预测当作其他 K 的结果。01–05 本身不生成完整的06报告。
+05默认 `n_clusters=[2,3,4,5,6,7,8,9,10]`、`seeds=[20260908]`。
+整数K也支持；无validation时沿用训练监控，不内部划分。每个seed/K保存于
+`models/seed-<seed>/k<K>/`。全部训练结束后生成各集预测、`run_metrics.csv`、
+`k_summary.csv` 和引用全部模型的运行清单，取消自动K/seed选择。
+无空簇及最小占比5%保留为诊断标记，不阻止明确请求的评价。
+05也报告test，人工参考这些指标选择K属于探索评价。
+
+06/07必须提供 `n_clusters`；多seed时还须提供 `model_seed`。
+默认输出同级figure/supplementary下的k<K>目录，两者独立运行。
+历史05清单也支持，不覆盖旧结果。正文默认E60指标；换面板或landmark时须明确调整
+figure.yaml的指标/单位/阶段配置，不自动删除指标。
+
+```bash
+uv run python -m scripts.crc_yunnan.06_figure \
+  inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling 'n_clusters=[2,5]' model_seed=20260908
+uv run python -m scripts.crc_yunnan.07_supplementary \
+  inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling 'n_clusters=[2,5]' model_seed=20260908
+```
+
+以上为未执行示例。06输出可编辑正文图及Source Data；07输出完整统计工作簿、
+英文补充图及比较表。统计解释和可配置字段见根目录README的“候选指标、正文图与补充图”。
+旧06_evaluate及evaluate.yaml已移除，历史命令不改写。
 
 01–04 默认拒绝覆盖已有产物。在当前服务器可直接复用已核验的 v2 冻结输入，
 从05开始；如需从原始数据重新生成，使用新的输出版本，例如：
