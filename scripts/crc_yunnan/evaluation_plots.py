@@ -714,21 +714,32 @@ def plot_training(history: pd.DataFrame, stem: Path, dpi: int) -> None:
     save_figure(figure, stem, dpi)
 
 
-def plot_k_metrics(runs: pd.DataFrame, minimum: float, stem: Path, dpi: int) -> None:
-    """各数据集分别展示原始指标，取消排名和自动入选标记。"""
+def plot_k_metrics(
+    runs: pd.DataFrame,
+    minimum: float,
+    stem: Path,
+    dpi: int,
+    *,
+    expected_ks: list[int] | None = None,
+    highlight_k: int | None = None,
+) -> None:
+    """六指标组图；缺失K断线，手动指定K仅作参照，不重新选择模型。"""
     datasets = runs["dataset"].drop_duplicates().tolist()
     metrics = [
+        ("selection_score", "Composite score (higher is better)"),
         ("cindex", "C-index"),
         ("latent_mixture_bic", "Latent-mixture BIC"),
         ("cluster_min_fraction", "Minimum cluster fraction"),
         ("cluster_empty_count", "Empty clusters"),
+        ("cluster_entropy", "Normalized cluster entropy"),
     ]
-    figure, axes = plt.subplots(
-        len(datasets), 4, figsize=(17, 4 * len(datasets)), squeeze=False, layout="constrained"
-    )
-    for row, name in enumerate(datasets):
+    figure, axes = plt.subplots(2, 3, figsize=(12, 7), layout="constrained")
+    ks = expected_ks or sorted(runs["n_clusters"].unique().tolist())
+    palette = {"train": "#0072B2", "validation": "#D55E00", "test": "#009E73"}
+    styles = {"train": "-", "validation": "--", "test": "-."}
+    for name in datasets:
         subset = runs.loc[runs["dataset"].eq(name)]
-        for axis, (metric, title) in zip(axes[row], metrics, strict=True):
+        for axis, (metric, title) in zip(axes.flat, metrics, strict=True):
             if metric not in subset:
                 axis.text(
                     0.5,
@@ -739,19 +750,38 @@ def plot_k_metrics(runs: pd.DataFrame, minimum: float, stem: Path, dpi: int) -> 
                 )
             else:
                 for seed, values in subset.groupby("seed"):
-                    values = values.sort_values("n_clusters")
-                    axis.plot(values["n_clusters"], values[metric], "o-", label=f"Seed {seed}")
-                axis.legend(fontsize=7)
-            if metric == "cluster_min_fraction":
-                axis.axhline(minimum, color="#D55E00", linestyle="--", linewidth=0.8)
+                    values = values.set_index("n_clusters").reindex(ks)
+                    suffix = f" ({seed})" if runs["seed"].nunique() > 1 else ""
+                    axis.plot(
+                        ks,
+                        values[metric],
+                        marker="o",
+                        markersize=4,
+                        color=palette.get(name),
+                        linestyle=styles.get(name, "-"),
+                        label=f"{english_label(name)}{suffix}",
+                    )
             axis.set(
-                title=f"{english_label(name)}: {title}",
+                title=title,
                 xlabel="Number of clusters (K)",
-                xticks=sorted(subset["n_clusters"].unique()),
+                xticks=ks,
             )
             axis.grid(alpha=0.15)
+    axes.flat[3].axhline(
+        minimum, color=".5", linestyle=":", linewidth=0.8, label=f"Minimum {minimum:.0%}"
+    )
+    axes.flat[3].axhline(0.10, color=".65", linestyle="--", linewidth=0.8, label="Preferred 10%")
+    for axis in axes.flat:
+        if highlight_k is not None:
+            axis.axvline(highlight_k, color=".65", linestyle=":", linewidth=0.8)
+        axis.legend(fontsize=7)
+    missing = sorted(set(ks) - set(runs["n_clusters"]))
     figure.suptitle(
-        "Candidate-model metrics: manual K choice; test-informed comparisons are exploratory"
+        "Candidate K diagnostics · same configuration / frozen splits\n"
+        + (f"Missing K: {missing}; gaps are not interpolated. " if missing else "")
+        + (f"Vertical line: manually fixed K={highlight_k}. " if highlight_k else "")
+        + "Test-informed comparisons are exploratory",
+        fontsize=11,
     )
     save_figure(figure, stem, dpi)
 

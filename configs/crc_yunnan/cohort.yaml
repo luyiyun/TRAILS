@@ -1,6 +1,6 @@
 # @package _global_
 dataset: crc_yunnan
-version: v2
+version: v2-g14-clean-20261008
 
 paths:
   raw_root: data/real/crc_yunnan
@@ -48,8 +48,22 @@ processing:
   max_outcome_days: 7305
   outcome_time_unit_days: 30
   refuse_overwrite: true
-  # 默认为空；探索性范围筛选通过命令行显式指定，区间端点保留。
-  observation_value_bounds: {}
+  # 本轮确认的探索性界限，端点保留；不是公认生理极限，不修正单位或小数点。
+  observation_value_bounds:
+    CEA: {min: 0}
+    CA242: {min: 0}
+    CA125: {min: 0}
+    血清白蛋白: {min: 0, max: 100}
+    总蛋白: {min: 0, max: 200}
+    白球比: {min: 0, max: 10}
+    前白蛋白: {min: 0, max: 1000}
+    胆碱酯酶: {min: 0, max: 50000}
+    红细胞: {min: 0.1, max: 20}
+    红细胞平均体积: {min: 20, max: 300}
+    平均血小板体积: {min: 1, max: 50}
+    中性粒细胞绝对值: {min: 0, max: 200}
+    乳酸脱氢酶: {min: 0, max: 20000}
+    尿素: {min: 0, max: 100}
 
 date_corrections:
   patients:

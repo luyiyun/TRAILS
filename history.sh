@@ -814,3 +814,213 @@ UV_CACHE_DIR=/tmp/uv-cache MPLCONFIGDIR=/tmp/trails-crc-mpl PYTHONPATH=/Users/ro
 # 2026-10-09：仅用既有r089 Source Data复绘并核对人数/参考簇/画像/轨迹/KM/Cox，不拟合、不读患者表或UMAP坐标；d为明确标注的检查占位。
 # 主机：本机；工作目录：/Users/rong/Project/TRAILS；输入：outputs/crc_yunnan/manuscript_results3/SourceData.xlsx；输出：/tmp/trails-crc-real-aggregate-replay；K5，seed20260908。
 UV_CACHE_DIR=/tmp/uv-cache MPLCONFIGDIR=/tmp/trails-crc-mpl PYTHONPATH=/Users/rong/Project/TRAILS uv run python /tmp/trails_crc_aggregate_replay.py
+
+# 2026-10-09：G14超参数探索准备和合成验收，不读取患者数据、不启动真实训练。
+# 本机 /Users/rong/Project/TRAILS；固定r089、seed20260908、K4–K8；第一阶段40格，新增总预算≤60。
+.venv/bin/python .remote-run/g14-hp-20261009/prepare.py
+.venv/bin/python .remote-run/g14-hp-20261009/selfcheck.py
+
+# 2026-10-09：修正合成KM夹具的事件向量，增加完整聚合输出与不可支持36月分离的验收；无真实训练。
+MPLCONFIGDIR=/tmp/g14-hp-mpl .venv/bin/python .remote-run/g14-hp-20261009/selfcheck.py
+
+# 2026-10-09：两机冻结输入预检及99→215加密流式复制；患者级文件不在本地落盘。
+# 远端主机99/215；工作目录均/home/rongzw/projects/TRAILS；G14 v2-g14-clean-20261008，OS/720天/seed20260908。
+.venv/bin/python .remote-run/g14-hp-20261009/transport.py --upload-code --target tmu-99-rzw-xtcp
+.venv/bin/python .remote-run/g14-hp-20261009/transport.py --upload-code --target tmu-215-rzw-xtcp
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default run --apply -- python .remote-run/g14-hp-20261009/verify_inputs.py --output .remote-run/g14-hp-20261009/input_contract_99.json
+.venv/bin/python .remote-run/g14-hp-20261009/transport.py --data-contract .remote-run/g14-hp-20261009/input_contract_99.json --target tmu-215-rzw-xtcp
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp run --apply -- python .remote-run/g14-hp-20261009/verify_inputs.py --output .remote-run/g14-hp-20261009/input_contract_215.json --compare .remote-run/g14-hp-20261009/input_contract_99.json
+
+# 2026-10-09：复用99已有r089 G14 K4–K8，按本轮固定风险层口径汇总参照；不新增训练。
+# 远端99 /home/rongzw/projects/TRAILS；输入outputs/crc_yunnan/g14-20261008/modeling，输出outputs/crc_yunnan/g14-hp-20261009/reference。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc-g14-hp-reference-20261009-01 --apply -- python .remote-run/g14-hp-20261009/run_reference.py
+
+# 2026-10-09：前次流式传输在本地相对路径解析处退出，未传输数据、未训练；改用绝对合同路径。
+.venv/bin/python .remote-run/g14-hp-20261009/transport.py --data-contract /Users/rong/Project/TRAILS/.remote-run/g14-hp-20261009/input_contract_99.json --target tmu-215-rzw-xtcp
+
+# 2026-10-09：G14第一阶段40次训练，99/215各2进程、CUDA:0、各4线程，seed20260908，K4–K8。
+# 工作目录均/home/rongzw/projects/TRAILS；冻结输入v2-g14-clean-20261008；8组完整配置见保留的phase1_jobs.json及configs/R*-k*.yaml。
+# 批次只调用现有05_run及已批准的一次性生存汇总；模型、数据和患者级预测留远端。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py group submit --plan .remote-run/g14-hp-20261009/phase1-group.json --apply
+
+# 2026-10-09：本地仅核验已取回的R0参照55份聚合文件SHA、图件结构及K4/K6人数/事件一致性；不读患者数据、不训练。
+# 本机 /Users/rong/Project/TRAILS；输入remote-results/default/crc-g14-hp-reference-20261009-01，输出本次任务reference_verification.json。
+.venv/bin/python .remote-run/g14-hp-20261009/validate_reference.py
+
+# 2026-10-09：参照目录实际白名单54份，修正前次手计55的验收断言；源数据和统计未改。
+.venv/bin/python .remote-run/g14-hp-20261009/validate_reference.py
+
+# 2026-10-09：两机P1父进程exit0后核验40格原子退出、启动预算、历史和三集预测，再检查冻结输入SHA。
+# 99/215工作目录均/home/rongzw/projects/TRAILS；G14/OS/720天/seed20260908不变，仅输出聚合核验与精确白名单，不训练。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default run --apply -- python .remote-run/g14-hp-20261009/verify_results.py --plan .remote-run/g14-hp-20261009/phase1-99.json --batch outputs/crc_yunnan/g14-hp-20261009/phase1-99 --run-id crc-g14-hp-p1-99-20261009-01
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp run --apply -- python .remote-run/g14-hp-20261009/verify_results.py --plan .remote-run/g14-hp-20261009/phase1-215.json --batch outputs/crc_yunnan/g14-hp-20261009/phase1-215 --run-id crc-g14-hp-p1-215-20261009-01
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default run --apply -- python .remote-run/g14-hp-20261009/verify_inputs.py --output outputs/crc_yunnan/g14-hp-20261009/phase1-99/frozen_input_recheck.json --compare .remote-run/g14-hp-20261009/input_contract_99.json
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp run --apply -- python .remote-run/g14-hp-20261009/verify_inputs.py --output outputs/crc_yunnan/g14-hp-20261009/phase1-215/frozen_input_recheck.json --compare .remote-run/g14-hp-20261009/input_contract_99.json
+
+# 2026-10-09：前次终态核验已完成40格内容检查，但白名单relative_to要求绝对batch路径；仅改核验CLI，不重训。
+# 99/215工作目录均/home/rongzw/projects/TRAILS；相同G14/OS/720天/seed20260908，保留原始失败诊断。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default run --apply -- python .remote-run/g14-hp-20261009/verify_results.py --plan .remote-run/g14-hp-20261009/phase1-99.json --batch /home/rongzw/projects/TRAILS/outputs/crc_yunnan/g14-hp-20261009/phase1-99 --run-id crc-g14-hp-p1-99-20261009-01
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp run --apply -- python .remote-run/g14-hp-20261009/verify_results.py --plan .remote-run/g14-hp-20261009/phase1-215.json --batch /home/rongzw/projects/TRAILS/outputs/crc_yunnan/g14-hp-20261009/phase1-215 --run-id crc-g14-hp-p1-215-20261009-01
+
+# 2026-10-09：终态精确白名单在各训练主机打包聚合文件，经remote-run取回、逐文件SHA校验后本地排名。
+# 99/215工作目录均/home/rongzw/projects/TRAILS；G14/OS/720天/seed20260908；压缩包仅含核验清单列出的聚合、配置、历史和退出记录。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default run --apply -- python .remote-run/g14-hp-20261009/pull_verified.py --target default --run-id crc-g14-hp-p1-99-20261009-01 --contract outputs/crc_yunnan/g14-hp-20261009/phase1-99/verification.json --pack outputs/crc_yunnan/g14-hp-20261009/phase1-99/aggregate-results.tar.gz
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp run --apply -- python .remote-run/g14-hp-20261009/pull_verified.py --target tmu-215-rzw-xtcp --run-id crc-g14-hp-p1-215-20261009-01 --contract outputs/crc_yunnan/g14-hp-20261009/phase1-215/verification.json --pack outputs/crc_yunnan/g14-hp-20261009/phase1-215/aggregate-results.tar.gz
+.venv/bin/python .remote-run/g14-hp-20261009/pull_verified.py --target default --run-id crc-g14-hp-p1-99-20261009-01 --contract remote-results/default/crc-g14-hp-p1-99-20261009-01/outputs/crc_yunnan/g14-hp-20261009/phase1-99/verification.json --archive outputs/crc_yunnan/g14-hp-20261009/phase1-99/aggregate-results.tar.gz --apply
+.venv/bin/python .remote-run/g14-hp-20261009/pull_verified.py --target tmu-215-rzw-xtcp --run-id crc-g14-hp-p1-215-20261009-01 --contract remote-results/tmu-215-rzw-xtcp/crc-g14-hp-p1-215-20261009-01/outputs/crc_yunnan/g14-hp-20261009/phase1-215/verification.json --archive outputs/crc_yunnan/g14-hp-20261009/phase1-215/aggregate-results.tar.gz --apply
+.venv/bin/python .remote-run/g14-hp-20261009/review.py --roots remote-results/default/crc-g14-hp-reference-20261009-01/outputs/crc_yunnan/g14-hp-20261009/reference remote-results/default/crc-g14-hp-p1-99-20261009-01/outputs/crc_yunnan/g14-hp-20261009/aggregates remote-results/tmu-215-rzw-xtcp/crc-g14-hp-p1-215-20261009-01/outputs/crc_yunnan/g14-hp-20261009/aggregates --stage 1
+
+# 2026-10-09：前次review在下载结束前只读到R0，生成的排名/15格未提交草稿已归档作废，不用于本轮选择。
+# 两份包及537+555文件SHA现已通过，并核对完整45格R0–R8×K4–8；本次才基于完整输入重排。无新增训练。
+.venv/bin/python .remote-run/g14-hp-20261009/review.py --roots remote-results/default/crc-g14-hp-reference-20261009-01/outputs/crc_yunnan/g14-hp-20261009/reference remote-results/default/crc-g14-hp-p1-99-20261009-01/outputs/crc_yunnan/g14-hp-20261009/aggregates remote-results/tmu-215-rzw-xtcp/crc-g14-hp-p1-215-20261009-01/outputs/crc_yunnan/g14-hp-20261009/aggregates --stage 1
+
+# 2026-10-09：完整45格排名选R8-K6作第二阶段起点，核验20格N1–N4各只变一项、现有Pydantic配置及40+20=60启动边界。
+# 本机/Users/rong/Project/TRAILS；固定G14/OS/720天/seed20260908，仅准备已批准方案，不启动训练。
+MPLCONFIGDIR=/private/tmp/crc-g14-hp-mpl .venv/bin/python .remote-run/g14-hp-20261009/validate_phase2.py
+
+# 2026-10-09：完整P1无候选达全部条件；按固定排序以R8-K6配置作第二阶段起点，执行N1–N4×K4–8共20格。
+# 99/215均/home/rongzw/projects/TRAILS，各2个独立05进程、cuda:0/4线程；G14/OS/720天/seed20260908固定，总新训练预算40+20=60。
+# N1生存权重0.10、N2学习率5e-4、N3 latent_dim16、N4 reconstruction_survival；其余R8参数保持，完整命令/配置见phase2_jobs.json。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py group submit --plan .remote-run/g14-hp-20261009/phase2-group.json --apply
+
+# 2026-10-09：用户指定查看R8-K6的06_figure；复用现有模型和预测，CPU四线程，不新增训练。
+# 主机215，工作目录/home/rongzw/projects/TRAILS；G14全14项画像与指定6轨迹，独立输出，P2继续运行。
+uv run --locked env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMBA_NUM_THREADS=4 python -m scripts.crc_yunnan.06_figure --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/configs --config-name figure-g14 inputs.run_dir=outputs/crc_yunnan/g14-hp-20261009/trials/R8-k6 n_clusters=6 model_seed=20260908 seed=20260908 device=cpu paths.dir=outputs/crc_yunnan/g14-hp-20261009/figure-R8-k6-request-20261009 paths.run_dir=outputs/crc_yunnan/g14-hp-20261009/figure-R8-k6-request-20261009/hydra
+
+# 2026-10-09：修正R8-K6绘图的Hydra日志路径为并列目录；首次配置校验退出1，未读取模型或训练。
+# 215 /home/rongzw/projects/TRAILS；活动P2期间不做源码同步，Direct独立绘图并记录原子退出。
+uv run --locked env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMBA_NUM_THREADS=4 python -m scripts.crc_yunnan.06_figure --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/configs --config-name figure-g14 inputs.run_dir=outputs/crc_yunnan/g14-hp-20261009/trials/R8-k6 n_clusters=6 model_seed=20260908 seed=20260908 device=cpu paths.dir=outputs/crc_yunnan/g14-hp-20261009/figure-R8-k6-request-20261009 paths.run_dir=outputs/crc_yunnan/g14-hp-20261009/figure-R8-k6-request-20261009-hydra
+
+# 2026-10-09：P2两根原子exit0后核验20格、60次总预算、三集模型bundle与冻结输入，患者数据不取回。
+# 99/215均/home/rongzw/projects/TRAILS；先核验仅history变更再同步，使用绝对batch路径。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default run --apply -- python .remote-run/g14-hp-20261009/verify_results.py --plan .remote-run/g14-hp-20261009/phase2-99.json --batch /home/rongzw/projects/TRAILS/outputs/crc_yunnan/g14-hp-20261009/phase2-99 --run-id crc-g14-hp-p2-99-20261009-01
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default run --apply -- python .remote-run/g14-hp-20261009/verify_inputs.py --output outputs/crc_yunnan/g14-hp-20261009/phase2-99/frozen_input_recheck.json --compare .remote-run/g14-hp-20261009/input_contract_99.json
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp run --apply -- python .remote-run/g14-hp-20261009/verify_results.py --plan .remote-run/g14-hp-20261009/phase2-215.json --batch /home/rongzw/projects/TRAILS/outputs/crc_yunnan/g14-hp-20261009/phase2-215 --run-id crc-g14-hp-p2-215-20261009-01
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp run --apply -- python .remote-run/g14-hp-20261009/verify_inputs.py --output outputs/crc_yunnan/g14-hp-20261009/phase2-215/frozen_input_recheck.json --compare .remote-run/g14-hp-20261009/input_contract_99.json
+
+# 2026-10-09：P2全部20格和两端冻结合同通过后，仅打包核验清单的聚合/配置/历史/退出文件。
+# 99/215工作目录/home/rongzw/projects/TRAILS；逐源SHA匹配，模型/患者/预测/dataset不进入压缩包。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default run --apply -- python .remote-run/g14-hp-20261009/pull_verified.py --target default --run-id crc-g14-hp-p2-99-20261009-01 --contract outputs/crc_yunnan/g14-hp-20261009/phase2-99/verification.json --pack outputs/crc_yunnan/g14-hp-20261009/phase2-99/aggregate-results.tar.gz
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp run --apply -- python .remote-run/g14-hp-20261009/pull_verified.py --target tmu-215-rzw-xtcp --run-id crc-g14-hp-p2-215-20261009-01 --contract outputs/crc_yunnan/g14-hp-20261009/phase2-215/verification.json --pack outputs/crc_yunnan/g14-hp-20261009/phase2-215/aggregate-results.tar.gz
+
+# 2026-10-09：精确取回P2两机白名单结果包，校验成员、尺寸和逐文件SHA；不取患者数据。
+.venv/bin/python .remote-run/g14-hp-20261009/pull_verified.py --target default --run-id crc-g14-hp-p2-99-20261009-01 --contract remote-results/default/crc-g14-hp-p2-99-20261009-01/outputs/crc_yunnan/g14-hp-20261009/phase2-99/verification.json --archive outputs/crc_yunnan/g14-hp-20261009/phase2-99/aggregate-results.tar.gz --apply
+.venv/bin/python .remote-run/g14-hp-20261009/pull_verified.py --target tmu-215-rzw-xtcp --run-id crc-g14-hp-p2-215-20261009-01 --contract remote-results/tmu-215-rzw-xtcp/crc-g14-hp-p2-215-20261009-01/outputs/crc_yunnan/g14-hp-20261009/phase2-215/verification.json --archive outputs/crc_yunnan/g14-hp-20261009/phase2-215/aggregate-results.tar.gz --apply
+
+# 2026-10-09：60格/60启动、两机P2 283+271白名单文件及包SHA均通过，再合并5个R0并作最终65格排名。
+MPLCONFIGDIR=/private/tmp/crc-g14-hp-mpl .venv/bin/python .remote-run/g14-hp-20261009/review.py --roots remote-results/default/crc-g14-hp-reference-20261009-01/outputs/crc_yunnan/g14-hp-20261009/reference remote-results/default/crc-g14-hp-p1-99-20261009-01/outputs/crc_yunnan/g14-hp-20261009/aggregates remote-results/tmu-215-rzw-xtcp/crc-g14-hp-p1-215-20261009-01/outputs/crc_yunnan/g14-hp-20261009/aggregates remote-results/default/crc-g14-hp-p2-99-20261009-01/outputs/crc_yunnan/g14-hp-20261009/aggregates remote-results/tmu-215-rzw-xtcp/crc-g14-hp-p2-215-20261009-01/outputs/crc_yunnan/g14-hp-20261009/aggregates --stage 2
+
+# 2026-10-09：完整65格排名无全达标，前三N2-K4/N2-K6/N1-K5；现有06仅调整密度说明位置，CPU四线程、14指标/6轨迹。
+# 两端重画65候选原簇/三级KM到新目录，只调整风险表间距；与原CSV逐字节及全部摘要统计比较，无训练。
+# 主机99/215，工作目录/home/rongzw/projects/TRAILS；现有结果和统计保持，患者/模型/预测留远端。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id crc-g14-hp-km-layout-99-20261009-01 --apply -- python /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/replot_batch.py --plans /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/phase1-99.json /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/phase2-99.json --target default --output outputs/crc_yunnan/g14-hp-20261009/km-layout-99
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp submit --run-id crc-g14-hp-km-layout-215-20261009-01 --apply -- python /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/replot_batch.py --plans /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/phase1-215.json /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/phase2-215.json --target tmu-215-rzw-xtcp --output outputs/crc_yunnan/g14-hp-20261009/km-layout-215
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp submit --run-id crc-g14-hp-figure-n2-k4-20261009-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMBA_NUM_THREADS=4 python /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/figure_layout.py --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/configs --config-name figure-g14 inputs.run_dir=outputs/crc_yunnan/g14-hp-20261009/trials/N2-k4 n_clusters=4 model_seed=20260908 seed=20260908 device=cpu paths.dir=outputs/crc_yunnan/g14-hp-20261009/figures-final/N2-k4 paths.run_dir=outputs/crc_yunnan/g14-hp-20261009/figure-logs-final/N2-k4
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp submit --run-id crc-g14-hp-figure-n2-k6-20261009-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMBA_NUM_THREADS=4 python /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/figure_layout.py --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/configs --config-name figure-g14 inputs.run_dir=outputs/crc_yunnan/g14-hp-20261009/trials/N2-k6 n_clusters=6 model_seed=20260908 seed=20260908 device=cpu paths.dir=outputs/crc_yunnan/g14-hp-20261009/figures-final/N2-k6 paths.run_dir=outputs/crc_yunnan/g14-hp-20261009/figure-logs-final/N2-k6
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp submit --run-id crc-g14-hp-figure-n1-k5-20261009-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMBA_NUM_THREADS=4 python /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/figure_layout.py --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/configs --config-name figure-g14 inputs.run_dir=outputs/crc_yunnan/g14-hp-20261009/trials/N1-k5 n_clusters=5 model_seed=20260908 seed=20260908 device=cpu paths.dir=outputs/crc_yunnan/g14-hp-20261009/figures-final/N1-k5 paths.run_dir=outputs/crc_yunnan/g14-hp-20261009/figure-logs-final/N1-k5
+
+# 2026-10-09：两机图件全部exit0后，精确核验并打包聚合KM与前三名06图件。
+# 主机99/215，工作目录/home/rongzw/projects/TRAILS；不训练，患者数据留远端。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default run --apply -- python /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/collect_final.py --target default
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp run --apply -- python /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/collect_final.py --target tmu-215-rzw-xtcp
+
+# 2026-10-09：本地仅取回已批准的聚合包并核验合同/包/逐文件SHA；整理65候选交付。
+# 工作目录/Users/rong/Project/TRAILS；冻结seed20260908，60次训练预算不增加。
+.venv/bin/python .remote-run/g14-hp-20261009/retrieve_final.py --host 99
+.venv/bin/python .remote-run/g14-hp-20261009/retrieve_final.py --host 215
+.venv/bin/python .remote-run/g14-hp-20261009/export_final.py
+
+# 2026-10-09：215 /home/rongzw/projects/TRAILS，N2-K4主图仅修正Cox轴刻度拥挤。
+# 复用05模型/固定seed20260908；新输出且14统计表须与前次06完全一致，不训练。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target tmu-215-rzw-xtcp submit --run-id crc-g14-hp-figure-n2-k4-ticks-20261009-01 --apply -- env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMBA_NUM_THREADS=4 python /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/figure_layout_ticks.py --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-hp-20261009/configs --config-name figure-g14 inputs.run_dir=outputs/crc_yunnan/g14-hp-20261009/trials/N2-k4 n_clusters=4 model_seed=20260908 seed=20260908 device=cpu paths.dir=outputs/crc_yunnan/g14-hp-20261009/figures-final-ticks/N2-k4 paths.run_dir=outputs/crc_yunnan/g14-hp-20261009/figure-logs-final-ticks/N2-k4
+
+# 2026-10-09：本地建立65候选已验证配置与历史的精确交付链接，不重新分析患者数据。
+.venv/bin/python .remote-run/g14-hp-20261009/reproduction_index.py
+
+# 2026-10-10（北京时间）：验证N2-K4刻度修正版7文件SHA和14表一致性，更新报告链接。
+.venv/bin/python .remote-run/g14-hp-20261009/finalize_delivery.py
+
+# 2026-10-10 本地 /Users/rong/Project/TRAILS：前三G14候选14项聚合轨迹比较，训练集固定选择6项并重绘图c。
+# 复用已核验的聚合CSV、训练预处理参数和原主图SVG；不读取患者/模型、不训练，原图保留。
+.venv/bin/python .remote-run/g14-trend-20261010/trend_review.py input_dir=remote-results/crc-g14-hp-20261009/tables parameters=remote-results/default/crc-g14-prep-20261008-01/outputs/crc_yunnan/g14-20261008/preparation/preprocessing_parameters.csv output_dir=remote-results/crc-g14-hp-20261009/trend-review-20261010 'candidates=[N2-k4,N2-k6,N1-k5]' minimum_n=10 minimum_shared_bins=4 n_features=6 level_weight=0.5 seed=20260908
+
+# 2026-10-10 同一聚合重绘任务：修复pandas只读数组，指定本地可写字体缓存后执行。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-trend-20261010/trend_review.py input_dir=remote-results/crc-g14-hp-20261009/tables parameters=remote-results/default/crc-g14-prep-20261008-01/outputs/crc_yunnan/g14-20261008/preparation/preprocessing_parameters.csv output_dir=remote-results/crc-g14-hp-20261009/trend-review-20261010 'candidates=[N2-k4,N2-k6,N1-k5]' minimum_n=10 minimum_shared_bins=4 n_features=6 level_weight=0.5 seed=20260908
+
+# 2026-10-10 同一聚合任务：按既有Pydantic要求分离聚合输入、绘图输出和日志路径后执行。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-trend-20261010/trend_review.py input_dir=remote-results/crc-g14-hp-20261009/tables parameters=remote-results/default/crc-g14-prep-20261008-01/outputs/crc_yunnan/g14-20261008/preparation/preprocessing_parameters.csv output_dir=remote-results/crc-g14-hp-20261009/trend-review-20261010 'candidates=[N2-k4,N2-k6,N1-k5]' minimum_n=10 minimum_shared_bins=4 n_features=6 level_weight=0.5 seed=20260908
+
+# 2026-10-10 聚合重绘定稿：覆盖分并列时按单项分选择补充项；三肿瘤标志物统一log轴，追加三阶段一致性说明。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-trend-20261010/trend_review.py input_dir=remote-results/crc-g14-hp-20261009/tables parameters=remote-results/default/crc-g14-prep-20261008-01/outputs/crc_yunnan/g14-20261008/preparation/preprocessing_parameters.csv output_dir=remote-results/crc-g14-hp-20261009/trend-review-20261010 'candidates=[N2-k4,N2-k6,N1-k5]' minimum_n=10 minimum_shared_bins=4 n_features=6 level_weight=0.5 seed=20260908
+
+# 2026-10-10 本地G14图c更新：整理完整选择依据、跨集核对、15个原始簇解释和图件索引并验收。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-trend-20261010/finish_report.py
+
+# 2026-10-11 本地：固定N2配置、复算已冻结六指标选择并验收主图与K诊断曲线。
+# 生存/投影仅合成验收；不读取患者，不新增真实训练。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-n2-final-20261011/check_local.py
+
+# 2026-10-11 本地：补全公开选择器所需的空跨seed表字段后复核。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-n2-final-20261011/check_local.py
+
+# 2026-10-11 本地：调整标题/图注间距；仅在KM轴检查18组真实删失标记。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-n2-final-20261011/check_local.py
+
+# 2026-10-11 本地→215：生成冻结N2图件配置，只传17份明确的配置/聚合文件并核对SHA。
+.venv/bin/python .remote-run/g14-n2-final-20261011/prepare_remote.py --upload
+
+# 2026-10-11 本地SSH只读：核验17冻结输入及N2-K6模型/三集预测SHA，患者数据留215。
+.venv/bin/python .remote-run/g14-n2-final-20261011/check_inputs.py
+
+# 2026-10-11 215 /home/rongzw/projects/TRAILS：现有N2-K6重绘，CPU四线程，不训练。
+env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMBA_NUM_THREADS=4 uv run --locked python -m scripts.crc_yunnan.06_figure --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-n2-final-20261011/configs --config-name figure
+
+# 2026-10-11 215 /home/rongzw/projects/TRAILS：评价现有N2-K6并绘N2 K诊断组图。
+# 仅使用已有K4–8；缺失K明确留空，待新增4次预算确认，不自动补训。
+env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMBA_NUM_THREADS=4 uv run --locked python -m scripts.crc_yunnan.07_supplementary --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-n2-final-20261011/configs --config-name supplementary
+
+# 2026-10-11 215 /home/rongzw/projects/TRAILS：图c脚注下移3mm避免与横轴标题重叠，保留首版。
+env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMBA_NUM_THREADS=4 uv run --locked python -m scripts.crc_yunnan.06_figure --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-n2-final-20261011/configs --config-name figure paths.dir=outputs/crc_yunnan/g14-n2-final-20261011/figure-v2 paths.run_dir=outputs/crc_yunnan/g14-n2-final-20261011/logs/figure-v2
+
+# 2026-10-11 本地：主图脚注合并一行，核验与d标题不交叠；已有统计与模型保持。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-n2-final-20261011/check_local.py
+
+# 2026-10-11 215 /home/rongzw/projects/TRAILS：最终主图单行脚注版，CPU四线程，不训练，另存v3。
+env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMBA_NUM_THREADS=4 uv run --locked python -m scripts.crc_yunnan.06_figure --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-n2-final-20261011/configs --config-name figure paths.dir=outputs/crc_yunnan/g14-n2-final-20261011/figure-v3 paths.run_dir=outputs/crc_yunnan/g14-n2-final-20261011/logs/figure-v3
+
+# 2026-10-11 本地：验证最终14个图表/配置SHA、原有统计不变、三集人数事件及K综合分，复制聚合交付件。
+.venv/bin/python .remote-run/g14-n2-final-20261011/finish_delivery.py
+
+# 2026-10-11 本地→99/215：用户新增4次N2补训预算；冻结非K参数与seed20260908，核验17输入与14核心SHA。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-n2-complete-20261011/prepare_extension.py --upload
+
+# 2026-10-11 99 /home/rongzw/projects/TRAILS：新增且仅新增N2 K2、K9；两个独立05，cuda:0，每进程4线程。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --config .remote-run/g14-n2-final.toml --target default submit --run-id crc-g14-n2-k2-20261011-01 --apply -- env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMBA_NUM_THREADS=4 python -m scripts.crc_yunnan.05_run --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-n2-complete-20261011/configs --config-name N2-k2
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --config .remote-run/g14-n2-final.toml --target default submit --run-id crc-g14-n2-k9-20261011-01 --apply -- env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMBA_NUM_THREADS=4 python -m scripts.crc_yunnan.05_run --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-n2-complete-20261011/configs --config-name N2-k9
+
+# 2026-10-11 215 /home/rongzw/projects/TRAILS：新增且仅新增N2 K3、K10；两个独立05，cuda:0，每进程4线程。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --config .remote-run/g14-n2-final.toml --target tmu-215-rzw-xtcp submit --run-id crc-g14-n2-k3-20261011-01 --apply -- env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMBA_NUM_THREADS=4 python -m scripts.crc_yunnan.05_run --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-n2-complete-20261011/configs --config-name N2-k3
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --config .remote-run/g14-n2-final.toml --target tmu-215-rzw-xtcp submit --run-id crc-g14-n2-k10-20261011-01 --apply -- env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMBA_NUM_THREADS=4 python -m scripts.crc_yunnan.05_run --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-n2-complete-20261011/configs --config-name N2-k10
+
+# 2026-10-11 四格原子exit0后：两机逐格核验配置、历史、三集bundle；只回传聚合。
+# 本地脚本仅传精确核验文件、逐SHA并显式target同步；以下为对应远端完整核验命令。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-n2-complete-20261011/complete_extension.py verify
+# 99 /home/rongzw/projects/TRAILS
+uv run --locked python .remote-run/g14-n2-complete-20261011/verify_candidate.py --k 2
+uv run --locked python .remote-run/g14-n2-complete-20261011/verify_candidate.py --k 9
+# 215 /home/rongzw/projects/TRAILS
+uv run --locked python .remote-run/g14-n2-complete-20261011/verify_candidate.py --k 3
+uv run --locked python .remote-run/g14-n2-complete-20261011/verify_candidate.py --k 10
+
+# 2026-10-11 本地：四格终态与三集bundle核验通过；仅按8文件白名单取回，先校验合同再逐SHA。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-n2-complete-20261011/complete_extension.py retrieve
+
+# 2026-10-11 本地→215：合并同N2参数的九个K，仅27份聚合输入；验证9K×3集并逐SHA上传07解析配置。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-n2-complete-20261011/complete_extension.py prepare
+
+# 2026-10-11 215 /home/rongzw/projects/TRAILS：复用已固定N2-K6，更新完整K2–10补充组六指标，不训练或重选K。
+# run_id=crc-g14-n2-supp-full-20261011-01，seed/model_seed=20260908，CPU四线程。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --config .remote-run/g14-n2-final.toml --target tmu-215-rzw-xtcp submit --run-id crc-g14-n2-supp-full-20261011-01 --apply -- env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMBA_NUM_THREADS=4 python -m scripts.crc_yunnan.07_supplementary --config-path /home/rongzw/projects/TRAILS/.remote-run/g14-n2-complete-20261011/configs --config-name supplementary-full
+
+# 2026-10-11 本地：07终态后精确取回9件聚合图表/配置/退出文件，验证全9K、旧原始统计不变与综合分公式。
+env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-n2-complete-20261011/finish_delivery.py

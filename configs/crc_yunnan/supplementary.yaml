@@ -1,9 +1,22 @@
 # @package _global_
 inputs:
   run_dir: ???
-# 必须明确指定K；多个模型seed时须提供model_seed。
-n_clusters: ???
-model_seed: null
+# 复用N2-K6与已经补齐的同参数九K聚合；这些目录位于215。
+n_clusters: 6
+model_seed: 20260908
+k_scan:
+  run_dirs:
+    - outputs/crc_yunnan/g14-n2-complete-20261011/scan_inputs/N2-k2
+    - outputs/crc_yunnan/g14-n2-complete-20261011/scan_inputs/N2-k3
+    - outputs/crc_yunnan/g14-n2-complete-20261011/scan_inputs/N2-k4
+    - outputs/crc_yunnan/g14-n2-complete-20261011/scan_inputs/N2-k5
+    - outputs/crc_yunnan/g14-n2-complete-20261011/scan_inputs/N2-k6
+    - outputs/crc_yunnan/g14-n2-complete-20261011/scan_inputs/N2-k7
+    - outputs/crc_yunnan/g14-n2-complete-20261011/scan_inputs/N2-k8
+    - outputs/crc_yunnan/g14-n2-complete-20261011/scan_inputs/N2-k9
+    - outputs/crc_yunnan/g14-n2-complete-20261011/scan_inputs/N2-k10
+  expected_ks: [2, 3, 4, 5, 6, 7, 8, 9, 10]
+  highlight_k: 6
 datasets: [train, validation, test]
 columns:
   numeric_baseline: [Preoperative_CEA, Preoperative_CA242, Age]
@@ -23,7 +36,7 @@ trajectory_bin_days: 90
 trajectory_panels_per_page: 12
 fisher_resamples: 10000
 seed: 20260908
-device: cuda:0
+device: cpu
 plot:
   dpi: 220
   font_families: ["DejaVu Sans", "Arial", "Liberation Sans"]

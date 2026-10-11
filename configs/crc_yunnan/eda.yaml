@@ -1,6 +1,6 @@
 # @package _global_
 dataset: crc_yunnan
-version: v2
+version: v2-g14-clean-20261008
 outcome: os
 
 paths:

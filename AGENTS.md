@@ -420,8 +420,9 @@ clean reusable method library.
   `feature_metadata.csv`; baseline covariates and outcomes remain in patients.csv.
   A Chinese cohort summary reports overlapping rule counts and sequential exclusions.
   Optional `processing.observation_value_bounds` uses inclusive per-feature min/max
-  bounds before same-day aggregation; the default empty mapping preserves existing
-  cleaning. It removes individual observations without correcting units or decimals,
+  bounds before same-day aggregation; an empty mapping preserves unbounded cleaning,
+  while the current YAML supplies the approved G14 bounds. It removes individual observations
+  without correcting units or decimals,
   and reports raw-record and eligible-cohort removal counts by feature.
 - `02_eda.py` resolves Hydra config through `scripts/crc_yunnan/config.py::CRCEDAConfig`
   before calling its typed `run`; the model owns path/type conversion, baseline column
@@ -446,7 +447,7 @@ clean reusable method library.
   lists transform-only inputs (default validation/test; omitted or empty means none).
   Output train is always named `train`; other names come from input directory names.
   Duplicate names/paths and overlapping patient IDs fail. Default analysis uses
-  OS, 720-day landmark, E60, at least two observed dates over the entire fixed panel.
+  OS, 720-day landmark, G14, at least two observed dates over the entire fixed panel.
   Outcomes must exceed landmark; observation windows include both endpoints and
   survival starts at landmark. Missing/constant train features fail rather than being
   silently dropped. Only final train observations fit auto-log1p and robust scaling
@@ -460,25 +461,25 @@ clean reusable method library.
   reads other available datasets after all training is complete. It reports train,
   validation and test C-index, latent-mixture BIC/NLL and occupancy without selecting
   K, a seed winner, ranks or a root-level final model. `n_clusters` is an integer or list;
-  defaults are K2–10 and `seeds=[20260908]`. Empty clusters and minimum fraction <5%
+  defaults are N2-K6 and `seeds=[20260908]`. Empty clusters and minimum fraction <5%
   are reported diagnostics and do not veto explicitly requested postprocessing.
-  Runtime, model and training parameters retain the r089 baseline. Shared core
+  N2 retains the r089 network/runtime with LR5e-4, uniform prior and fixed logits. Shared core
   selection APIs and MIMIC behavior remain unchanged. The existing run manifest
   uses schema 3 and references each model under `models/seed-<seed>/k<K>/`; prediction
   payloads and patient tables remain remote. Test-informed manual K choice is exploratory.
 - `06_figure.py` and `07_supplementary.py` independently read the 05 bundle and
-  require an explicit integer/list `n_clusters`. Multiple available model seeds
+  consume integer/list `n_clusters` (current YAML default 6). Multiple available model seeds
   require `model_seed`; a sole seed is inferred. Both read historical schema-2
   selected/candidate bundles without training. Every requested model and output is
   checked before starting; each K writes into `k<K>/` and never overwrites outputs.
   Common model reading and statistics live in `evaluation.py`, individual figures
   in `evaluation_plots.py`, and the main composite in `figure_plots.py`.
 - 06 produces the six-panel main figure (setting/sparsity, phase atlas, trajectories,
-  latent-z UMAP, validation/test narrow KM, and default test adjusted Cox), PDF/SVG,
+  latent-z UMAP, three-set KM, and default test adjusted Cox), PDF/SVG,
   600-dpi PNG, aggregate Source Data, resolved configuration and JSON summary.
   Features/English labels/units, phase boundaries and display datasets are explicit
   configuration; missing features and phase/window mismatch fail instead of silently
-  adapting scientific content. The 180×215 mm baseline grows with content. Patient
+  adapting scientific content. Current G14 dimensions are 190×255 mm. Patient
   phase/bin medians precede cluster medians/IQR; n<10 is grey/disconnected, with full
   numerical values retained. Training preprocessing stays unchanged.
 - 07 retains full-panel trajectories/coverage, cluster occupancy/confidence, clinical
@@ -604,3 +605,29 @@ Run these commands in order after code changes:
 4. `UV_CACHE_DIR=/tmp/uv-cache uv run pytest`
 
 If any step fails, fix it before considering the change complete.
+
+## G14 current exploratory candidate (2026-10-11)
+
+- User provisionally selected N2-K6 and requested one canonical YAML set.
+  `cohort`/`eda`/`split`/`preproc`/`run`/`figure`/`supplementary` now default to
+  the frozen G14/N2 workflow; no separate `_g14_n2` profiles remain. Historical
+  E60/r089 configs remain only in original result snapshots and history.
+- Cohort bounds match the approved exploratory G14 cleaning; split outputs use
+  v2-g14-clean-20261008 while assignments reuse v2. 06/07 default to CPU, K6 and
+  seed20260908; their model input directory must still be explicit. 07 defaults
+  to the nine frozen aggregate scan directories on 215; use `k_scan.run_dirs=[]`
+  only when the supplied 05 directory itself contains the intended K grid.
+- N2 keeps the frozen G14/OS/720-day inputs and seed20260908, uses learning rate
+  5e-4, uniform mixture prior and fixed mixture logits. Never refit an existing K
+  just to make figures. The explicitly expanded 64-training budget is exhausted;
+  K2–10 is complete. Additional training requires new user authorization.
+- Main figure trajectory selection is train-only descriptive pair coverage of
+  level and baseline-subtracted change, with observed-count/coverage weighting.
+  The fixed six are CEA, CA242, albumin, A/G ratio, cholinesterase and MCV.
+  `evaluation.trajectory_selection` reproduces this rule; 06 exports the evidence.
+- Main UMAP/KM panels support all three sets; censor ticks are actual censoring
+  times and the Cox forest includes explicit point estimates. Patient data and
+  projection coordinates remain remote.
+- 07 can combine same-configuration 05 aggregate metrics through `k_scan.run_dirs`.
+  Missing K stay missing; default composite score is descriptive and does not
+  override the manually fixed candidate or the previous survival-tier gates.

@@ -134,7 +134,7 @@ def _setting(
     )
     axis.text(
         -0.05,
-        -0.85,
+        -0.64,
         (
             f"Dates/patient: {density['visits_median']:.0f} "
             f"(IQR {density['visits_q25']:.0f}–{density['visits_q75']:.0f})\n"
@@ -282,7 +282,7 @@ def _trajectories(
             )
             axis.fill_between(x, lower, upper, where=valid, color=color, alpha=0.08)
             axis.scatter(x[~valid], median[~valid], color="#AAAAAA", s=6, marker=marker)
-        unit = spec.unit.replace("10^9", "10⁹")
+        unit = spec.unit.replace("10^9", "10⁹").replace("10^12", "10¹²")
         suffix = "; log" if spec.scale == "log" else ""
         axis.set_title(f"{spec.label} ({unit}{suffix})", fontsize=6, pad=3)
         axis.set_yscale(spec.scale)
@@ -328,11 +328,10 @@ def _trajectories(
     )
     fig.text(
         box.x0,
-        box.y0 - 0.042,
+        box.y0 - 7 / (fig.get_figheight() * 25.4),
         (
-            f"{english_label(config.figure.profile_dataset)} · median and IQR · "
-            f"grey: n < {config.figure.min_observed}; disconnected\n"
-            "Observed patients per bin: Source Data, Trajectories"
+            f"{english_label(config.figure.profile_dataset)} median (IQR); "
+            f"grey: n < {config.figure.min_observed}, disconnected. Counts: Source Data."
         ),
         fontsize=5.5,
         va="top",
@@ -349,7 +348,7 @@ def _umap(
 ) -> None:
     _header(fig, cell, "d", "Latent representation z")
     names = config.figure.display_datasets
-    grid = cell.subgridspec(len(names), 1, hspace=0.65)
+    grid = cell.subgridspec(1, len(names), wspace=0.28)
     all_points = np.concatenate([projections[name] for name in names]) if projections else None
     for row, name in enumerate(names):
         axis = fig.add_subplot(grid[row])
@@ -386,8 +385,7 @@ def _umap(
         axis.set_aspect("equal", adjustable="box")
         axis.set_title(f"{english_label(name)}, n = {len(frames[name]):,}", fontsize=6, pad=3)
         axis.set_ylabel("UMAP 2", fontsize=6, labelpad=1)
-        if row == len(names) - 1:
-            axis.set_xlabel("UMAP 1", fontsize=6, labelpad=1)
+        axis.set_xlabel("UMAP 1", fontsize=6, labelpad=1)
         _clean(axis)
 
 
@@ -434,12 +432,16 @@ def _survival(
                 color=colors[cluster],
                 alpha=0.08,
             )
-            markers = np.asarray([month for month in ticks if 0 < month <= last])
+            # 在真实删失时点显示短竖线，不把固定时间点误当作删失标记。
+            censored = km.event_table.loc[km.event_table["censored"].gt(0)]
+            markers = censored.index.to_numpy(dtype=float)
+            markers = markers[(markers >= 0) & (markers <= last)]
             axis.plot(
                 markers,
                 km.predict(markers),
-                marker=CLUSTER_MARKERS[cluster % len(CLUSTER_MARKERS)],
-                markersize=2,
+                marker="|",
+                markersize=2.6,
+                markeredgewidth=0.55,
                 linestyle="none",
                 color=colors[cluster],
             )
@@ -514,11 +516,22 @@ def _cox(
             hr,
             cluster,
             xerr=[[hr - lower], [upper - hr]],
-            fmt=CLUSTER_MARKERS[cluster % len(CLUSTER_MARKERS)],
+            fmt="none",
             color=color,
             markersize=3,
             lw=0.8,
             capsize=1.5,
+        )
+        # 点估计独立绘制，保证PDF/SVG及参考簇的零宽CI也有清楚的实心点。
+        axis.scatter(
+            hr,
+            cluster,
+            marker="o",
+            s=13,
+            facecolor=color,
+            edgecolor="white",
+            linewidth=0.35,
+            zorder=4,
         )
         printed = [
             f"{value:.2g}" if value < 0.01 or value >= 1000 else f"{value:.2f}"
@@ -570,17 +583,16 @@ def plot_main_figure(
     config: CRCFigureConfig,
     stem: Path,
 ) -> tuple[float, float]:
-    """保持180×215mm基准；新增指标、簇或展示集时扩展高度，不缩小字体。"""
+    """画像/轨迹在左，Cox在右；三集UMAP和KM横排，减少竖向空白。"""
     k = len(colors)
     extra_a = max(0, len(config.figure.atlas) - 13) * 3 + (7 if k > 5 else 0)
     extra_c = (
         max(0, math.ceil(len(config.figure.trajectories) / 3) - 2) * 30
         + max(0, math.ceil(k / 8) - 1) * 6
     )
-    extra_c = max(extra_c, max(0, len(config.figure.display_datasets) - 2) * 32)
     extra_e = max(0, k - 5) * 3
-    width = max(config.figure.width_mm, 180 + max(0, len(config.figure.display_datasets) - 2) * 48)
-    height = max(config.figure.height_mm, 215 + extra_a + extra_c + extra_e)
+    width = max(config.figure.width_mm, 190)
+    height = max(config.figure.height_mm, 242 + extra_a + extra_c + extra_e)
     fig = plt.figure(figsize=(width / 25.4, height / 25.4), facecolor="white")
     plt.rcParams.update({"font.size": 6, "svg.fonttype": "none", "pdf.fonttype": 42})
     first = fig.add_gridspec(
@@ -598,30 +610,36 @@ def plot_main_figure(
         2,
         left=10 / width,
         right=1 - 5 / width,
-        top=1 - (87 + extra_a) / height,
-        bottom=1 - (134 + extra_a + extra_c) / height,
-        width_ratios=[100, 50],
-        wspace=0.28,
+        top=1 - (86 + extra_a) / height,
+        bottom=1 - (131 + extra_a + extra_c) / height,
+        width_ratios=[120, 48],
+        wspace=0.32,
     )
     third = fig.add_gridspec(
         1,
-        2,
+        1,
         left=11 / width,
         right=1 - 5 / width,
-        top=1 - (159 + extra_a + extra_c) / height,
+        top=1 - (188 + extra_a + extra_c) / height,
         bottom=5 / height,
-        width_ratios=[100, 50],
-        wspace=0.38,
+    )
+    latent = fig.add_gridspec(
+        1,
+        1,
+        left=11 / width,
+        right=1 - 5 / width,
+        top=1 - (150 + extra_a + extra_c) / height,
+        bottom=1 - (174 + extra_a + extra_c) / height,
     )
     _setting(fig, first[0], tables, frames, outcome, landmark, config)
     _atlas(fig, first[1], tables["Atlas"], k, colors, config)
     _trajectories(fig, second[0], tables["Trajectories"], landmark, colors, config)
-    _umap(fig, second[1], projections, frames, colors, config)
+    _umap(fig, latent[0], projections, frames, colors, config)
     _survival(
         fig, third[0], km_models, km_summaries, tables["At_risk"], frames, outcome, colors, config
     )
     cox = tables["Cox"].loc[tables["Cox"]["dataset"].eq(config.figure.cox_dataset)]
-    _cox(fig, third[1], cox, cox_summary, len(frames[config.figure.cox_dataset]), colors, config)
+    _cox(fig, second[1], cox, cox_summary, len(frames[config.figure.cox_dataset]), colors, config)
     for extension in ("pdf", "svg", "png"):
         fig.savefig(stem.with_suffix(f".{extension}"), dpi=config.plot.dpi, facecolor="white")
     plt.close(fig)

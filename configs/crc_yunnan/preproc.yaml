@@ -1,6 +1,6 @@
 # @package _global_
 dataset: crc_yunnan
-version: v2
+version: v2-g14-clean-20261008
 outcome: os
 landmark_months: 24
 min_observation_dates: 2
@@ -21,7 +21,7 @@ paths:
   run_dir: outputs/crc_yunnan/preproc_runs/${now:%Y%m%d-%H%M%S-%f}
 
 features:
-  panel: E60
+  panel: G14
   # 明确列出每套面板；新增源指标不会自动进入任何面板。
   panels:
     G14:

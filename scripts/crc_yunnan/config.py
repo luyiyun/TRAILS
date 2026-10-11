@@ -478,12 +478,38 @@ class CRCPostprocessConfig(BaseModel):
         return self
 
 
+class KScanConfig(BaseModel):
+    """同一超参数配置的既有05目录；不自动训练缺失K。"""
+
+    model_config = ConfigDict(extra="forbid")
+    run_dirs: list[Path] = Field(default_factory=list)
+    expected_ks: list[Annotated[int, Field(ge=2)]] = Field(default_factory=list)
+    highlight_k: Annotated[int, Field(ge=2)] | None = None
+
+    @model_validator(mode="after")
+    def validate_scan(self) -> Self:
+        if self.expected_ks != sorted(set(self.expected_ks)):
+            raise ValueError("expected_ks须严格递增且不重复")
+        if len(set(self.run_dirs)) != len(self.run_dirs):
+            raise ValueError("run_dirs不能重复")
+        return self
+
+
 class CRCSupplementaryConfig(CRCPostprocessConfig):
     """07完整统计、补充图和候选K比较。"""
 
     columns: EDAColumnsConfig
     trajectory_panels_per_page: int = Field(ge=1, le=24)
     fisher_resamples: int = Field(ge=100)
+    k_scan: KScanConfig = Field(default_factory=KScanConfig)
+
+
+class TrajectorySelectionConfig(BaseModel):
+    """训练集描述性覆盖选择；固定名单须与复算结果相符。"""
+
+    model_config = ConfigDict(extra="forbid")
+    minimum_shared_bins: int = Field(default=4, ge=2)
+    level_weight: FiniteFloat = Field(default=0.5, ge=0, le=1)
 
 
 class FigureFeatureConfig(BaseModel):
@@ -533,6 +559,7 @@ class CRCFigureConfig(CRCPostprocessConfig):
     """06正文六面板组图及其Source Data。"""
 
     figure: FigurePanelsConfig
+    trajectory_selection: TrajectorySelectionConfig | None = None
 
     @model_validator(mode="after")
     def validate_panel_datasets(self) -> Self:

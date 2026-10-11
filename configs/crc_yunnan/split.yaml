@@ -1,6 +1,7 @@
 # @package _global_
 dataset: crc_yunnan
-version: v2
+version: v2-g14-clean-20261008
+# 继续复用原v2主划分；清洗后的输出独立保存。
 split_version: v2
 
 paths:
@@ -8,12 +9,12 @@ paths:
   patients_csv: ${paths.cohort_root}/patients.csv
   observations_csv: ${paths.cohort_root}/observations.csv
   assignment_root: data/derived/crc_yunnan/assignments/${split_version}
-  dir: data/derived/crc_yunnan/splits/${split_version}
+  dir: data/derived/crc_yunnan/splits/${version}
   run_dir: outputs/crc_yunnan/split_runs/${now:%Y%m%d-%H%M%S-%f}
 
 save_full_dataset: false
 split:
-  strategies: [random, temporal]
+  strategies: [random]
   seeds: [20260908]
   random:
     train_fraction: 0.64

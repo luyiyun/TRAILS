@@ -400,8 +400,8 @@ uv run python -m scripts.crc_yunnan.02_eda
 uv run python -m scripts.crc_yunnan.03_split
 uv run python -m scripts.crc_yunnan.04_preproc
 uv run python -m scripts.crc_yunnan.05_run
-uv run python -m scripts.crc_yunnan.06_figure inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling n_clusters=5
-uv run python -m scripts.crc_yunnan.07_supplementary inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling n_clusters=5
+uv run python -m scripts.crc_yunnan.06_figure inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling
+uv run python -m scripts.crc_yunnan.07_supplementary inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling
 ```
 
 01 完成基础清洗与纳排，另存特征分组和中文排除汇总。02 输出中文
@@ -412,29 +412,31 @@ CSV；04 选择结局、窗口及固定面板，仅在训练观测上拟合变�
 建模一致使用 OS；完整队列生存曲线仍同时展示 DFS 和 OS。
 各命令的 YAML 位于 `configs/crc_yunnan/`，旧长格式和旧编号入口不再使用。
 
-默认 03 同时生成 random 和 temporal-2017，默认 04/05 使用 random。
+当前普通YAML统一采用G14/N2-K6；完整配置说明见 `configs/crc_yunnan/README.md`。
+默认03仅生成random并复用原v2主划分，04/05使用清洗后的G14输入。
+以下非默认示例需要先显式生成相应划分。
 预处理时间划分时，同时设置输入和独立输出目录：
 
 ```bash
 uv run python -m scripts.crc_yunnan.04_preproc \
-  inputs.split_dir=data/derived/crc_yunnan/splits/v2/temporal-2017/seed-20260908 \
-  paths.dir=data/derived/crc_yunnan/preproc/v2/os/landmark-24m/E60/auto-log1p-robust/temporal-2017/seed-20260908
+  inputs.split_dir=data/derived/crc_yunnan/splits/v2-g14-clean-20261008/temporal-2017/seed-20260908 \
+  paths.dir=data/derived/crc_yunnan/preproc/v2-g14-clean-20261008/os/landmark-24m/G14/auto-log1p-robust/temporal-2017/seed-20260908
 uv run python -m scripts.crc_yunnan.05_run split.strategy=temporal-2017
 ```
 
 ### 全样本固定 K 训练
 
-以下命令先仅保存完整基础队列，再按默认 OS、24 个月和 E60 规则形成全体合格
+以下非默认示例先仅保存完整基础队列，再按默认 OS、24 个月和 G14 规则形成全体合格
 患者。若同时需要普通划分，去掉第一条命令中的 `split.strategies=[]`。
 
 ```bash
 uv run python -m scripts.crc_yunnan.03_split \
   'split.strategies=[]' split.save_full_dataset=true
 uv run python -m scripts.crc_yunnan.04_preproc \
-  inputs.train_dir=data/derived/crc_yunnan/splits/v2/full \
-  'inputs.test_dirs=[]' paths.dir=data/derived/crc_yunnan/preproc/v2/full-e60
+  inputs.train_dir=data/derived/crc_yunnan/splits/v2-g14-clean-20261008/full \
+  'inputs.test_dirs=[]' paths.dir=data/derived/crc_yunnan/preproc/v2-g14-clean-20261008/full-g14
 uv run python -m scripts.crc_yunnan.05_run \
-  split.dir=data/derived/crc_yunnan/preproc/v2/full-e60 n_clusters=3
+  split.dir=data/derived/crc_yunnan/preproc/v2-g14-clean-20261008/full-g14 n_clusters=3
 ```
 
 04 的 `inputs.test_dirs` 可包含一个或多个目录，例如 validation 与 test；省略该
@@ -538,7 +540,8 @@ K本身只用train/validation选择，代表seed沿用05的验证指标排序。
 
 ### 候选指标、正文图与补充图
 
-05 使用同一个 `run.yaml`，默认串行训练 K2–10、seed20260908。
+05 使用唯一 `run.yaml`，默认训练G14/N2-K6、seed20260908。
+已完成的K2–10诊断复用既有产物，不自动重复训练。
 `n_clusters=5` 或 `'n_clusters=[2,5]'` 控制候选K，`'seeds=[20260908]'` 控制模型seed。
 所有模型训练完成后才读取test，报告三集 C-index、潜空间混合 BIC/NLL、簇占用、
 人数和事件数。无自动入选K、最佳seed或综合排名。空簇和最小占比5%只作为诊断，
@@ -548,10 +551,12 @@ K本身只用train/validation选择，代表seed沿用05的验证指标排序。
 根目录 `run_metrics.csv` 保存逐seed/K/数据集指标，`k_summary.csv` 保存跨seed均值、
 标准差及占簇诊断，`run_manifest.json`（schema 3）引用全部候选。
 
-06与07独立读取05，均必须显式传入K。默认各自输出到同级 `figure/`、
+06与07独立读取05，默认K6、model_seed20260908，必须显式提供输入目录。
+07的跨K组图默认读取215上的九个冻结N2聚合目录；若05输入自身包含所需网格，
+显式设 `k_scan.run_dirs=[]`。默认各自输出到同级 `figure/`、
 `supplementary/` 下的 `k<K>/`，日志分别在 `logs/06_figure/`、
-`logs/07_supplementary/`。只有一个模型seed时推断使用；多个seed须指定
-`model_seed`。图件/统计随机seed由 `seed` 和 `umap.seed` 分别控制，不选择模型seed。
+`logs/07_supplementary/`。其他模型seed须覆盖 `model_seed`；显式置为null时只在
+仅一个可用seed的情况下推断。图件/统计随机seed由 `seed` 和 `umap.seed` 分别控制。
 历史schema-2模型及候选也可以读取；历史未保存预测的候选在冻结数据上推理，不训练。
 
 ```bash
@@ -566,18 +571,18 @@ uv run python -m scripts.crc_yunnan.06_figure \
 
 uv run python -m scripts.crc_yunnan.07_supplementary \
   inputs.run_dir=outputs/crc_yunnan/<运行名>/modeling \
-  'n_clusters=[2,5]' model_seed=20260908
+  'n_clusters=[2,5]' model_seed=20260908 'k_scan.run_dirs=[]'
 ```
 
 以上是未执行的示例；实际运行前将确切命令追加至 `history.sh`。
 
 06 的 `figure.yaml` 默认复现认可的六面板结构：稀疏临床设置、阶段画像、
-代表轨迹、验证/测试UMAP、验证/测试窄高KM，以及测试集调整Cox。
+代表轨迹、三集UMAP、三集KM，以及测试集调整Cox。
 每个K输出 `Figure_K<K>.pdf/svg/png`、`SourceData.xlsx`、
 `figure_summary.json` 和 `resolved_config.yaml`；PNG默认600 dpi，文字可编辑。
-180×215 mm为基准，指标、簇或展示集增加时扩展布局。图内全部为英文。
+当前为190×255 mm，图内全部为英文。
 `figure.atlas` / `figure.trajectories` 明确配置 feature、英文label、原始unit和
-线性/log轴；缺失指标不会被自动省略。改用G14等面板时须先修改这些列表，
+线性/log轴；当前为G14的14项画像及训练集选定的6项轨迹。更换面板时须修改这些列表，
 不推测单位。`figure.phase_days` 默认 [0,90,360,720]，必须覆盖模型窗口；
 各面板数据集由 profile_dataset、display_datasets、cox_dataset 明确控制。
 

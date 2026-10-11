@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -13,16 +14,189 @@ import torch
 import umap
 from lifelines import CoxPHFitter, KaplanMeierFitter
 from lifelines.statistics import multivariate_logrank_test
+from omegaconf import OmegaConf
 from scipy import stats
 from scipy.special import xlogy
 
-from trails import ClinicalTimeSeriesDataset, TrailsEstimator, TrailsPrediction
+from trails import (
+    ClinicalTimeSeriesDataset,
+    ClusterNumberSelector,
+    TrailsEstimator,
+    TrailsPrediction,
+)
 from trails.artifacts import flatten_history
 from trails.metrics import SurvivalMetrics, concordance_index
 
-from .config import BASELINE_LABELS, CRCPostprocessConfig, CRCSupplementaryConfig
+from .config import BASELINE_LABELS, CRCFigureConfig, CRCPostprocessConfig, CRCSupplementaryConfig
 
 SPLIT_LABELS = {"train": "训练集", "validation": "验证集", "test": "测试集"}
+
+
+def k_scan_metrics(config: CRCSupplementaryConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """合并同配置的05聚合指标，复用公开选择器计算描述性综合分。"""
+    roots = config.k_scan.run_dirs or [config.inputs.run_dir]
+    signature = None
+    parts = []
+    minimum = 0.05
+    for root in roots:
+        manifest = json.loads((root / "run_manifest.json").read_text())
+        if manifest["schema_version"] != 3:
+            raise ValueError("跨目录K曲线要求schema_version=3的05产物")
+        raw = OmegaConf.to_container(OmegaConf.load(root / "resolved_config.yaml"), resolve=True)
+        assert isinstance(raw, dict)
+        model, trainer = dict(raw["model"]), dict(raw["trainer"])
+        model.pop("n_clusters", None)
+        trainer.pop("device", None)
+        current = {
+            "model": model,
+            "trainer": trainer,
+            **{
+                key: manifest[key]
+                for key in [
+                    "split_dir",
+                    "outcome",
+                    "landmark_days",
+                    "panel",
+                    "training_scope",
+                    "min_cluster_fraction",
+                ]
+            },
+        }
+        if signature is not None and current != signature:
+            raise ValueError(f"K曲线输入的超参数或冻结队列不一致：{root}")
+        signature = current
+        minimum = float(manifest["min_cluster_fraction"])
+        parts.append(pd.read_csv(root / manifest["metrics"]).assign(source_run=str(root)))
+    metrics = pd.concat(parts, ignore_index=True)
+    if config.model_seed is not None:
+        metrics = metrics.loc[metrics["seed"].eq(config.model_seed)].copy()
+    if metrics.duplicated(["seed", "n_clusters", "dataset"]).any():
+        raise ValueError("同一seed/K/dataset重复；请明确只保留一个05来源")
+    expected = config.k_scan.expected_ks or sorted(metrics["n_clusters"].unique().tolist())
+    if set(metrics["n_clusters"]) - set(expected):
+        raise ValueError("K曲线输入含有expected_ks以外的K")
+    scored = []
+    for name, rows in metrics.groupby("dataset", sort=False):
+        selector = ClusterNumberSelector(
+            candidates=expected,
+            seeds=sorted(rows["seed"].unique().tolist()),
+            require_non_empty=True,
+            min_cluster_fraction=minimum,
+            compute_stability=False,
+        )
+        result = selector.summarize_completed(rows, pd.DataFrame(columns=["n_clusters", "ari"]))
+        scored.append(result.run_metrics.assign(dataset=name))
+    return pd.concat(scored, ignore_index=True), {
+        "expected_ks": expected,
+        "available_ks": sorted(metrics["n_clusters"].unique().tolist()),
+        "missing_ks": sorted(set(expected) - set(metrics["n_clusters"])),
+        "minimum_cluster_fraction": minimum,
+        "score_definition": (
+            "sqrt(C-index^2 + (1 - minmax(BIC))^2); "
+            "each dataset/seed separately; all finite available K"
+        ),
+        "interpretation": (
+            "Descriptive score only; does not replace the HP survival-tier "
+            "ranking or change the manually fixed K."
+        ),
+        "bic_definition": (
+            "Existing latent-mixture BIC, not full joint-model BIC; includes "
+            "the historical K-1 mixture term even with fixed logits."
+        ),
+        "sources": [str(root) for root in roots],
+    }
+
+
+def trajectory_selection(
+    trajectories: pd.DataFrame, parameters: pd.DataFrame, k: int, config: CRCFigureConfig
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """复现G14训练集的水平/趋势覆盖选择，不使用结局或验证/测试集。"""
+    options = config.trajectory_selection
+    assert options is not None
+    features = parameters["feature"].tolist()
+    table = trajectories.loc[trajectories["dataset"].eq("train")]
+    bins = sorted(table["时间箱"].unique())
+    if len(bins) < options.minimum_shared_bins:
+        raise ValueError("时间箱不足，不能完成配置的轨迹覆盖选择")
+    index = pd.MultiIndex.from_product([features, range(k), bins], names=["特征", "簇", "时间箱"])
+    ordered = table.set_index(["特征", "簇", "时间箱"]).reindex(index)
+    shape = (len(features), k, len(bins))
+    z = ordered["中位数"].to_numpy(dtype=float, copy=True).reshape(shape)
+    counts = ordered["观测人数"].to_numpy(dtype=float).reshape(shape)
+    coverage = ordered["覆盖率（%）"].to_numpy(dtype=float).reshape(shape) / 100
+    pars = parameters.set_index("feature").loc[features]
+    logged = pars["transform"].eq("log1p").to_numpy()
+    z[logged] = np.log1p(z[logged])
+    z = (z - pars["center"].to_numpy()[:, None, None]) / pars["scale"].to_numpy()[:, None, None]
+    pairs = list(combinations(range(k), 2))
+    first, second = np.array(pairs).T
+    contrast = z[:, first] - z[:, second]
+    valid = (
+        (counts[:, first] >= config.figure.min_observed)
+        & (counts[:, second] >= config.figure.min_observed)
+        & np.isfinite(contrast)
+    )
+    enough = valid.sum(axis=2) >= options.minimum_shared_bins
+    weight = np.where(
+        valid & enough[:, :, None], np.sqrt(coverage[:, first] * coverage[:, second]), 0
+    )
+    # 固定箱数为分母；缺失与低覆盖不会因分母缩小而提高描述分。
+    distance = np.nan_to_num(np.abs(contrast))
+    level = (weight * distance / (1 + distance)).sum(axis=2) / len(bins)
+    distance = np.nan_to_num(np.abs(contrast - contrast[:, :, :1]))
+    shape_score = (
+        (weight * valid[:, :, :1])[:, :, 1:] * distance[:, :, 1:] / (1 + distance[:, :, 1:])
+    ).sum(axis=2) / (len(bins) - 1)
+    alpha = options.level_weight
+    count = len(config.figure.trajectories)
+    if count > len(features):
+        raise ValueError("请求轨迹数量大于模型指标数")
+
+    def objective(chosen: tuple[int, ...]) -> float:
+        return float(
+            (
+                alpha * level[list(chosen)].max(axis=0)
+                + (1 - alpha) * shape_score[list(chosen)].max(axis=0)
+            ).mean()
+        )
+
+    best, score, secondary = (), -1.0, -1.0
+    for choice in combinations(range(len(features)), count):
+        value = objective(choice)
+        individual = float(
+            (alpha * level[list(choice)] + (1 - alpha) * shape_score[list(choice)]).mean()
+        )
+        if value > score + 1e-12 or (abs(value - score) <= 1e-12 and individual > secondary):
+            best, score, secondary = choice, value, individual
+    selected = [features[i] for i in best]
+    rows = [
+        {
+            "feature": feature,
+            "level": level[i].mean(),
+            "shape": shape_score[i].mean(),
+            "individual_score": (alpha * level[i] + (1 - alpha) * shape_score[i]).mean(),
+            "selected": i in best,
+            "coverage_objective": score,
+            "leave_one_out_gain": score - objective(tuple(j for j in best if j != i))
+            if i in best and len(best) > 1
+            else 0.0,
+        }
+        for i, feature in enumerate(features)
+    ]
+    pairs_table = pd.DataFrame(
+        [
+            {
+                "feature": feature,
+                "cluster_a": a,
+                "cluster_b": b,
+                "level": level[i, p],
+                "shape": shape_score[i, p],
+            }
+            for i, feature in enumerate(features)
+            for p, (a, b) in enumerate(pairs)
+        ]
+    )
+    return pd.DataFrame(rows), pairs_table, selected
 
 
 @dataclass(frozen=True)
@@ -375,6 +549,7 @@ def km_source_data(
     for cluster, km in models.items():
         table = km.survival_function_.join(km.confidence_interval_)
         table.columns = ["survival", "ci_lower", "ci_upper"]
+        table["censored"] = km.event_table["censored"].reindex(table.index, fill_value=0)
         table = table.rename_axis("month").reset_index()
         table.insert(0, "cluster", cluster)
         curves.append(table)

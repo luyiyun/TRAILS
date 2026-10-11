@@ -23,6 +23,7 @@ from scripts.crc_yunnan.evaluation import (
     cluster_survival,
     evaluation_requests,
     evaluation_summary,
+    k_scan_metrics,
     latent_projection,
     load_evaluation_data,
     survival_evaluation,
@@ -248,7 +249,36 @@ def evaluate_model(
         k_summary = run_metrics.copy()
         minimum = 0.05
     tables["K候选指标"], tables["K指标汇总"] = run_metrics, k_summary
-    plot_k_metrics(run_metrics, minimum, figures / "k_metrics", dpi)
+    if manifest["schema_version"] == 3:
+        run_metrics, scan_summary = k_scan_metrics(config)
+        tables["K候选指标"] = run_metrics
+        scan_table: pd.DataFrame = run_metrics.groupby(
+            ["n_clusters", "dataset"], as_index=False
+        ).agg(  # type: ignore[reportAssignmentType]
+            n_seeds=("seed", "nunique"),
+            mean_selection_score=("selection_score", "mean"),
+            mean_cindex=("cindex", "mean"),
+            mean_bic=("latent_mixture_bic", "mean"),
+            minimum_cluster_fraction=("cluster_min_fraction", "min"),
+            maximum_empty_clusters=("cluster_empty_count", "max"),
+        )
+        tables["K指标汇总"] = scan_table
+        tables["K曲线定义"] = pd.DataFrame(
+            [
+                {"item": key, "value": json.dumps(value, ensure_ascii=False)}
+                for key, value in scan_summary.items()
+            ]
+        )
+        summary["K曲线"] = scan_summary
+        run_metrics.to_csv(output / "k_scan_metrics.csv", index=False)
+    plot_k_metrics(
+        run_metrics,
+        minimum,
+        figures / "k_metrics",
+        dpi,
+        expected_ks=config.k_scan.expected_ks,
+        highlight_k=config.k_scan.highlight_k,
+    )
     candidates = available_models(source, manifest)
     if "validation" not in manifest["datasets"] or len({row["seed"] for row in candidates}) < 2:
         summary["跨seedARI"] = {"不可计算原因": "没有独立验证集或不足两个候选seed"}

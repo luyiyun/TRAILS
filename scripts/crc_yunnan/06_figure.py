@@ -20,6 +20,7 @@ from scripts.crc_yunnan.evaluation import (
     latent_projection,
     load_evaluation_data,
     observation_summaries,
+    trajectory_selection,
     trajectory_statistics,
     write_summary,
 )
@@ -101,6 +102,14 @@ def run(config: CRCFigureConfig) -> None:
                 table.insert(0, "dataset", name)
                 collected.setdefault(key, []).append(table)
         tables = {key: pd.concat(parts, ignore_index=True) for key, parts in collected.items()}
+        if config.trajectory_selection is not None:
+            selection, pairwise, chosen = trajectory_selection(
+                tables["Trajectories"], data.parameters, model.n_clusters, config
+            )
+            if chosen != [spec.feature for spec in config.figure.trajectories]:
+                raise ValueError(f"固定轨迹名单与训练集选择不同：{chosen}；请显式复核配置")
+            tables["Trajectory_selection"] = selection
+            tables["Trajectory_pairs"] = pairwise
         cox, cox_summary = adjusted_cox(frames[config.figure.cox_dataset], data.reference)
         cox.insert(0, "dataset", config.figure.cox_dataset)
         tables["Cox"] = cox
@@ -173,6 +182,12 @@ def run(config: CRCFigureConfig) -> None:
                 f"Original units; patient medians within {config.trajectory_bin_days}-day bins, "
                 "then cluster medians and IQR; final endpoint included"
             ),
+            "Trajectory selection": (
+                "Fixed configured features; optional train-only pair coverage of level and "
+                "baseline-subtracted change; d/(1+d), coverage weighting, exhaustive combinations. "
+                "See Trajectory_selection / Trajectory_pairs when enabled. "
+                "Descriptive, not model importance or within-patient change."
+            ),
             "Density": (
                 "Observed dates and nonmissing feature values per patient; "
                 "patient median intervals, then population quartiles"
@@ -190,7 +205,8 @@ def run(config: CRCFigureConfig) -> None:
                 "common limits and equal aspect; no coordinate export"
             ),
             "KM": (
-                f"95% CI; display 0–{config.figure.display_months:g} months after landmark; "
+                "95% CI; ticks at actual censoring times; "
+                f"display 0–{config.figure.display_months:g} months after landmark; "
                 "full available follow-up used for log-rank and Cox"
             ),
             "At risk": "survival_time >= month * 30, before removals at exact time",
