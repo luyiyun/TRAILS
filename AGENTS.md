@@ -37,7 +37,7 @@ Allowed dependencies:
 - `scripts.mimic command modules -> scripts.mimic` non-command support modules
 - workflow packages under `scripts/ -> scripts.utils`
 - workflow packages under `scripts/ -> scripts.configs`
-- `scripts.configs -> trails_case.config` for the existing command config inheritance
+- `scripts.configs -> trails_simulate.config` for shared training configuration
 - `scripts.utils -> trails`
 - `trails_simulate -> trails`
 - `trails_case -> trails`
@@ -61,16 +61,16 @@ clean reusable method library.
 - Paper simulation grid generation for one scene: `uv run python scripts/simulate.py simulation=base`
 - Train existing splits: `uv run python scripts/train.py training=base paths.data_root=data/simulated/base`
 - Train with mTAN-style input: `uv run python scripts/train.py training=mtan paths.data_root=data/simulated/base`
-- Run real-data case modeling: `uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv`
 - Generate MIMIC patient splits and tensor datasets: `uv run python -m scripts.mimic.06_split`
 - Split CRC Yunnan patients and middle-format observations: `uv run python -m scripts.crc_yunnan.03_split`
 - Prepare CRC Yunnan model datasets: `uv run python -m scripts.crc_yunnan.04_preproc`
 - Train and report CRC Yunnan candidates on one frozen split: `uv run python -m scripts.crc_yunnan.05_run`
 - Draw a CRC main figure: `uv run python -m scripts.crc_yunnan.06_figure inputs.run_dir=outputs/crc_yunnan/<run>/modeling n_clusters=5`
 - Produce CRC supplementary evaluation: `uv run python -m scripts.crc_yunnan.07_supplementary inputs.run_dir=outputs/crc_yunnan/<run>/modeling n_clusters=5`
-- Run MIMIC modeling with configured or automatically selected K: `uv run python -m scripts.mimic.07_run`
+- Run all MIMIC seed/K candidates without automatic selection: `uv run python -m scripts.mimic.07_run`
 - Run MIMIC baselines on frozen splits: `uv run python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517`
-- Evaluate frozen MIMIC predictions: `uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<primary-run>,outputs/mimic_case/<other-runs>]' 'baseline_dirs=[outputs/mimic_case/<baselines>]'`
+- Draw the MIMIC main figure: `uv run python -m scripts.mimic.09_figure inputs.run_dir=outputs/mimic_case/<run> n_clusters=3 model_seed=20260517 selection_basis=validation`
+- Produce MIMIC supplements independently: `uv run python -m scripts.mimic.10_supplementary inputs.run_dir=outputs/mimic_case/<run> n_clusters=3 model_seed=20260517 selection_basis=validation`
 - Run lightweight baselines on existing splits: `uv run python scripts/baseline.py paths.data_root=data/simulated/base`
 - Run Optuna tuning on existing splits: `uv run python scripts/optim.py paths.data_root=data/simulated/base`
 - Summarize train and baseline results: `uv run python scripts/summary.py 'train_roots=[outputs/train/base-...,outputs/train/mtan-...]' 'baseline_roots=[outputs/baseline/base-...]' 'train_labels=[base,mtan]' 'baseline_labels=[kmeans]'`
@@ -300,20 +300,29 @@ clean reusable method library.
 - Clustering uses a VaDE-style learnable Gaussian mixture latent prior,
   initialized by deterministic k-means after warmup.
 - CRC modeling uses `05_run` followed by independent `06_figure`/`07_supplementary`; the standalone recipe-search
-  command and its dedicated configuration have been removed. Shared selector APIs
+  command and its dedicated configuration have been removed. Shared candidate evaluator APIs
   and trainer controls remain available to existing modeling workflows.
   Optional trainer controls cover warmup objective, mixture initialization, stage
   resets/freezing, and native LR schedulers. Defaults preserve existing training and
   format-3 checkpoint loading; diagnostic passes preserve Torch RNG state.
 - The core network is `TrailsModel`, replacing the old patient-level survival model.
   Its joint distribution is p(c)p(z|c)p(x|z)p(T|z,c). Training reconstruction,
-  mixture-prior and survival branches share one reparameterized z; evaluation and
-  prediction use the latent mean deterministically. The survival network takes z
-  through shared hidden layers and emits K cluster-specific log-scales directly.
-  All clusters reuse the same sampled z; hidden layers keep latent_dim width and ReLU.
-  Zero hidden layers give each cluster its own linear z effect and intercept.
-  One trainable scalar log-shape is
-  shared and initialized to zero. CRC retains one hidden layer; no softplus is applied. Generic and CRC
+  mixture-prior and survival branches share one reparameterized z by default; evaluation and
+  prediction use the latent mean deterministically. `model.survival_head_architecture`
+  selects `multi_output` (default) or `one_hot`. The default takes z through shared
+  hidden layers and emits K cluster-specific log-scales plus one globally shared
+  trainable log-shape initialized to zero. `one_hot` concatenates each patient's z
+  with every cluster's one-hot vector and uses a shared network to emit log-scale
+  and log-shape for each patient/cluster pair; it has no global shape parameter.
+  Both modes evaluate all K components and mix curves using outcome-free p(c|z).
+  `model.survival_latent_source` selects `sample` (default) or `mean` for the survival
+  head only. Mean mode retains gradients through the latent mean; reconstruction
+  and mixture-prior branches still use the sampled z. Both modes use the latent mean
+  during evaluation. The option is saved in checkpoints; absent values default to
+  `sample`. All clusters reuse the chosen latent input; hidden layers keep latent_dim width and ReLU.
+  Zero hidden layers give independent linear z effects per cluster in multi_output;
+  one_hot instead has shared linear z effects and cluster-specific intercepts.
+  CRC retains one hidden layer; no softplus is applied. Generic and CRC
   defaults are Weibull. `survival_loss=cox` remains a configuration enum but model
   construction raises NotImplementedError; no old TRAILS Cox execution path remains.
   Independent baseline models are unaffected.
@@ -330,7 +339,7 @@ clean reusable method library.
 - `TrailsPrediction.cluster_probabilities` and labels always use outcome-free p(c|z).
   Survival curves mix component curves with these probabilities, never averaged
   Weibull parameters. Validation losses use gamma; occupancy, ARI, C-index and other
-  prospective metrics use outcome-free predictions. K-selection rules are unchanged.
+  prospective metrics use outcome-free predictions. TRAILS candidate metrics remain descriptive; baseline K-selection rules are unchanged.
   `TrailsEstimator.predict(..., include_survival_posterior=True)` optionally returns
   `survival_conditioned_cluster_probabilities` for retrospective analysis without
   changing ordinary predictions; requesting it with survival disabled raises an error.
@@ -338,13 +347,15 @@ clean reusable method library.
   1-S(horizon), or negative log mixture median, found by vectorized log-time bisection
   between component medians. Models and predictions use format 3; all older formats
   are rejected and require their original code. Model checkpoints save
-  survival_head_architecture="multi_output". Original format-3 multi-output checkpoints
+  survival_head_architecture matching the model config. Original format-3 multi-output checkpoints
   without this marker remain loadable; explicit mismatched markers are rejected.
-  Conditioned-one-hot models require their original code; format-3 predictions remain
+  Historical `conditioned_one_hot` models require their original code; the new
+  dual-parameter `one_hot` head has a distinct marker. Format-3 predictions remain
   compatible. Optional retrospective posteriors are saved with predictions.
   The matched OS24/E60 experiment did not improve occupancy with one-hot conditioning,
-  so the multi-output head is restored. Initialization, warmup, early stopping and
-  K-selection remain unchanged.
+  so multi_output remains the default; the new dual-parameter one_hot head has not
+  been validated on a real cohort. Initialization, warmup, early stopping and
+  candidate diagnostics remain unchanged.
 - TorchSurv supplies Harrell/Uno C-index, cumulative/dynamic AUC, Brier and their
   integrals across training, K selection, CRC/MIMIC and baseline selection.
   `trails.metrics.SurvivalMetrics` supplies train-only IPCW and support checks; it
@@ -392,13 +403,9 @@ clean reusable method library.
   logits, aggregates them into fixed time-bin by feature tables with SEM, and writes
   one multi-cluster line plot using `--plot-features` as either Top-N or explicit
   feature names.
-- `scripts/case.py` reads real-data CSV inputs:
-  `patients.csv` with `patient_id`, `survival_time`, `event`, and optional
-  `cluster_label`; `observations.csv` with `patient_id`, `time`, `feature`,
-  and `value`. It trains on all patients, uses `trainer.valid_size`
-  only for internal early stopping, and saves the converted dataset, model,
-  history, predictions, patient-level clusters, cluster summaries, feature
-  summaries, and `case_summary.json` under `paths.dir`.
+- Generic real-data workflows use `ClinicalTimeSeriesDataset.from_dataframes()` or
+  `load_from_csv()` followed by public estimator/evaluator APIs. Dataset adapters and
+  command orchestration stay outside `trails`.
 - CRC Yunnan uses `01_cohort -> 02_eda -> 03_split -> 04_preproc -> 05_run -> 06_figure / 07_supplementary`,
   with Hydra configs `cohort`, `eda`, `split`, `preproc`, `run`, `figure`, and `supplementary` under
   `configs/crc_yunnan`. New cohort/split/preproc artifacts use v2; historical v1
@@ -513,22 +520,29 @@ clean reusable method library.
 - MIMIC patient inputs and each frozen split preserve baseline `age`, `gender`,
   `race`, and sepsis-onset `sofa_score` covariates for adjusted descriptive Cox
   analysis; these variables are not added to the longitudinal clustering inputs.
-- `scripts/mimic/01_build_sepsis.py` through `07_run.py` form the current ordered
-  MIMIC analysis workflow. `06_split.py` saves ID-only train/validation/test
-  partitions and their tensor datasets. In `07_run.py`, a non-null top-level
-  `n_clusters` runs that fixed K, while `n_clusters: null` selects K from the
-  configured candidates and seeds using train plus validation only. The configured
-  `trainer.seed` must be among the selection seeds and identifies the predeclared
-  candidate estimator used for downstream predictions; test is loaded only after K
-  and that final estimator are locked. Single-seed selection leaves stability pairs
-  empty, while multiple seeds enable pairwise ARI summaries and the optional
-  `min_mean_pairwise_ari` gate. Selection artifacts use the public
-  `ClusterNumberSelectionResult` contract under `k_selection.result_dir`.
-  `07_run.py` then exports per-split datasets, complete `TrailsPrediction` objects,
-  patient-level tables, metrics, the model, preprocessing parameters, history, and
-  a run manifest. Their Hydra command configs live under `configs/mimic/`; `split.yaml` declares
-  `feature_order: []`, which preserves the observed CSV order by default and can
-  be overridden directly through Hydra.
+- MIMIC `01–05 -> 06_split -> 07_run / 08_baselines -> 09_figure / 10_supplementary`
+  preserves the cohort, 23 features, 0–48h window, landmark+28d outcome and frozen splits.
+  06 validates a `MimicPreparationConfig` and passes the already transformed pivot directly
+  to `from_dataframes`, preserving source patient/feature order, masks and time gaps.
+  Only train fits 1%/99% winsorization and standardization. YAML `feature_order: []`
+  continues to preserve observed source feature order.
+- Both MIMIC 07 and CRC 05 call public `ClusterNumberEvaluator.fit`; command layers only
+  adapt frozen inputs and export patient CSVs/YAML/manifests through `scripts.utils.candidates`.
+  MIMIC defaults to K=[2,3,4,5], seeds=[20260517], with its existing model/trainer settings.
+  All seed/K candidates train serially with valid_size=0, save and release each estimator.
+  Missing independent validation means full-train fitting, never an implicit split.
+  Additional named datasets or dataset paths load only after all models freeze.
+  No TRAILS best-K selection, ranking, seed winners or occupancy stopping remains.
+- `ClusterNumberEvaluatorConfig` / `ClusterNumberEvaluationResult` are public API types.
+  The evaluator owns one result; candidates/run_metrics/k_summary/stability_pairs proxy it.
+  Version-1 evaluator.json uses relative artifact paths; load reads only config/metadata/CSV
+  aggregates. Model, prediction and history load lazily via load_estimator/load_prediction/
+  load_history. Aggregate-only downloads support browsing/plotting and whole-directory moves.
+  Missing patient/model files fail only on the corresponding accessor. No legacy migration.
+  The historical selection_score column is descriptive only, computed within dataset/seed
+  using sqrt(Cindex^2+(1-BIC_norm)^2). BIC definition is unchanged. Occupancy is diagnostic.
+  Cross-seed ARI uses only the same independent validation; absent validation/single seed
+  records an unavailable reason. CRC 06/07 still accept historical CRC modeling artifacts.
 - `scripts/mimic/08_baselines.py` fits each method/seed only on frozen train
   (validation may control early stopping), saves models and three-split predictions,
   and records its direct 06 split reference plus artifact SHA256 hashes in an atomic
@@ -547,26 +561,28 @@ clean reusable method library.
   UFPCA-based. R exchange files and checkpoints stay remote.
   Any method error propagates immediately with its original traceback; a partial run
   is not accepted as a complete comparison. New run directories are required.
-- `09_evaluation.py` accepts any number of completed `baseline_dirs`, branches
-  between `TrailsPrediction` and baseline NPZ readers,
-  and evaluates each method/seed/split once according to its cluster and survival
-  capabilities. `evaluation.py` retains shared plotting/calculation classes. Cluster evaluation
-  reports occupancy, entropy, KM/log-rank, adjusted Cox, clinical characteristics,
-  trajectories, organ support/treatment differences and label agreement. Treatment
-  evaluation reads the 04-generated `interventions.csv`, compares seven binary
-  exposures in all patients and twelve continuous endpoints among corresponding
-  exposed patients, and saves descriptive/test tables plus PNG/PDF panels per split;
-  it never generates cluster-only survival
-  predictions or predictive C-index/AUC/IBS/calibration from cluster KM curves.
-  Survival evaluation reports Harrell/IPCW C-index, cumulative/dynamic AUC, daily
-  Brier/IBS and quantile-group KM calibration, always estimating censoring from train.
-  One unified comparison table retains unavailable capability fields as missing values.
-  Degenerate clusters and unestimable Cox
-  effects remain explicit diagnostics, not silently relabeled successes.
-  Its non-empty `trails_dirs` places the primary TRAILS method first. Every 07/08
-  manifest must directly reference the same 06 split; 09 rejects old manifests or
-  mismatched references, then loads datasets and preprocessing from that common split.
-  Each run receives a unique comparison key and participates in cross-run ARI/NMI.
+- MIMIC 09_figure and 10_supplementary replace 09_evaluation and evaluate.yaml. They share
+  non-numbered evaluation.py/reporting.py and independently consume frozen results.
+  inputs.run_dir, n_clusters, model_seed, and selection_basis are mandatory; additional
+  TRAILS candidates use comparison_runs and baselines use baseline_dirs. All runs must
+  reference the same frozen 06 split. Old MIMIC results are never silently converted.
+  09 requires baseline_seeds for every displayed baseline and preserves configured order;
+  10 retains all seeds for requested TRAILS K and all baseline repeats. Test-informed manual
+  choices use selection_basis=test_exploratory and are labeled exploratory.
+- MIMIC survival metrics use recorded C-index risk semantics (including median_survival),
+  time-specific 1-S(t) for AUC at 7/14/21d, and the full 1–27d IBS grid. IPCW fits train only.
+  Missing curves/support retain null metrics and reasons; no extrapolation or shorter integration.
+  Cluster-only methods do not receive predictive metrics. Treatment evaluation retains all
+  seven binary exposures and twelve continuous endpoints among exposed patients.
+- MIMIC 09 saves an English 240x330mm A–J figure (PDF/SVG/600dpi PNG), aggregate SourceData.xlsx,
+  config and summary: C-index/IBS on separate axes, AUC, day21 calibration, occupancy, ARI label
+  agreement, all-23-feature phase profiles, six trajectories, validation/test KM with risk counts,
+  test adjusted Cox, and clinical/treatment profile. Performance uses test by default;
+  profiles/trajectories use train. Phases are [0,6),[6,12),[12,24),[24,48]h; 4h trajectories
+  use patient-equal medians/IQR and explicitly flag low support. Inverse-scaled values are
+  winsorized clinical values. 10 adds all-set detailed statistics/plots, candidate history/K
+  curves/stability, ARI/NMI, and train-fitted UMAP with transform-only evaluation sets.
+  Postprocessing exports aggregates only, never patient coordinate or assignment tables.
 - `AdjustedCoxAnalysis` uses the train split's lowest observed KM mortality cluster as the
   shared validation/test reference and reports cluster hazard ratios adjusted for
   age, gender, grouped race, and sepsis-onset SOFA with lifelines' default Efron
@@ -580,20 +596,9 @@ clean reusable method library.
   units using the train-fitted preprocessing parameters, bins the 0–48 hour
   window at configurable four-hour intervals, first takes each patient's median
   within a feature-bin, and then saves cluster median/IQR tables and PNG/PDF
-  trajectory panels for validation and test.
-- In generic `scripts/case.py`, `k_selection.enabled=true` runs estimator-level holdout K selection before
-  final case training. Empty `k_selection.candidate_clusters` means
-  `2..model.n_clusters`; candidates are scored by validation C-index and
-  latent MoG BIC using `sqrt(CI^2 + (1 - BIC_norm)^2)`. Candidate training and
-  selection metrics share the same holdout validation split. Empty
-  `k_selection.seeds` uses `trainer.seed`; an explicit list supports multi-seed
-  stability and must include `trainer.seed`, which identifies the downstream
-  estimator. Case runs inherit the selected candidate estimator instead of
-  retraining on all patients, and
-  candidate models, histories, metrics, configs, and aggregate selection tables
-  are saved under `k_selection.result_dir`.
-- `configs/case.yaml` composes the `training=case` preset, which defaults to SwanLab
-  enabled, complete artifacts, and latent embedding diagnostics.
+  trajectory panels for train, validation and test.
+- The ignored scripts/deprecated archive is outside the maintained workflow and Pyright scope;
+  archived scripts that depend on removed selector APIs require their original code version.
 
 ## Verification
 

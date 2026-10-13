@@ -14,7 +14,7 @@ Subtypes** 的缩写。项目目标是构建面向非同步多变量医学纵向
   per-feature `mtan2` 输入层用于对照。
 - 解码器支持 GRU/LSTM/Transformer，从患者级 latent representation 重构纵向轨迹。
 - 聚类模块使用 VaDE 风格的可学习 Gaussian mixture latent prior。
-- 生存模块从同一个潜变量经共享隐藏层直接输出 K 个簇特异 Weibull log(scale)，共享一个可学习 log(shape)。
+- 生存模块支持多输出 scale 加共享 shape，或 latent 与簇 one-hot 拼接的双参数 Weibull 头。
 
 本阶段不实现 mixed-type likelihood、competing risks 或 recurrent events。
 
@@ -24,12 +24,41 @@ Subtypes** 的缩写。项目目标是构建面向非同步多变量医学纵向
 \[
 p(x,T,z,c)=p(c)p(z\mid c)p(x\mid z)p(T\mid z,c).
 \]
-训练时三个分支共用一次重参数采样的 \(z\sim q_\phi(z\mid x)\)；验证和预测使用
-\(z=m_\phi(x)\)。生存头恢复为共享隐藏层加 K 维输出：
+默认训练时三个分支共用一次重参数采样的 \(z\sim q_\phi(z\mid x)\)；验证和预测使用
+\(z=m_\phi(x)\)。`model.survival_head_architecture=multi_output`（默认）使用共享隐藏层加 K 维输出：
 \(\log\lambda_k(z)=[f_\theta(z)]_k\)，输出分量对应簇身份，实现
 \(p(T\mid z,c)\)。隐藏层宽度保持 latent_dim，激活保持 ReLU；CRC 默认一个隐藏层。
 `survival_head_hidden_layers=0` 表示各簇独立的 z 线性效应和截距。
-共享的标量 `log(shape)` 初值为 0；均不经过 softplus。通用和 CRC 默认均为
+此模式的标量 `log(shape)` 全局共享，初值为 0。
+
+设置 `model.survival_head_architecture=one_hot` 时，对每个患者枚举 K 个簇，
+将同一 latent 与各簇 one-hot 拼接后输入共享网络：
+\[
+(\log\lambda_{ik},\log\rho_{ik})=f_\theta([z_i,\operatorname{onehot}(k)]).
+\]
+输入宽度为 `latent_dim + K`，输出宽度为 2；scale 和 shape 均可随患者和簇变化，
+不再另设共享 shape。隐藏层仍由 `survival_head_hidden_layers` 控制，宽度为 latent_dim，
+激活为 ReLU；零隐藏层是 latent 效应与簇截距相加，非线性交互需至少一个隐藏层。
+两种头均直接输出 log 参数，不使用 softplus，指数变换得到正值 scale/shape。
+两种头均计算全部 K 个分量，并用 `p(c|z)` 混合生存曲线，不先选定一个硬簇。
+
+`model.survival_latent_source` 可设为 `sample`（默认）或 `mean`：前者复用同一次
+采样，后者仅将生存头输入改为可反向传播的 latent mean，重建和聚类仍使用采样 z。
+两种设置在验证和预测时均使用 latent mean。MIMIC、CRC 及通用训练命令均可追加
+`model.survival_latent_source=mean`；Python API 使用
+`ModelConfig(survival_latent_source="mean")`。该参数随检查点保存，旧检查点缺省为
+`sample`。它与 `survival_head_architecture` 独立组合；`mean` 仅改变生存输入，
+保留所选头的结构和结局条件责任度；下述生存似然中的 z 相应替换为均值。例如：
+
+```yaml
+model:
+  survival_head_architecture: one_hot
+  survival_latent_source: mean
+  survival_head_hidden_layers: 1
+```
+
+Python API 对应 `ModelConfig(survival_head_architecture="one_hot", survival_latent_source="mean")`。
+通用和 CRC 默认均为
 `model.survival_loss=weibull`。`cox` 枚举保留，但构造模型立即抛出
 `NotImplementedError`（簇特异 Cox 尚未实现），不再估计 TRAILS Cox 基线；独立基线模型不受影响。
 
@@ -90,14 +119,16 @@ TorchSurv 0.2 的 AUC 部分临时张量没有指定设备，调用时使用局�
 
 **格式变更：** checkpoint 和预测文件使用版本 **3**，保存生存类型、簇分量 log 参数，
 预测文件可附带回顾性后验。模型 checkpoint 另保存结构标识
-`survival_head_architecture="multi_output"`。原始版本 3 多输出头未保存该标识，也可直接加载；
+`survival_head_architecture`（`multi_output` 或 `one_hot`），重载时检查它与配置一致。
+原始版本 3 多输出头未保存该标识和配置字段，也可直接加载；
 显式标识为 `conditioned_one_hot` 的 checkpoint 拒绝读取，需使用该结构的原代码。
 预测参数语义和形状不变，已有版本 3
 预测文件仍可读取。版本 1/2 一律拒绝读取。探索脚本中的版本 3 标记本身不代表模型
 结构相同，历史运行应使用原代码续跑。TorchSurv 由 `uv.lock`
 锁定；私有累积风险接口只在生存适配模块使用，升级依赖时需复核。
 
-OS24/E60 的匹配 K/seed 对照未显示 one-hot 条件输入改善占簇，因此恢复多输出头。
+历史 OS24/E60 的 `conditioned_one_hot` 头与本次双参数 `one_hot` 头不同；该次对照
+未显示占簇改善，不代表本次新头已经经过真实队列验证。默认仍为多输出头。
 初始化、warmup、早停和 K 选择协议保持现有设置。
 
 并列风险容差显式保持 `1e-8`，但 TorchSurv 0.2 的 C-index 内部使用 float32 判断
@@ -147,37 +178,79 @@ dataset = ClinicalTimeSeriesDataset.from_dataframes(
 
 ## 命令
 
-MIMIC 比较流程以 `06_split` 生成的冻结划分为共同输入：`07_run` 和
-`08_baselines` 分别读取该划分，`09_evaluation` 再联合读取两类预测结果。
-06 会拒绝覆盖已经存在的 seed 目录，需要新划分时应使用新的输出目录或 seed。
+MIMIC 流程为 `01–05 → 06_split → 07_run / 08_baselines → 09_figure / 10_supplementary`。
+队列、23项特征、0–48小时观察窗、48小时landmark后28天结局及冻结划分规则保持不变。
+06以Pydantic解析配置，复用已转换的矩阵直接调用`from_dataframes()`；预处理仍仅在train
+拟合1%/99%截尾与标准化，不通过临时CSV重建张量。已有seed目录拒绝覆盖。
+
+07默认逐个训练K=2–5、seed=20260517，保存全部候选；TRAILS不再自动选K、排名或因占簇
+门槛失败而终止。整数K和列表K均可，seeds必须明确给出。模型与训练默认参数保持不变。
+train和独立validation用于训练/早停，所有模型保存后才加载test。
+08的全部基线、消融、各自选K规则和预算不变，与07没有运行依赖。
+
+下面是后续真实重跑的命令示例，本次代码更新没有执行这些命令：
 
 ```bash
-# 默认n_clusters=null：按配置的候选K和seeds在train/validation上选择K
-uv run python -m scripts.mimic.07_run
-# 显式指定K时跳过选择
-uv run python -m scripts.mimic.07_run n_clusters=3
-# 扩展seeds列表后启用跨seed稳定性汇总；trainer.seed必须包含在列表中
-uv run python -m scripts.mimic.07_run 'k_selection.seeds=[20260517,20260518,20260519]'
-uv run python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517 n_clusters=3 paths.dir=outputs/mimic_case/<baseline-run>
-uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<trails-run>]' 'baseline_dirs=[outputs/mimic_case/<baseline-run>]'
-# 在一次09运行中比较多个TRAILS实验，并直接计算模型间ARI/NMI
-uv run python -m scripts.mimic.09_evaluation 'trails_dirs=[outputs/mimic_case/<primary-trails-run>,outputs/mimic_case/<other-trails-run>]'
+uv run python -m scripts.mimic.06_split
+uv run python -m scripts.mimic.07_run 'n_clusters=[2,3,4,5]' 'seeds=[20260517]' paths.dir=outputs/mimic_case/new-candidates
+uv run python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517 paths.dir=outputs/mimic_case/new-baselines
+uv run python -m scripts.mimic.09_figure inputs.run_dir=outputs/mimic_case/new-candidates n_clusters=3 model_seed=20260517 selection_basis=validation
+uv run python -m scripts.mimic.10_supplementary inputs.run_dir=outputs/mimic_case/new-candidates n_clusters=3 model_seed=20260517 selection_basis=validation
 ```
 
-`trails_dirs`不能为空；其中第一个目录仅作为主TRAILS方法。09会从所有07/08 manifest
-推导共同的06冻结划分；任一结果引用不同划分时会直接报错。
+09/10独立读取冻结结果。`inputs.run_dir`、`n_clusters`、`model_seed`、`selection_basis`
+均须明确指定；后者为`prespecified`、`validation`或`test_exploratory`。
+如果人工选择参考了test指标，必须使用`test_exploratory`，图和摘要会标注探索分析。
+可用`comparison_runs=[{run_dir: ..., n_clusters: 4, model_seed: 20260517, label: alternative}]`
+加入额外TRAILS候选，用`baseline_dirs=[...]`加入已完成的08目录。09还须给每个基线名称
+设置展示seed，例如`+baseline_seeds.summary_kmeans=20260517`；10保留所请求K的全部
+TRAILS seed及08全部重复。顺序为主TRAILS、配置中的额外模型、08清单顺序，绝不按test性能排序。
+所有07/08输入必须引用同一06冻结划分。旧MIMIC结果保留，不能自动转换或混作新模型结果。
 
-07自动选择K时不会使用test；只有K及`trainer.seed`对应的最终模型锁定后才加载test。
-选择结果保存在运行目录的`k_selection/`，包括逐运行指标、跨seed稳定性、K汇总和候选模型。
-08 通过`split_dir`直接读取06保存的三划分，并通过`n_clusters`明确指定K；它与07之间没有
-输入依赖。所有方法只使用train拟合，validation可用于早停，test仅用于冻结预测后的评价。
-`methods`可选择子集或配置多个seed。
-R方法需要远端 `lcmm`、`JMbayes2`、`data.table`、`jsonlite`、`R.utils`、`nlme`和`survival`。
-09支持一个主TRAILS目录、任意多个同冻结划分的额外TRAILS目录和多个已完成的基线目录；
-每个07/08 manifest都必须直接记录其06划分引用，旧08 manifest不再兼容。09确认这些引用
-一致后，从共同的06目录加载数据集和预处理参数，
-输出方法×seed×split结果、统一比较表及所有有聚类能力方法之间的ARI/NMI；
-聚类方法不通过簇KM构造预测C-index、AUC、IBS或校准。真实数据与患者级产物留在远端。
+09输出240×330 mm英文A–J综合图，包含方法性能、校准、占簇、ARI标签一致性、23项阶段
+画像、六项代表轨迹、validation/test KM及风险人数、test调整Cox和临床/七项治疗暴露。
+默认比较test，画像和轨迹使用train；四阶段为[0,6)、[6,12)、[12,24)、[24,48]小时。
+轨迹按4小时先取每位患者中位数，再汇总簇中位数/IQR，末箱包含48小时。逆标准化值标为
+“临床单位下的截尾后数值”。默认少于10名患者的画像单元显示灰色、轨迹点标记×。
+输出PDF、SVG、600 dpi PNG及聚合`SourceData.xlsx`、配置、摘要。
+
+10输出各集完整评价、23项轨迹、临床特征、治疗连续指标、校准/Brier曲线、全部候选历史
+和K曲线、独立validation上的跨seed ARI、方法间ARI/NMI，以及仅在train拟合、其余集
+transform的UMAP。SourceData仅含聚合数据；原始数据、模型和患者级预测留在数据执行环境。
+R方法仍需要原有`lcmm`、`JMbayes2`等依赖。
+
+C-index使用模型记录的风险定义，支持`median_survival`；7/14/21天动态AUC分别使用该日
+`1-S(t)`。IBS使用完整1–27天网格，删失分布只由train估计；不外推冻结曲线、不缩短积分
+区间，不支持的指标保留缺失和原因。仅聚类的方法不产生患者级生存预测指标。Cox仍调整
+年龄、性别、分组种族和SOFA，并采用train中28天KM死亡风险最低的簇作为参考。
+
+公共候选接口也供CRC 05使用；CRC模型路径、既有指标及06/07后处理兼容性不变：
+
+```python
+from trails import ClusterNumberEvaluator
+
+evaluator = ClusterNumberEvaluator([2, 3, 4, 5], seeds=[20260517], estimator_config=config)
+result = evaluator.fit(train, validation_data=validation,
+                       evaluation_data={"test": "data/frozen/test/dataset.pt"},
+                       result_dir="outputs/candidates")
+# 无validation时训练完整train；从不隐式拆分，所有候选valid_size=0。
+evaluator = ClusterNumberEvaluator.load("outputs/candidates")
+evaluator.config, evaluator.candidates
+evaluator.run_metrics, evaluator.k_summary, evaluator.stability_pairs
+figure = evaluator.plot_metrics(dataset="validation")
+history = evaluator.load_history(seed=20260517, n_clusters=3)
+model = evaluator.load_estimator(seed=20260517, n_clusters=3, device="cpu")
+prediction = evaluator.load_prediction(seed=20260517, n_clusters=3, dataset="test")
+```
+
+`ClusterNumberEvaluatorConfig`和`ClusterNumberEvaluationResult`替代原选择器类型。
+`evaluator.json`格式版本1只记录配置、候选及相对路径；`run_metrics.csv`、`k_summary.csv`、
+`stability_pairs.csv`保存聚合表。目录整体迁移可直接重载；只下载这四个文件也可浏览和绘图，
+缺少模型/预测/历史时仅对应的按需加载方法报错。旧选K产物不自动迁移，历史CRC由原有
+后处理兼容分支读取。`selection_score`列名为历史兼容保留，含义仅为描述性综合分：
+`sqrt(Cindex² + (1 − BIC_normalized)²)`，在每个dataset/seed内独立归一化，不生成排名。
+BIC仍用潜在高斯混合似然和`K*(2*latent_dim)+K−1`参数数目；占簇门槛仅作诊断。
+单seed或无独立validation时，跨seed稳定性为空并记录原因。
 
 实验入口使用 Hydra 配置。每个任务都有独立脚本；生成模拟 train/test split：
 
@@ -233,28 +306,9 @@ uv run python scripts/train.py training=mtan paths.data_root=data/simulated/high
 uv run python scripts/train.py training=small paths.explicit_split.enabled=true paths.explicit_split.train_data=data/simulated/base/train_500_test_300/k2/0/train.pt paths.explicit_split.test_data=data/simulated/base/train_500_test_300/k2/0/test.pt
 ```
 
-真实数据建模使用 `scripts/case.py`。先把真实队列预处理成两个 CSV：
-
-- `patients.csv`：必需列为 `patient_id`、`survival_time`、`event`，可选列为
-  `cluster_label`。`event` 必须是 `0/1`，`survival_time` 与纵向观测时间使用同一单位。
-- `observations.csv`：必需列为 `patient_id`、`time`、`feature`、`value`。每行是一位患者
-  在某个时间点的某个变量观测；同一个 `patient_id + time + feature` 不能重复。
-
-运行示例：
-
-```bash
-uv run python scripts/case.py observations_csv=data/case/observations.csv patients_csv=data/case/patients.csv
-```
-
-`scripts/case.py` 默认加载 `training=case`，默认开启 SwanLab、保存完整训练 artifacts，
-并开启 latent embedding diagnostics。命令使用全部患者训练，`trainer.valid_size`
-只作为内部 early stopping validation。输出默认保存在 `paths.dir`，默认形如
-`outputs/case/case-<timestamp>/`，包括 `case_dataset.pt`、`case_dataset_summary.json`、
-`config.json`、`history.json`、`history.csv`、`history.png`、`model.pt`、
-`predictions.pt`、`patient_clusters.csv`、`cluster_summary.csv`、
-`cluster_feature_summary.csv` 和 `case_summary.json`。`patient_clusters.csv`
-包含患者 ID、预测 cluster、风险分数、cluster posterior probabilities、生存结局和观测摘要，
-便于后续制作 KM 曲线、cluster composition 和变量分布图。
+其他真实数据可使用公开的`ClinicalTimeSeriesDataset.from_dataframes()`或`load_from_csv()`
+准备数据，再通过`TrailsEstimator.fit()`或上述公共候选接口建模。旧`case.py`已在忽略的
+`deprecated`归档中，依赖旧选择器的归档脚本需使用原代码版本，不属于当前工作流或静态检查范围。
 
 对已有 train/test split 运行轻量基线方法：
 

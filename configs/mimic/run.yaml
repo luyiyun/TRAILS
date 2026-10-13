@@ -4,28 +4,14 @@ defaults:
   - /trainer: full
   - _self_
 
-observations_csv: data/real/mimic-iv-3.1/derived/trails_case/observations.csv
-patients_csv: data/real/mimic-iv-3.1/derived/trails_case/patients.csv
 description: "MIMIC-IV v3.1 early Sepsis-3 TRAILS analysis"
 split:
   seed: 20260517
   dir: data/real/mimic-iv-3.1/derived/trails_splits/seed-${split.seed}
-outputs:
-  summary: run_manifest.json
-# 固定K、模型比较与K-selection共用充分训练的trainer协议。
-# 整数表示固定K；null表示使用train/validation自动选择，test只在锁定K后评估。
-n_clusters: null
-k_selection:
-  enabled: true
-  candidate_clusters: [2, 3, 4, 5]
-  # 当前只运行一个seed；后续可直接扩展列表以计算seed间稳定性。
-  seeds:
-    - ${trainer.seed}
-  selection_rule: one_standard_error
-  require_non_empty: true
-  min_cluster_fraction: 0.05
-  min_mean_pairwise_ari: null
-  result_dir: k_selection
+# 逐个训练全部seed/K；全部训练完成后报告train/validation/test，不自动选择。
+n_clusters: [2, 3, 4, 5]
+seeds: [20260517]
+min_cluster_fraction: 0.05
 trainer:
   risk_horizon: 28.0
 artifacts:

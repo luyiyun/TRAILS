@@ -5,9 +5,7 @@ from pathlib import Path
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator
-from scripts.configs import FrozenSplitConfig
-
-from trails_simulate.config import OutputPathsConfig, TrainingConfig
+from scripts.configs import CandidateRunConfig
 
 BASELINE_LABELS = {
     "Preoperative_CEA": "术前CEA",
@@ -39,27 +37,10 @@ class CRCRunRuntimeConfig(BaseModel):
     cudnn_allow_tf32: bool | None = None
 
 
-class CRCRunConfig(TrainingConfig):
-    """逐个训练seed/K并报告指标，不自动选择代表模型。"""
+class CRCRunConfig(CandidateRunConfig):
+    """保留CRC命令级运行时设置，候选协议由共享配置提供。"""
 
-    split: FrozenSplitConfig
-    n_clusters: (
-        Annotated[int, Field(ge=2)]
-        | Annotated[list[Annotated[int, Field(ge=2)]], Field(min_length=1)]
-    )
-    seeds: list[Annotated[int, Field(ge=0, lt=2**32)]] = Field(min_length=1)
-    min_cluster_fraction: FiniteFloat = Field(ge=0, le=1)
-    paths: OutputPathsConfig
-    description: str
     runtime: CRCRunRuntimeConfig = Field(default_factory=CRCRunRuntimeConfig)
-
-    @model_validator(mode="after")
-    def validate_runs(self) -> Self:
-        if isinstance(self.n_clusters, list) and len(set(self.n_clusters)) != len(self.n_clusters):
-            raise ValueError("n_clusters不能重复")
-        if len(set(self.seeds)) != len(self.seeds):
-            raise ValueError("seeds不能重复")
-        return self
 
 
 class CohortPathsConfig(BaseModel):

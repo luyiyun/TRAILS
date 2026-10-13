@@ -1,4 +1,4 @@
-"""TRAILS 候选簇数选择器及其结构化结果对象。"""
+"""候选簇数训练、描述性评价及可迁移的结果重载。"""
 
 from __future__ import annotations
 
@@ -9,473 +9,451 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import adjusted_rand_score
 
-from .artifacts import save_json
-from .config import ClusterNumberSelectorConfig, TrailsConfig
+from .artifacts import save_history_csv, save_json
+from .config import ClusterNumberEvaluatorConfig, TrailsConfig, resolve_batch_size
 from .data import ClinicalTimeSeriesDataset
 from .estimator import TrailsEstimator
-from .metrics import (
-    cluster_assignment_diagnostics,
-    concordance_index,
-    gaussian_log_prob,
-)
+from .metrics import cluster_assignment_diagnostics, concordance_index, gaussian_log_prob
+from .prediction import TrailsPrediction
 from .survival import survival_risk
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
 LOGGER = logging.getLogger(__name__)
-
-_PLOT_METRIC_LABELS = {
-    "cindex": "Validation C-index",
+_PAIR_COLUMNS = ["n_clusters", "seed_a", "seed_b", "ari"]
+_PLOT_LABELS = {
+    "cindex": "C-index",
     "latent_mixture_bic": "Latent-mixture BIC",
     "latent_mixture_mean_nll": "Latent-mixture mean NLL",
-    "selection_score": "Selection score",
+    "selection_score": "Descriptive composite score",
     "cluster_min_fraction": "Minimum cluster fraction",
-    "cluster_max_fraction": "Maximum cluster fraction",
     "cluster_entropy": "Normalized cluster entropy",
-    "mean_pairwise_ari": "Mean pairwise ARI",
+    "mean_pairwise_ari": "Validation pairwise ARI",
 }
-_DEFAULT_PLOT_METRICS = (
-    "cindex",
-    "latent_mixture_bic",
-    "selection_score",
-    "cluster_min_fraction",
-    "cluster_entropy",
-)
 
 
 @dataclass(frozen=True)
-class ClusterNumberSelectionResult:
-    """保存候选 K 在一个或多个随机种子下的完整选择结果。
+class ClusterNumberEvaluationResult:
+    """候选记录与聚合表；不持有模型、患者预测或原始数据。
 
-    属性：
-        config: 本次选择使用的已校验配置。
-        selected_k: 根据配置规则选出的 K；没有候选通过门槛时为 ``None``。
-        run_metrics: 每个 ``seed × K`` 一行的评价和选择指标，包括 C-index、
-            潜在混合分布 BIC、簇占用、归一化 BIC、复合分数和 seed 内排名。
-        stability_pairs: 同一 K 下不同 seed 预测标签的两两稳定性指标；单 seed
-            运行时为空表。
-        k_summary: 按 K 聚合的复合分数、标准误、C-index、簇占用、稳定性和
-            门槛结果。
-        seed_winners: 每个 seed 独立排名第一的 K。
-        estimators: 以 ``(seed, K)`` 为键保存的已拟合估计器。
-
-    结果对象不替多 seed 运行决定最终代表模型；论文或应用流程可从
-    :attr:`selected_estimators` 获取入选 K 的所有估计器并使用自己的锁模规则。
+    candidates中的路径相对于result_dir。run_metrics每个seed/K/dataset一行，
+    k_summary按K/dataset汇总；stability_pairs仅描述独立validation上的跨seed ARI。
     """
 
-    config: ClusterNumberSelectorConfig
-    selected_k: int | None
+    config: ClusterNumberEvaluatorConfig
+    candidates: list[dict[str, Any]]
     run_metrics: pd.DataFrame
     stability_pairs: pd.DataFrame
     k_summary: pd.DataFrame
-    seed_winners: dict[int, int]
-    estimators: dict[tuple[int, int], TrailsEstimator]
+    stability_reason: str = ""
+    result_dir: Path | None = None
 
-    @property
-    def selected_estimators(self) -> dict[int, TrailsEstimator]:
-        """返回入选 K 按 seed 组织的估计器；未选出 K 时返回空字典。"""
-        if self.selected_k is None:
-            return {}
+    def to_payload(self) -> dict[str, Any]:
+        """返回版本化的轻量元信息，指标本体保存在CSV中。"""
         return {
-            seed: estimator
-            for (seed, n_clusters), estimator in self.estimators.items()
-            if n_clusters == self.selected_k
-        }
-
-    def to_payload(self) -> dict[str, object]:
-        """将配置、选择结论和各层指标转换为 JSON 兼容载荷。
-
-        返回：
-            包含配置、入选 K、各 seed 最优 K、逐运行指标、稳定性和 K 汇总的
-            字典；已拟合估计器不包含在载荷中。
-        """
-
-        def records(frame: pd.DataFrame) -> object:
-            serialized = frame.to_json(orient="records")
-            assert serialized is not None
-            return json.loads(serialized)
-
-        return {
+            "format_version": 1,
             "config": self.config.model_dump(mode="json"),
-            "selected_k": self.selected_k,
-            "seed_winners": self.seed_winners,
-            "run_metrics": records(self.run_metrics),
-            "stability_pairs": records(self.stability_pairs),
-            "k_summary": records(self.k_summary),
+            "candidates": self.candidates,
+            "datasets": self.run_metrics["dataset"].drop_duplicates().tolist(),
+            "tables": {
+                "run_metrics": "run_metrics.csv",
+                "k_summary": "k_summary.csv",
+                "stability_pairs": "stability_pairs.csv",
+            },
+            "stability_reason": self.stability_reason,
         }
 
-    def save(self, result_dir: str | Path) -> None:
-        """保存选择表、JSON 摘要及每个 ``seed × K`` 候选估计器。
-
-        参数：
-            result_dir: 结果根目录。总体表保存在根目录，每个候选的模型、历史、
-                指标和配置保存在 ``seed-<seed>/k<K>/`` 下。
-        """
-        root = Path(result_dir)
-        root.mkdir(parents=True, exist_ok=True)
-        self.run_metrics.to_csv(root / "run_metrics.csv", index=False)
-        self.stability_pairs.to_csv(root / "stability_pairs.csv", index=False)
-        self.k_summary.to_csv(root / "k_summary.csv", index=False)
-        save_json(root / "selection_summary.json", self.to_payload())
-        for (seed, n_clusters), estimator in self.estimators.items():
-            candidate_dir = root / f"seed-{seed}" / f"k{n_clusters}"
-            estimator.save(candidate_dir / "model.pt")
-            save_json(candidate_dir / "history.json", estimator.history)
-            candidate_metrics = self.run_metrics.loc[
-                (self.run_metrics["seed"] == seed) & (self.run_metrics["n_clusters"] == n_clusters)
-            ].iloc[0]
-            serialized = candidate_metrics.to_json()
-            assert serialized is not None
-            save_json(candidate_dir / "metrics.json", json.loads(serialized))
-            save_json(candidate_dir / "config.json", estimator.config.model_dump(mode="json"))
+    def save(self, result_dir: str | Path | None = None) -> None:
+        """保存聚合表和重载元信息；不复制模型或患者级文件。"""
+        destination = Path(result_dir) if result_dir is not None else self.result_dir
+        if destination is None:
+            raise ValueError("保存结果需要result_dir")
+        destination.mkdir(parents=True, exist_ok=True)
+        self.run_metrics.to_csv(destination / "run_metrics.csv", index=False)
+        self.k_summary.to_csv(destination / "k_summary.csv", index=False)
+        self.stability_pairs.to_csv(destination / "stability_pairs.csv", index=False)
+        save_json(destination / "evaluator.json", self.to_payload())
 
     def plot_metrics(
         self,
         metrics: Sequence[str] | None = None,
         *,
+        dataset: str = "validation",
         path: str | Path | None = None,
     ) -> Figure:
-        """绘制候选 K 变化时的选择指标，并可保存为静态图片。
-
-        每个指标独占一个面板。多 seed 结果显示跨 seed 均值及标准误阴影；
-        单 seed 只显示折线。若已选出 K，则在所有面板中用竖直虚线标记。
-
-        参数：
-            metrics: ``run_metrics`` 或 ``k_summary`` 中需要绘制的数值列。
-                默认绘制 C-index、latent-mixture BIC、综合选择分、最小簇比例
-                和簇熵；多 seed 有稳定性结果时还会绘制平均成对 ARI。
-            path: 可选输出路径，图片格式由扩展名决定。
-
-        返回：
-            未关闭的 Matplotlib Figure，调用方可继续调整或自行关闭。
-        """
+        """绘制指定数据集的候选指标；多seed显示均值及SE，不标记最佳K。"""
         from matplotlib import pyplot as plt
 
-        selected_metrics: list[str]
-        if metrics is None:
-            selected_metrics = list(_DEFAULT_PLOT_METRICS)
-            if "mean_pairwise_ari" in self.k_summary and bool(
-                np.asarray(self.k_summary["mean_pairwise_ari"].notna()).any()
-            ):
-                selected_metrics.append("mean_pairwise_ari")
-        else:
-            selected_metrics = list(metrics)
-        if not selected_metrics:
-            raise ValueError("At least one metric is required for plotting.")
-        missing = [
-            metric
-            for metric in selected_metrics
-            if metric not in self.run_metrics and metric not in self.k_summary
-        ]
-        if missing:
-            raise ValueError(f"选择结果缺少绘图指标：{missing}")
-        non_numeric = [
-            metric
-            for metric in selected_metrics
-            if not pd.api.types.is_numeric_dtype(
-                self.run_metrics[metric] if metric in self.run_metrics else self.k_summary[metric]
-            )
-        ]
-        if non_numeric:
-            raise ValueError(f"绘图指标必须是数值列：{non_numeric}")
-
-        grouped = self.run_metrics.groupby("n_clusters", sort=True)
-        ncols = min(2, len(selected_metrics))
-        nrows = math.ceil(len(selected_metrics) / ncols)
-        fig, axes = plt.subplots(
-            nrows,
-            ncols,
-            figsize=(6.0 * ncols, 3.8 * nrows),
-            squeeze=False,
-            constrained_layout=True,
+        rows = self.run_metrics.loc[self.run_metrics["dataset"].eq(dataset)]
+        if rows.empty:
+            raise ValueError(f"结果不包含数据集：{dataset}")
+        names = (
+            list(metrics)
+            if metrics is not None
+            else [
+                "cindex",
+                "latent_mixture_bic",
+                "selection_score",
+                "cluster_min_fraction",
+                "cluster_entropy",
+            ]
         )
-        plot_axes = list(axes.flat)
-        n_seeds = self.run_metrics["seed"].nunique()
-        color = "#2F6B9A"
-
-        for ax, metric in zip(plot_axes, selected_metrics, strict=False):
-            has_uncertainty = metric in self.run_metrics and n_seeds > 1
-            if metric in self.run_metrics:
-                mean = cast(pd.Series, grouped[metric].mean())
-                standard_error = cast(pd.Series, grouped[metric].sem()).fillna(0.0)
+        if "mean_pairwise_ari" in names and dataset != "validation":
+            raise ValueError("跨seed ARI仅描述独立validation，不属于其他数据集")
+        if not names:
+            raise ValueError("At least one metric is required for plotting.")
+        if missing := set(names) - (set(rows.columns) | {"mean_pairwise_ari"}):
+            raise ValueError(f"评价结果缺少绘图指标：{sorted(missing)}")
+        fig, axes = plt.subplots(
+            math.ceil(len(names) / 2),
+            min(2, len(names)),
+            squeeze=False,
+            figsize=(11, 3.6 * math.ceil(len(names) / 2)),
+            layout="constrained",
+        )
+        for axis, metric in zip(axes.flat, names, strict=False):
+            if metric == "mean_pairwise_ari":
+                values = self.stability_pairs.groupby("n_clusters")["ari"]
             else:
-                summary = self.k_summary.sort_values("n_clusters").set_index("n_clusters")
-                mean = summary[metric]
-                standard_error = pd.Series(0.0, index=mean.index)
-            x_values = np.asarray(mean.index.tolist(), dtype=np.int64)
-            y_values = mean.to_numpy().astype(np.float64, copy=False)
-            ax.plot(x_values, y_values, color=color, marker="o", linewidth=2.0)
-            if has_uncertainty:
-                error = standard_error.to_numpy().astype(np.float64, copy=False)
-                ax.fill_between(
-                    x_values, y_values - error, y_values + error, color=color, alpha=0.18
-                )
-            if self.selected_k is not None and self.selected_k in x_values:
-                ax.axvline(self.selected_k, color="#333333", linestyle="--", linewidth=1.2)
-            ax.set_title(_PLOT_METRIC_LABELS.get(metric, metric), loc="left", fontsize=11)
-            ax.set_xticks(x_values)
-            ax.grid(axis="y", color="#D9DEE3", linewidth=0.8, alpha=0.8)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-
-        for ax in plot_axes[len(selected_metrics) :]:
-            ax.remove()
-        fig.supxlabel("Number of clusters (K)")
-        uncertainty = "mean ± SE" if n_seeds > 1 else "single seed"
-        fig.suptitle(f"Cluster-number selection metrics ({uncertainty})", fontsize=13)
+                if not pd.api.types.is_numeric_dtype(rows[metric]):
+                    raise ValueError(f"绘图指标必须为数值：{metric}")
+                values = rows.groupby("n_clusters")[metric]
+            means = pd.Series(values.mean())
+            errors = pd.Series(values.sem()).fillna(0.0)
+            axis.errorbar(means.index, means, yerr=errors, marker="o", color="#0072B2")
+            axis.set(title=_PLOT_LABELS.get(metric, metric), xlabel="Number of clusters (K)")
+            axis.set_xticks(sorted(rows["n_clusters"].unique()))
+            axis.spines[["top", "right"]].set_visible(False)
+        for axis in list(axes.flat)[len(names) :]:
+            axis.remove()
+        fig.suptitle(f"{dataset}: candidate metrics (mean ± SE)")
         if path is not None:
-            destination = Path(path)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(destination, dpi=180)
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(target, dpi=220)
         return fig
 
 
-class ClusterNumberSelector:
-    """通过一个或多个随机种子比较候选 K，并返回结构化选择结果。
-
-    直接参数生成 Pydantic 配置，也可用 :meth:`from_config` 恢复；所有候选
-    共用同一数据划分，先在 seed 内评分，再跨 seed 汇总。
-    """
+class ClusterNumberEvaluator:
+    """逐个训练全部seed/K并报告指标；支持不依赖GPU或源数据的结果浏览。"""
 
     def __init__(
         self,
         candidates: Sequence[int],
         *,
         seeds: int | Sequence[int] = 2026,
-        split_seed: int = 2026,
-        valid_fraction: float = 0.2,
-        selection_rule: Literal["best_mean", "one_standard_error"] = "best_mean",
-        require_non_empty: bool = False,
+        require_non_empty: bool = True,
         min_cluster_fraction: float | None = None,
-        min_mean_pairwise_ari: float | None = None,
         compute_stability: bool = True,
         estimator_config: TrailsConfig | Mapping[str, object] | None = None,
     ) -> None:
-        """校验直接参数并建立 K 选择配置，尚不训练模型。
-
-        参数：
-            candidates: 要比较的候选簇数。
-            seeds: 单个模型随机种子或重复运行使用的种子序列。
-            split_seed: 内部训练/验证划分使用的固定随机种子。
-            valid_fraction: 未提供显式验证集时的内部验证比例。
-            selection_rule: 选择最高平均分，或应用 one-standard-error 规则。
-            require_non_empty: 是否排除任何运行产生空簇的候选 K。
-            min_cluster_fraction: 可选的最小簇占比门槛。
-            min_mean_pairwise_ari: 可选的多 seed 平均成对 ARI 门槛。
-            compute_stability: 是否收集验证集标签并计算跨 seed 的成对 ARI。
-            estimator_config: 基础 TRAILS 配置或可由 Pydantic 解析的映射。
-        """
-        estimator = (
-            estimator_config
-            if isinstance(estimator_config, TrailsConfig)
-            else TrailsConfig.model_validate(estimator_config or {})
-        )
-        self.config = ClusterNumberSelectorConfig(
+        self.config = ClusterNumberEvaluatorConfig(
             candidates=tuple(candidates),
             seeds=(seeds,) if isinstance(seeds, int) else tuple(seeds),
-            split_seed=split_seed,
-            valid_fraction=valid_fraction,
-            selection_rule=selection_rule,
             require_non_empty=require_non_empty,
             min_cluster_fraction=min_cluster_fraction,
-            min_mean_pairwise_ari=min_mean_pairwise_ari,
             compute_stability=compute_stability,
-            estimator=estimator,
+            estimator=(
+                estimator_config
+                if isinstance(estimator_config, TrailsConfig)
+                else TrailsConfig.model_validate(estimator_config or {})
+            ),
         )
+        self._result: ClusterNumberEvaluationResult | None = None
 
     @classmethod
-    def from_config(cls, config: ClusterNumberSelectorConfig) -> ClusterNumberSelector:
-        """从已校验配置恢复选择器，适合读取保存的 JSON/YAML 配置。
+    def from_config(cls, config: ClusterNumberEvaluatorConfig) -> ClusterNumberEvaluator:
+        """由Pydantic配置构造尚未拟合的评价器。"""
+        evaluator = cls.__new__(cls)
+        evaluator.config, evaluator._result = config, None
+        return evaluator
 
-        参数：
-            config: 已通过 Pydantic 校验的选择器配置。
+    @property
+    def result(self) -> ClusterNumberEvaluationResult:
+        """访问最近的拟合、汇总或重载结果。"""
+        if self._result is None:
+            raise RuntimeError("请先fit、summarize_completed或load")
+        return self._result
 
-        返回：
-            使用原配置且尚未训练候选模型的选择器。
-        """
-        selector = cls.__new__(cls)
-        selector.config = config
-        return selector
+    @property
+    def candidates(self) -> list[dict[str, Any]]:
+        """候选模型及相对产物路径。"""
+        return self.result.candidates
 
-    def select(
+    @property
+    def run_metrics(self) -> pd.DataFrame:
+        """逐seed/K/dataset指标。"""
+        return self.result.run_metrics
+
+    @property
+    def k_summary(self) -> pd.DataFrame:
+        """按K/dataset汇总的指标。"""
+        return self.result.k_summary
+
+    @property
+    def stability_pairs(self) -> pd.DataFrame:
+        """独立验证集上的跨seed ARI。"""
+        return self.result.stability_pairs
+
+    @classmethod
+    def load(cls, result_dir: str | Path) -> ClusterNumberEvaluator:
+        """只读取轻量元信息和汇总表；允许模型/预测文件未下载。"""
+        root = Path(result_dir).resolve()
+        payload = json.loads((root / "evaluator.json").read_text(encoding="utf-8"))
+        if payload["format_version"] != 1:
+            raise ValueError("不支持的evaluator格式；旧选K结果须使用原代码")
+        evaluator = cls.from_config(ClusterNumberEvaluatorConfig.model_validate(payload["config"]))
+        # relative路径保证搬迁后仍可定位；CSV空理由恢复为空字符串，指标缺失保留NaN。
+        tables = {
+            name: pd.read_csv(root / relative, float_precision="round_trip")
+            for name, relative in payload["tables"].items()
+        }
+        for column in ("metric_reason", "occupancy_reason"):
+            if column in tables["run_metrics"]:
+                tables["run_metrics"][column] = tables["run_metrics"][column].fillna("")
+        evaluator._result = ClusterNumberEvaluationResult(
+            config=evaluator.config,
+            candidates=payload["candidates"],
+            run_metrics=tables["run_metrics"],
+            k_summary=tables["k_summary"],
+            stability_pairs=tables["stability_pairs"],
+            stability_reason=payload["stability_reason"],
+            result_dir=root,
+        )
+        return evaluator
+
+    def _candidate_path(self, seed: int, n_clusters: int, field: str) -> Path:
+        root = self.result.result_dir
+        if root is None:
+            raise ValueError("此汇总对象没有模型产物目录")
+        for row in self.candidates:
+            if row["seed"] == seed and row["n_clusters"] == n_clusters:
+                return root / row[field]
+        raise KeyError(f"没有候选seed={seed}, K={n_clusters}")
+
+    def load_history(self, *, seed: int, n_clusters: int) -> pd.DataFrame:
+        """按需读取一个候选的训练历史。"""
+        return pd.read_csv(self._candidate_path(seed, n_clusters, "training_history"))
+
+    def load_estimator(self, *, seed: int, n_clusters: int, device: str = "cpu") -> TrailsEstimator:
+        """按需恢复一个候选模型；默认CPU，不触发训练。"""
+        return TrailsEstimator.load(self._candidate_path(seed, n_clusters, "model"), device=device)
+
+    def load_prediction(self, *, seed: int, n_clusters: int, dataset: str) -> TrailsPrediction:
+        """按需读取某个候选在指定数据集上的冻结预测。"""
+        if dataset not in set(self.run_metrics["dataset"]):
+            raise KeyError(f"没有数据集：{dataset}")
+        root = self._candidate_path(seed, n_clusters, "prediction_dir")
+        return TrailsPrediction.load(root / dataset / "model_prediction.pt")
+
+    def plot_metrics(
+        self,
+        metrics: Sequence[str] | None = None,
+        *,
+        dataset: str = "validation",
+        path: str | Path | None = None,
+    ) -> Figure:
+        """直接绘制当前结果，重载后无需重新计算指标。"""
+        return self.result.plot_metrics(metrics, dataset=dataset, path=path)
+
+    def fit(
         self,
         data: ClinicalTimeSeriesDataset,
         *,
         validation_data: ClinicalTimeSeriesDataset | None = None,
-    ) -> ClusterNumberSelectionResult:
-        """训练全部 ``seed × K`` 候选并按配置规则选择 K。
+        evaluation_data: Mapping[str, ClinicalTimeSeriesDataset | str | Path] | None = None,
+        result_dir: str | Path,
+    ) -> ClusterNumberEvaluationResult:
+        """先保存全部候选，再加载额外评价集并生成预测与汇总。
 
-        显式验证集会用于全部运行；否则只按 ``split_seed`` 划分一次。每个 seed
-        内先将潜空间混合 BIC 做 min-max 归一化，再按
-        ``sqrt(C-index² + (1 - BIC_norm)²)`` 计算复合分数；多 seed 时进一步
-        按 compute_stability 决定是否计算验证集簇标签的两两 ARI。
-        没有候选通过配置门槛时不会静默回退。
-
-        参数：
-            data: 候选模型的训练数据，或内部划分前的完整训练数据。
-            validation_data: 可选的独立验证数据集。
-
-        返回：
-            包含入选 K、逐运行指标、稳定性、K 汇总和候选估计器的结果对象。
+        不隐式划分train；validation_data仅用于既定早停。额外评价集名称不可占用
+        train/validation或候选文件名。异常直接抛出，已保存模型不覆盖、不自动续训。
         """
-        if validation_data is None:
-            train_data, valid_data = data.split(
-                [1.0 - self.config.valid_fraction, self.config.valid_fraction],
-                seed=self.config.split_seed,
+        root = Path(result_dir).resolve()
+        extra = dict(evaluation_data or {})
+        reserved = {
+            "train",
+            "validation",
+            "model.pt",
+            "training_history.csv",
+            "metrics.csv",
+            "resolved_config.yaml",
+            "config.json",
+        }
+        if any(
+            not name or Path(name).name != name or name in reserved or name in {".", ".."}
+            for name in extra
+        ):
+            raise ValueError("评价集名称必须为不冲突的单级目录名")
+        targets = [
+            root / name
+            for name in (
+                "models",
+                "evaluator.json",
+                "run_metrics.csv",
+                "k_summary.csv",
+                "stability_pairs.csv",
             )
-        else:
-            train_data, valid_data = data, validation_data
-
-        run_scores: list[pd.DataFrame] = []
-        estimators: dict[tuple[int, int], TrailsEstimator] = {}
-        cluster_assignments: dict[tuple[int, int], np.ndarray] = {}
-        seed_winners: dict[int, int] = {}
-        base_config = self.config.estimator
+        ]
+        if existing := [str(path) for path in targets if path.exists()]:
+            raise FileExistsError(f"拒绝覆盖既有候选产物：{existing}")
+        records: list[dict[str, Any]] = []
+        base = self.config.estimator
         for seed in self.config.seeds:
-            candidate_metrics: list[dict[str, float | int]] = []
-            for n_clusters in self.config.candidates:
+            for k in self.config.candidates:
                 LOGGER.info(
-                    "K选择候选 %d/%d：seed=%d，K=%d",
-                    len(estimators) + 1,
+                    "候选 %d/%d：seed=%d，K=%d",
+                    len(records) + 1,
                     len(self.config.seeds) * len(self.config.candidates),
                     seed,
-                    n_clusters,
+                    k,
                 )
-                config = base_config.model_copy(
+                config = base.model_copy(
                     update={
                         "seed": seed,
-                        "model": base_config.model.model_copy(update={"n_clusters": n_clusters}),
-                        "trainer": base_config.trainer.model_copy(
-                            update={"seed": seed, "valid_size": 0.0}
+                        "model": base.model.model_copy(update={"n_clusters": k}),
+                        "trainer": base.trainer.model_copy(
+                            update={
+                                "seed": seed,
+                                "valid_size": 0.0,
+                                "batch_size": resolve_batch_size(
+                                    len(data), base.trainer.batch_size
+                                ),
+                            }
                         ),
                     }
                 )
-                estimator = TrailsEstimator(config).fit(train_data, validation_data=valid_data)
-                candidate_metrics.append(
+                estimator = TrailsEstimator(config).fit(data, validation_data=validation_data)
+                directory = Path("models") / f"seed-{seed}" / f"k{k}"
+                estimator.save(root / directory / "model.pt")
+                save_history_csv(root / directory / "training_history.csv", estimator.history)
+                # 模型配置使用JSON；命令层另外保存原工作流要求的YAML。
+                save_json(
+                    root / directory / "config.json", estimator.config.model_dump(mode="json")
+                )
+                records.append(
                     {
-                        "n_clusters": n_clusters,
-                        **self._calculate_candidate_metrics(estimator, valid_data),
+                        "seed": seed,
+                        "n_clusters": k,
+                        "model": str(directory / "model.pt"),
+                        "prediction_dir": str(directory),
+                        "training_history": str(directory / "training_history.csv"),
+                        "metrics": str(directory / "metrics.csv"),
+                        "config": str(directory / "config.json"),
                     }
                 )
-                estimators[(seed, n_clusters)] = estimator
-                if self.config.compute_stability:
-                    cluster_assignments[(seed, n_clusters)] = (
-                        estimator.predict(valid_data).predict().numpy()
-                    )
-            candidate_scores = self._score_and_rank_candidates(pd.DataFrame(candidate_metrics))
-            candidate_scores.insert(0, "seed", seed)
-            run_scores.append(candidate_scores)
-            seed_winners[seed] = int(candidate_scores.iloc[0]["n_clusters"])
+                del estimator
 
-        run_metrics = pd.concat(run_scores, ignore_index=True).sort_values(["n_clusters", "seed"])
-        stability_pairs = (
-            self._calculate_stability(cluster_assignments)
-            if self.config.compute_stability
-            else pd.DataFrame(columns=["n_clusters", "seed_a", "seed_b", "ari"])
+        datasets = {"train": data}
+        if validation_data is not None:
+            datasets["validation"] = validation_data
+        for name, source in extra.items():
+            datasets[name] = (
+                source
+                if isinstance(source, ClinicalTimeSeriesDataset)
+                else ClinicalTimeSeriesDataset.load(source)
+            )
+        rows: list[dict[str, Any]] = []
+        assignments: dict[tuple[int, int], np.ndarray] = {}
+        for record in records:
+            estimator = TrailsEstimator.load(root / record["model"], device=base.trainer.device)
+            for name, dataset in datasets.items():
+                prediction = estimator.predict(dataset)
+                prediction.save(root / record["prediction_dir"] / name / "model_prediction.pt")
+                labels = prediction.predict()
+                events = torch.stack([sample.event for sample in dataset.samples])
+                metrics = self.evaluate_fitted(estimator, dataset)
+                fractions = torch.bincount(labels, minlength=record["n_clusters"]) / len(dataset)
+                rows.append(
+                    {
+                        "seed": record["seed"],
+                        "n_clusters": record["n_clusters"],
+                        "dataset": name,
+                        "n_patients": len(dataset),
+                        "n_events": int(events.sum()),
+                        "metric_reason": "无事件，C-index不可计算"
+                        if not bool(events.any())
+                        else "",
+                        **metrics,
+                        **{f"cluster_{k}_fraction": float(v) for k, v in enumerate(fractions)},
+                    }
+                )
+                if name == "validation" and self.config.compute_stability:
+                    assignments[record["seed"], record["n_clusters"]] = labels.numpy()
+            del estimator
+        pairs = [
+            {
+                "n_clusters": k,
+                "seed_a": a,
+                "seed_b": b,
+                "ari": float(adjusted_rand_score(assignments[a, k], assignments[b, k])),
+            }
+            for k in self.config.candidates
+            for a, b in combinations(self.config.seeds, 2)
+            if (a, k) in assignments and (b, k) in assignments
+        ]
+        reason = (
+            "已关闭稳定性计算"
+            if not self.config.compute_stability
+            else "没有独立验证集"
+            if validation_data is None
+            else "不足两个候选seed"
+            if len(self.config.seeds) < 2
+            else ""
         )
-        k_summary = self._summarize_candidates(run_metrics, stability_pairs)
-        selected_k = self._select_k(k_summary)
-
-        return ClusterNumberSelectionResult(
+        summary = self.summarize_completed(
+            pd.DataFrame(rows), pd.DataFrame(pairs, columns=_PAIR_COLUMNS)
+        )
+        self._result = ClusterNumberEvaluationResult(
             config=self.config,
-            selected_k=selected_k,
-            run_metrics=run_metrics,
-            stability_pairs=stability_pairs,
-            k_summary=k_summary,
-            seed_winners=seed_winners,
-            estimators=estimators,
+            candidates=records,
+            run_metrics=summary.run_metrics,
+            stability_pairs=summary.stability_pairs,
+            k_summary=summary.k_summary,
+            stability_reason=reason,
+            result_dir=root,
         )
+        for record in records:
+            selected = self.run_metrics.loc[
+                self.run_metrics["seed"].eq(record["seed"])
+                & self.run_metrics["n_clusters"].eq(record["n_clusters"])
+            ]
+            selected.to_csv(root / record["metrics"], index=False)
+        self.result.save()
+        return self.result
 
     @staticmethod
     def evaluate_fitted(
         estimator: TrailsEstimator, data: ClinicalTimeSeriesDataset
     ) -> dict[str, float]:
-        """评价已锁定的候选模型，不重新训练或划分数据。"""
-        return ClusterNumberSelector._calculate_candidate_metrics(estimator, data)
-
-    def summarize_completed(
-        self, run_metrics: pd.DataFrame, stability_pairs: pd.DataFrame
-    ) -> ClusterNumberSelectionResult:
-        """汇总独立进程完成的候选；数值失败和缺失 seed 不通过门槛。
-
-        输入每个 seed/K 一行，失败行的 status 为 numerical_failure。
-        stability_pairs 沿用 n_clusters/seed_a/seed_b/ari 四列，标签无需汇入。
-        """
-        if run_metrics.duplicated(["seed", "n_clusters"]).any():
-            raise ValueError("每个seed/K只能提供一个候选")
-        frames: list[pd.DataFrame] = []
-        winners: dict[int, int] = {}
-        for seed in self.config.seeds:
-            rows = run_metrics.loc[run_metrics["seed"].eq(seed)].copy()
-            required = [
-                "cindex",
-                "latent_mixture_bic",
-                "cluster_min_fraction",
-                "cluster_empty_count",
-            ]
-            for column in required:
-                if column not in rows:
-                    rows[column] = np.nan
-            finite = np.isfinite(rows[required].to_numpy(dtype=float)).all(axis=1)
-            if "status" in rows:
-                finite &= rows["status"].eq("completed").to_numpy()
-            valid = rows.loc[finite]
-            invalid = rows.loc[~finite].assign(
-                latent_mixture_bic_normalized=np.nan, selection_score=np.nan, rank=np.nan
-            )
-            if not valid.empty:
-                scored = self._score_and_rank_candidates(valid)
-                winners[seed] = int(scored.iloc[0]["n_clusters"])
-                frames.append(scored)
-            frames.append(invalid)
-        metrics = pd.concat(frames, ignore_index=True).sort_values(["n_clusters", "seed"])
-        summary = self._summarize_candidates(metrics, stability_pairs)
-        return ClusterNumberSelectionResult(
-            config=self.config,
-            selected_k=self._select_k(summary),
-            run_metrics=metrics,
-            stability_pairs=stability_pairs,
-            k_summary=summary,
-            seed_winners=winners,
-            estimators={},
-        )
-
-    @staticmethod
-    def _calculate_candidate_metrics(
-        estimator: TrailsEstimator,
-        data: ClinicalTimeSeriesDataset,
-    ) -> dict[str, float]:
-        """计算一个已拟合候选模型的生存、潜空间混合分布和簇占用指标。"""
+        """沿用潜在混合BIC和风险定义，评价冻结模型；无事件集保留缺失C-index。"""
         outputs, batch = estimator.trainer._collect_outputs(data)
         latent = outputs.latent_mean.detach()
         n_samples = int(latent.shape[0])
         if n_samples == 0:
-            raise ValueError("Selection metrics require at least one sample.")
-
+            raise ValueError("Evaluation metrics require at least one sample.")
         log_prior = torch.log_softmax(estimator.model.mixture_logits.detach(), dim=-1).unsqueeze(0)
-        component_log_prob = gaussian_log_prob(
+        component = gaussian_log_prob(
             latent.unsqueeze(1),
             estimator.model.mixture_means.detach().unsqueeze(0),
             estimator.model.mixture_log_variances.detach().unsqueeze(0),
         ).sum(dim=-1)
-        log_likelihood = torch.logsumexp(log_prior + component_log_prob, dim=-1)
-        n_clusters = estimator.config.model.n_clusters
-        latent_dim = estimator.config.model.latent_dim
-        n_parameters = n_clusters * (2 * latent_dim) + (n_clusters - 1)
-        latent_mixture_bic = (
-            -2.0 * float(log_likelihood.sum().item()) + math.log(float(n_samples)) * n_parameters
-        )
-        pred_cluster = torch.argmax(outputs.cluster_probabilities.detach().cpu(), dim=-1).long()
-        return {
-            "cindex": float(
+        likelihood = torch.logsumexp(log_prior + component, dim=-1)
+        k, latent_dim = estimator.config.model.n_clusters, estimator.config.model.latent_dim
+        # 保持既有BIC定义，固定混合权重时也保留历史K-1项。
+        n_parameters = k * (2 * latent_dim) + k - 1
+        labels = outputs.cluster_probabilities.detach().cpu().argmax(dim=-1).long()
+        cindex = float("nan")
+        if bool(batch["event"].any()):
+            cindex = float(
                 concordance_index(
                     survival_risk(
                         outputs.survival_log_params,
@@ -486,102 +464,111 @@ class ClusterNumberSelector:
                     batch["survival_time"],
                     batch["event"],
                 )
-            ),
-            "latent_mixture_bic": float(latent_mixture_bic),
-            "latent_mixture_mean_nll": float((-log_likelihood).mean().item()),
+            )
+        return {
+            "cindex": cindex,
+            "latent_mixture_bic": -2 * float(likelihood.sum().item())
+            + math.log(n_samples) * n_parameters,
+            "latent_mixture_mean_nll": float((-likelihood).mean().item()),
             "latent_mixture_n_parameters": float(n_parameters),
-            **cluster_assignment_diagnostics(pred_cluster, n_clusters=n_clusters),
+            **cluster_assignment_diagnostics(labels, n_clusters=k),
         }
 
-    @staticmethod
-    def _score_and_rank_candidates(candidate_metrics: pd.DataFrame) -> pd.DataFrame:
-        """在一个 seed 内归一化潜在混合 BIC，并按复合分数确定候选 K 排名。"""
-        if candidate_metrics.empty:
-            raise ValueError("K selection requires at least one candidate.")
-        candidate_scores = candidate_metrics.copy()
-        bics = candidate_scores["latent_mixture_bic"].astype(float)
-        bic_range = float(bics.max() - bics.min())
-        candidate_scores["latent_mixture_bic_normalized"] = (
-            0.0 if bic_range == 0.0 else (bics - bics.min()) / bic_range
-        )
-        candidate_scores["selection_score"] = np.hypot(
-            candidate_scores["cindex"].astype(float),
-            1.0 - candidate_scores["latent_mixture_bic_normalized"],
-        )
-        candidate_scores.sort_values(
-            ["selection_score", "cindex", "latent_mixture_bic", "n_clusters"],
-            ascending=[False, False, True, True],
-            inplace=True,
-        )
-        candidate_scores["rank"] = np.arange(1, len(candidate_scores) + 1)
-        return candidate_scores
-
-    def _calculate_stability(
-        self, cluster_assignments: Mapping[tuple[int, int], np.ndarray]
-    ) -> pd.DataFrame:
-        """计算每个候选 K 在不同 seed 预测标签之间的成对 ARI。"""
-        stability_records: list[dict[str, float | int]] = []
-        for n_clusters in self.config.candidates:
-            for seed_a, seed_b in combinations(self.config.seeds, 2):
-                ari = adjusted_rand_score(
-                    cluster_assignments[(seed_a, n_clusters)],
-                    cluster_assignments[(seed_b, n_clusters)],
-                )
-                stability_records.append(
-                    {"n_clusters": n_clusters, "seed_a": seed_a, "seed_b": seed_b, "ari": ari}
-                )
-        return pd.DataFrame(stability_records, columns=["n_clusters", "seed_a", "seed_b", "ari"])
-
-    def _summarize_candidates(
-        self, run_metrics: pd.DataFrame, stability_pairs: pd.DataFrame
-    ) -> pd.DataFrame:
-        """按 K 汇总跨 seed 得分、簇占用和稳定性门槛。"""
-        summary_records: list[dict[str, float | int | bool]] = []
-        for n_clusters in self.config.candidates:
-            candidate_runs = run_metrics.loc[run_metrics["n_clusters"] == n_clusters]
-            scores = candidate_runs["selection_score"].astype(float)
-            aris = stability_pairs.loc[stability_pairs["n_clusters"] == n_clusters, "ari"]
-            mean_ari = float(aris.mean()) if not aris.empty else float("nan")
-            min_fraction = float(candidate_runs["cluster_min_fraction"].min())
-            empty_counts = candidate_runs["cluster_empty_count"].dropna()
-            max_empty = int(empty_counts.max()) if not empty_counts.empty else n_clusters
-            complete = (
-                set(candidate_runs["seed"]) == set(self.config.seeds)
-                and len(candidate_runs) == len(self.config.seeds)
-                and bool(np.isfinite(scores.to_numpy()).all())
+    def summarize_completed(
+        self,
+        run_metrics: pd.DataFrame,
+        stability_pairs: pd.DataFrame,
+    ) -> ClusterNumberEvaluationResult:
+        """汇总既有指标，不训练、不排序或选择最佳K；允许候选缺失。"""
+        metrics = run_metrics.copy()
+        if "dataset" not in metrics:
+            metrics["dataset"] = "validation"
+        if metrics.duplicated(["seed", "n_clusters", "dataset"]).any():
+            raise ValueError("每个seed/K/dataset只能提供一个候选")
+        if set(metrics["seed"]) - set(self.config.seeds) or set(metrics["n_clusters"]) - set(
+            self.config.candidates
+        ):
+            raise ValueError("汇总指标含有未配置的seed或K")
+        metrics["latent_mixture_bic_normalized"] = np.nan
+        metrics["selection_score"] = np.nan
+        for _, rows in metrics.groupby(["dataset", "seed"], sort=False):
+            finite = np.isfinite(rows[["cindex", "latent_mixture_bic"]].to_numpy(dtype=float)).all(
+                axis=1
             )
-            passes_gate = complete and (not self.config.require_non_empty or max_empty == 0)
-            if self.config.compute_stability and len(self.config.seeds) > 1:
-                expected = len(self.config.seeds) * (len(self.config.seeds) - 1) // 2
-                passes_gate &= len(aris) == expected and bool(np.isfinite(aris.to_numpy()).all())
-            if self.config.min_cluster_fraction is not None:
-                passes_gate &= min_fraction >= self.config.min_cluster_fraction
-            if self.config.min_mean_pairwise_ari is not None:
-                passes_gate &= mean_ari >= self.config.min_mean_pairwise_ari
-            summary_records.append(
-                {
-                    "n_clusters": n_clusters,
-                    "mean_selection_score": float(scores.mean()),
-                    "se_selection_score": 0.0 if len(scores) == 1 else float(scores.sem()),
-                    "mean_cindex": float(candidate_runs["cindex"].mean()),
-                    "min_cluster_fraction": min_fraction,
-                    "max_empty_clusters": max_empty,
-                    "mean_pairwise_ari": mean_ari,
-                    "passes_gate": passes_gate,
-                    "complete": complete,
-                }
+            if "status" in rows:
+                finite &= rows["status"].eq("completed").to_numpy()
+            valid = rows.loc[finite]
+            if valid.empty:
+                continue
+            bics = valid["latent_mixture_bic"]
+            width = float(bics.max() - bics.min())
+            normalized = (bics - bics.min()) / width if width else bics * 0.0
+            metrics.loc[valid.index, "latent_mixture_bic_normalized"] = normalized
+            metrics.loc[valid.index, "selection_score"] = np.hypot(valid["cindex"], 1 - normalized)
+        empty = (
+            metrics["cluster_empty_count"].gt(0)
+            if self.config.require_non_empty
+            else pd.Series(False, index=metrics.index)
+        )
+        small = (
+            metrics["cluster_min_fraction"].lt(self.config.min_cluster_fraction)
+            if self.config.min_cluster_fraction is not None
+            else pd.Series(False, index=metrics.index)
+        )
+        finite_occupancy = np.isfinite(
+            metrics[["cluster_min_fraction", "cluster_empty_count"]].to_numpy(dtype=float)
+        ).all(axis=1)
+        metrics["passes_occupancy"] = ~empty & ~small & finite_occupancy
+        metrics["occupancy_reason"] = [
+            "; ".join(
+                reason
+                for reason, applies in (
+                    ("存在空簇", e),
+                    (f"最小簇占比低于{self.config.min_cluster_fraction or 0:.0%}", s),
+                    ("占簇指标缺失", not finite),
+                )
+                if applies
             )
-        return pd.DataFrame(summary_records).sort_values("n_clusters")
-
-    def _select_k(self, k_summary: pd.DataFrame) -> int | None:
-        """根据门槛和配置规则从 K 汇总表中选择最终簇数。"""
-        eligible = k_summary.loc[k_summary["passes_gate"]]
-        if eligible.empty:
-            return None
-        best = eligible.sort_values(
-            ["mean_selection_score", "n_clusters"], ascending=[False, True]
-        ).iloc[0]
-        if self.config.selection_rule == "one_standard_error":
-            cutoff = float(best["mean_selection_score"] - best["se_selection_score"])
-            return int(eligible.loc[eligible["mean_selection_score"] >= cutoff, "n_clusters"].min())
-        return int(best["n_clusters"])
+            for e, s, finite in zip(empty, small, finite_occupancy, strict=True)
+        ]
+        numeric = [
+            col
+            for col in metrics.select_dtypes(include="number")
+            if col not in {"seed", "n_clusters"}
+        ]
+        grouped = metrics.groupby(["n_clusters", "dataset"], sort=True)
+        summary = grouped[numeric].agg(["mean", "std"])
+        summary.columns = [f"{column}_{stat}" for column, stat in summary.columns]
+        summary = summary.join(
+            grouped.agg(
+                n_seeds=("seed", "nunique"),
+                all_seeds_pass_occupancy=("passes_occupancy", "all"),
+                minimum_cluster_fraction=("cluster_min_fraction", "min"),
+                maximum_empty_clusters=("cluster_empty_count", "max"),
+            )
+        ).reset_index()
+        summary["complete"] = summary["n_seeds"].eq(len(self.config.seeds))
+        summary["mean_pairwise_ari"] = np.nan
+        if not stability_pairs.empty:
+            means = stability_pairs.groupby("n_clusters")["ari"].mean()
+            valid = summary["dataset"].eq("validation")
+            summary.loc[valid, "mean_pairwise_ari"] = summary.loc[valid, "n_clusters"].map(means)
+        self._result = ClusterNumberEvaluationResult(
+            config=self.config,
+            candidates=[],
+            run_metrics=metrics,
+            stability_pairs=stability_pairs.copy(),
+            k_summary=summary,
+            stability_reason=(
+                "已关闭稳定性计算"
+                if not self.config.compute_stability
+                else "没有独立验证集"
+                if "validation" not in set(metrics["dataset"])
+                else "不足两个候选seed"
+                if len(self.config.seeds) < 2
+                else "未提供验证集跨seed配对结果"
+                if stability_pairs.empty
+                else ""
+            ),
+        )
+        return self.result

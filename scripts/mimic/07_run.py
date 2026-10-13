@@ -1,287 +1,116 @@
+"""在MIMIC冻结划分上训练全部候选，保存可重载结果而不选择最佳K。"""
+
 from __future__ import annotations
 
-import shutil
-import time
-from datetime import datetime
-from pathlib import Path
+import json
+import logging
 from typing import Any
 
 import hydra
-import pandas as pd
-import swanlab
-import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
-from trails import (
-    ClinicalTimeSeriesDataset,
-    ClusterNumberSelectionResult,
-    ClusterNumberSelector,
-    DataConfig,
-    TrailsConfig,
-    TrailsEstimator,
-    resolve_batch_size,
-)
-from trails.artifacts import plot_history, resolve_artifact_names, save_history_csv, save_json
-from trails_case.evaluation import (
-    evaluate_case_predictions,
-)
+from scripts.utils.candidates import save_candidate_outputs
+from trails import ClinicalTimeSeriesDataset, ClusterNumberEvaluator, DataConfig, TrailsConfig
+from trails.artifacts import plot_history, save_json
+from trails.survival import SURVIVAL_FORMAT_VERSION
 from trails_simulate.config import resolved_payload
-from trails_simulate.training import log_swanlab_history
 
 from .config import BASELINE_COVARIATE_COLUMNS, MimicApplicationConfig
-from .paths import resolve_input_path, resolve_output_path
+
+LOGGER = logging.getLogger(__name__)
 
 
-def _save_split_outputs(
-    run_dir: Path,
-    split_name: str,
-    dataset: ClinicalTimeSeriesDataset,
-    estimator: TrailsEstimator,
-    risk_horizon: float,
-) -> dict[str, float]:
-    split_dir = run_dir / split_name
-    patient_ids = list(dataset.metadata["patient_ids"])
-    model_prediction = estimator.predict(dataset)
-    pred_cluster = model_prediction.predict()
-    probabilities = model_prediction.predict_proba()
-    risk_score = model_prediction.risk_score(risk_horizon)
-    survival_time = torch.stack([dataset[index].survival_time for index in range(len(dataset))])
-    event = torch.stack([dataset[index].event for index in range(len(dataset))])
-    metrics = evaluate_case_predictions(dataset, model_prediction, risk_horizon)
-
-    dataset.save(split_dir / "dataset.pt")
-    model_prediction.save(split_dir / "model_prediction.pt")
-    frame = pd.DataFrame(
-        {
-            "patient_id": patient_ids,
-            "pred_cluster": pred_cluster.numpy(),
-            "risk_score": risk_score.numpy(),
-            "survival_time": survival_time.numpy(),
-            "event": event.numpy(),
-        }
-    )
-    raw_covariates = dataset.metadata.get("baseline_covariates")
-    if not isinstance(raw_covariates, list):
-        raise ValueError(f"{split_name} dataset缺少baseline_covariates")
-    covariates = pd.DataFrame(raw_covariates)
-    required_covariates = {"patient_id", *BASELINE_COVARIATE_COLUMNS}
-    if missing := sorted(required_covariates - set(covariates.columns)):
-        raise ValueError(f"{split_name} baseline_covariates缺少字段：{missing}")
-    frame = frame.merge(
-        covariates.loc[:, ["patient_id", *BASELINE_COVARIATE_COLUMNS]],
-        on="patient_id",
-        how="left",
-        validate="one_to_one",
-        sort=False,
-    )
-    for index in range(probabilities.shape[1]):
-        frame[f"cluster_probability_{index}"] = probabilities[:, index]
-    for index in range(model_prediction.latent_representation.shape[1]):
-        frame[f"latent_{index}"] = model_prediction.latent_representation[:, index]
-    frame.to_csv(split_dir / "patient_outputs.csv", index=False)
-    save_json(split_dir / "metrics.json", metrics)
-    return metrics
-
-
-def run(config: MimicApplicationConfig) -> dict[str, object]:
-    run_dir = config.paths.dir
-    run_dir.mkdir(parents=True, exist_ok=True)
-    artifacts = resolve_artifact_names(config.artifacts.names)
-    split_dir = resolve_input_path(config.split.dir)
-    dataset_paths = {
-        name: split_dir / name / "dataset.pt" for name in ("train", "validation", "test")
-    }
-    preprocessing_parameters = split_dir / "preprocessing_parameters.csv"
-    required = [*dataset_paths.values(), preprocessing_parameters]
-    if missing := [str(path) for path in required if not path.is_file()]:
-        raise FileNotFoundError(f"缺少 MIMIC tensor dataset；请先运行06_split：{missing}")
-    device = config.trainer.device
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError("MIMIC TRAILS 分析要求可用 CUDA GPU")
-
-    load_started = time.perf_counter()
-    datasets = {
-        name: ClinicalTimeSeriesDataset.load(dataset_paths[name])
-        for name in ("train", "validation")
-    }
-    for name, dataset in datasets.items():
-        if (
-            dataset.metadata.get("split_name") != name
-            or dataset.metadata.get("split_seed") != config.split.seed
-        ):
-            raise ValueError(f"{dataset_paths[name]} 的split元数据与当前配置不一致")
-    train = datasets["train"]
-    validation = datasets["validation"]
-    load_seconds = time.perf_counter() - load_started
-    initial_k = config.n_clusters or config.k_selection.candidate_clusters[0]
-    trails_config = TrailsConfig(
-        data=DataConfig(n_features=train.n_features),
-        model=config.model.model_copy(update={"n_clusters": initial_k}),
-        trainer=config.trainer.model_copy(
-            update={
-                "batch_size": resolve_batch_size(len(train), config.trainer.batch_size),
-                "valid_size": 0.0,
-            }
-        ),
-        seed=config.trainer.seed,
-    )
-    if device.startswith("cuda"):
-        torch.cuda.set_device(torch.device(device))
-        torch.cuda.reset_peak_memory_stats(torch.device(device))
-
-    k_selection_result: ClusterNumberSelectionResult | None = None
-    k_selection_result_dir: Path | None = None
-    selection_seconds = 0.0
-    estimator: TrailsEstimator
-    if config.n_clusters is None:
-        selection_started = time.perf_counter()
-        k_selection_result_dir = resolve_output_path(config.k_selection.result_dir, run_dir)
-        selector = ClusterNumberSelector(
-            config.k_selection.candidate_clusters,
-            seeds=config.k_selection.seeds,
-            selection_rule=config.k_selection.selection_rule,
-            require_non_empty=config.k_selection.require_non_empty,
-            min_cluster_fraction=config.k_selection.min_cluster_fraction,
-            min_mean_pairwise_ari=config.k_selection.min_mean_pairwise_ari,
-            compute_stability=config.k_selection.compute_stability,
-            estimator_config=trails_config,
-        )
-        k_selection_result = selector.select(train, validation_data=validation)
-        selection_seconds = time.perf_counter() - selection_started
-        k_selection_result.save(k_selection_result_dir)
-        if k_selection_result.selected_k is None:
-            raise RuntimeError("没有候选K通过配置的选择门槛；test尚未评估")
-        estimator = k_selection_result.selected_estimators[config.trainer.seed]
-        trails_config = estimator.config
-    else:
-        estimator = TrailsEstimator(trails_config)
-
-    resolved_application = config.model_copy(update={"model": trails_config.model})
+def run(config: MimicApplicationConfig) -> dict[str, Any]:
+    ##################################################
+    # 一、只读取train/validation，复用06冻结的预处理和划分。
+    ##################################################
+    source, root = config.split.dir.resolve(), config.paths.dir.resolve()
+    if root == source or source in root.parents or root in source.parents:
+        raise ValueError("建模输出不得写入冻结06目录")
+    targets = [
+        root / name
+        for name in ("run_manifest.json", "resolved_config.yaml", "models", "evaluator.json")
+    ]
+    if existing := [str(path) for path in targets if path.exists()]:
+        raise FileExistsError(f"拒绝覆盖已有建模产物：{existing}")
     if config.swanlab.enabled:
-        experiment_name = config.swanlab.experiment or datetime.now().astimezone().strftime(
-            "trails-mimic-%Y%m%d-%H%M%S"
-        )
-        init_kwargs: dict[str, Any] = {
-            "project": config.swanlab.project,
-            "experiment_name": experiment_name,
-            "config": {
-                "application": resolved_application.model_dump(mode="json"),
-                "training": trails_config.model_dump(mode="json"),
-                "artifacts": sorted(artifacts),
-            },
-        }
-        if config.swanlab.mode is not None:
-            init_kwargs["mode"] = config.swanlab.mode
-        swanlab.init(**init_kwargs)
+        raise ValueError("候选批量报告请设置swanlab.enabled=false")
+    split_manifest = json.loads((source / "split_manifest.json").read_text())
+    if split_manifest["split_seed"] != config.split.seed:
+        raise ValueError("split.seed与冻结划分不一致")
+    train = ClinicalTimeSeriesDataset.load(source / "train/dataset.pt")
+    validation = ClinicalTimeSeriesDataset.load(source / "validation/dataset.pt")
+    root.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(config.model_dump(mode="json"), root / "resolved_config.yaml")
 
-    try:
-        training_started = time.perf_counter()
-        if k_selection_result is None:
-            estimator.fit(
-                train,
-                validation_data=validation,
-                history_callback=log_swanlab_history if config.swanlab.enabled else None,
-            )
-            training_seconds = time.perf_counter() - training_started
-        else:
-            if config.swanlab.enabled:
-                for entry in estimator.history:
-                    log_swanlab_history(entry)
-            training_seconds = selection_seconds
-
-        # K与最终模型锁定后才读取封存测试集，避免选择失败时接触test。
-        test_load_started = time.perf_counter()
-        test = ClinicalTimeSeriesDataset.load(dataset_paths["test"])
-        if (
-            test.metadata.get("split_name") != "test"
-            or test.metadata.get("split_seed") != config.split.seed
-        ):
-            raise ValueError(f"{dataset_paths['test']} 的split元数据与当前配置不一致")
-        datasets["test"] = test
-        load_seconds += time.perf_counter() - test_load_started
-
-        inference_started = time.perf_counter()
-        split_metrics = {
-            name: _save_split_outputs(
-                run_dir,
-                name,
-                dataset,
-                estimator,
-                trails_config.trainer.risk_horizon,
-            )
-            for name, dataset in datasets.items()
-        }
-        inference_seconds = time.perf_counter() - inference_started
-        if config.swanlab.enabled:
-            step = int(estimator.history[-1]["global_epoch"]) if estimator.history else 0
-            swanlab.log(
-                {
-                    f"{split_name}/{metric_name}": value
-                    for split_name, metrics in split_metrics.items()
-                    for metric_name, value in metrics.items()
-                },
-                step=step,
-            )
-    finally:
-        if config.swanlab.enabled:
-            swanlab.finish()
-
-    estimator.save(run_dir / "model.pt")
-    shutil.copy2(preprocessing_parameters, run_dir / "preprocessing_parameters.csv")
-    save_history_csv(run_dir / "training_history.csv", estimator.history)
-    save_json(run_dir / "training_history.json", estimator.history)
-    if "plot" in artifacts:
-        plot_history(run_dir / "training_history.png", estimator.history)
-    peak_memory = (
-        torch.cuda.max_memory_allocated(torch.device(device)) / 1024**3
-        if device.startswith("cuda")
-        else 0.0
+    ##################################################
+    # 二、调用公共评价器；所有候选冻结后才读取test，不自动决定K。
+    ##################################################
+    clusters = config.n_clusters if isinstance(config.n_clusters, list) else [config.n_clusters]
+    evaluator = ClusterNumberEvaluator(
+        clusters,
+        seeds=config.seeds,
+        min_cluster_fraction=config.min_cluster_fraction,
+        estimator_config=TrailsConfig(
+            data=DataConfig(n_features=train.n_features),
+            model=config.model,
+            trainer=config.trainer,
+            seed=config.trainer.seed,
+        ),
     )
+    evaluator.fit(
+        train,
+        validation_data=validation,
+        evaluation_data={"test": source / "test/dataset.pt"},
+        result_dir=root,
+    )
+
+    ##################################################
+    # 三、导出冻结预测与来源清单；各模型保持独立可读取。
+    ##################################################
+    save_candidate_outputs(
+        evaluator,
+        {
+            "train": train,
+            "validation": validation,
+            "test": source / "test/dataset.pt",
+        },
+        baseline_columns=BASELINE_COVARIATE_COLUMNS,
+    )
+    if "plot" in config.artifacts.names or "all" in config.artifacts.names:
+        for candidate in evaluator.candidates:
+            model = evaluator.load_estimator(
+                seed=candidate["seed"], n_clusters=candidate["n_clusters"]
+            )
+            plot_history(root / candidate["prediction_dir"] / "training_history.png", model.history)
+            del model
     summary = {
+        "schema_version": 2,
+        "evaluator": "evaluator.json",
         "data": {
+            "split_dir": str(source),
             "split_seed": config.split.seed,
-            "split_dir": str(split_dir),
-            "split_sizes": {name: len(data) for name, data in datasets.items()},
+            "split_sizes": split_manifest["split_counts"],
             "n_features": train.n_features,
         },
-        "metrics": split_metrics,
-        "resources": {
-            "device": device,
-            "batch_size": trails_config.trainer.batch_size,
-            "load_seconds": load_seconds,
-            "training_seconds": training_seconds,
-            "inference_seconds": inference_seconds,
-            "k_selection_seconds": selection_seconds,
-            "peak_gpu_memory_gib": peak_memory,
-        },
-        "application": resolved_application.model_dump(mode="json"),
-        "training": trails_config.model_dump(mode="json"),
-        "k_resolution": {
-            "mode": "automatic" if k_selection_result is not None else "fixed",
-            "requested_n_clusters": config.n_clusters,
-            "effective_n_clusters": trails_config.model.n_clusters,
-            "selection_seeds": (
-                list(config.k_selection.seeds) if k_selection_result is not None else []
-            ),
-            "final_model_seed": config.trainer.seed,
-        },
-        "k_selection": (
-            None
-            if k_selection_result is None
-            else {
-                **k_selection_result.to_payload(),
-                "result_dir": str(k_selection_result_dir),
-            }
-        ),
+        "datasets": ["train", "validation", "test"],
+        "models": evaluator.candidates,
+        "metrics": "run_metrics.csv",
+        "k_summary": "k_summary.csv",
+        "min_cluster_fraction": config.min_cluster_fraction,
+        "cindex_risk_score": config.trainer.cindex_risk_score,
+        "risk_horizon": config.trainer.risk_horizon,
+        "survival_format_version": SURVIVAL_FORMAT_VERSION,
+        "interpretation": "全部候选冻结后报告各集；人工参考test选择模型时属于探索分析。",
     }
-    save_json(resolve_output_path(config.outputs.summary, run_dir), summary)
+    save_json(root / "run_manifest.json", summary)
+    LOGGER.info("MIMIC全部候选已保存，未自动选择模型：%s", root)
     return summary
 
 
 @hydra.main(config_path="../../configs", config_name="mimic/run", version_base="1.3")
 def main(raw_config: DictConfig) -> None:
-    config = MimicApplicationConfig.model_validate(resolved_payload(raw_config))
-    run(config)
+    run(MimicApplicationConfig.model_validate(resolved_payload(raw_config)))
 
 
 if __name__ == "__main__":

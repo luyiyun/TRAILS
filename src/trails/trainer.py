@@ -336,8 +336,9 @@ class TrailsTrainer:
             for module in self.model.survival_head.modules():
                 if isinstance(module, torch.nn.Linear):
                     module.reset_parameters()
-            with torch.no_grad():
-                self.model.survival_log_shape.zero_()
+            if self.model.survival_log_shape is not None:
+                with torch.no_grad():
+                    self.model.survival_log_shape.zero_()
         if self.config.uncertainty_after_warmup == "reset":
             weights = self.model.model_config.loss
             for name, weight in {

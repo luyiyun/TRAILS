@@ -1,0 +1,29 @@
+# @package _global_
+# 显式指定主候选；各基线必须指定展示seed。顺序由comparison_runs和08清单决定。
+inputs:
+  run_dir: ???
+n_clusters: ???
+model_seed: ???
+selection_basis: ??? # prespecified / validation / test_exploratory
+comparison_runs: [] # [{run_dir: ..., n_clusters: 3, model_seed: 20260517, label: alternative}]
+baseline_dirs: []
+baseline_seeds: {} # {summary_kmeans: 20260517, ...}
+interventions_csv: data/real/mimic-iv-3.1/derived/trails_case/interventions.csv
+auc_times: [7.0, 14.0, 21.0]
+probability_times: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0]
+calibration_bins: 10
+trajectory_bin_hours: 4.0
+min_cell_patients: 10
+tau: 28.0
+comparison_dataset: test
+profile_dataset: train
+width_mm: 240
+height_mm: 330
+dpi: 600
+paths:
+  dir: ${inputs.run_dir}/figure-k${n_clusters}-seed${model_seed}
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${paths.dir}

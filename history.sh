@@ -1024,3 +1024,188 @@ env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/
 
 # 2026-10-11 本地：07终态后精确取回9件聚合图表/配置/退出文件，验证全9K、旧原始统计不变与综合分公式。
 env MPLCONFIGDIR=/tmp/trails-g14-mpl XDG_CACHE_HOME=/tmp/trails-g14-cache .venv/bin/python .remote-run/g14-n2-complete-20261011/finish_delivery.py
+
+# 2026-10-11 本地MIMIC迁移：公开候选API合成数据验证，无真实队列训练。
+# 覆盖seed/K、无validation、无事件评价集、延迟加载及可迁移重载；CPU小模型。
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_selection.py tests/test_estimator.py -q
+
+# 2026-10-11 本地合成冻结数据：240人、23变量，seed=20260517；保留原源码快照用于新旧对照。
+# 06张量等价、CRC两seed/K=2,3各3轮CPU数值对照及MIMIC新07训练，不读取真实患者数据。
+PYTHONPATH=. UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/validate.py --stage prepare --output outputs/validation/mimic-migration-20261011/run01
+
+# 2026-10-11 修正合成输入：遵守05已保证的patient/time/feature唯一键，再执行等价对照。
+PYTHONPATH=. UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/validate.py --stage prepare --output outputs/validation/mimic-migration-20261011/run02
+
+# 2026-10-11 等价对照的短训练配置使用合法min_epochs=1，其余合成输入与预算不变。
+PYTHONPATH=. MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/validate.py --stage prepare --output outputs/validation/mimic-migration-20261011/run03
+
+# 2026-10-11 合成冻结结果：10先独立生成全部重复的补充材料，再由09生成240x330mm主图。
+# 使用seed=20260517主候选、K=2；比较纯聚类/纯生存能力，SourceData仅聚合统计。
+PYTHONPATH=. MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/validate.py --stage figures --output outputs/validation/mimic-migration-20261011/run03
+
+# 2026-10-11 检查独立09/10聚合数值、动态AUC、方法能力、同划分限制及600dpi输出尺寸。
+PYTHONPATH=. MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/validate.py --stage checks --output outputs/validation/mimic-migration-20261011/run03
+
+# 2026-10-11 09只计算主模型完整Cox描述，10计算所有方法；数值对照仅比较二者共同评价字段。
+PYTHONPATH=. MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/validate.py --stage checks --output outputs/validation/mimic-migration-20261011/run03
+
+# 2026-10-11 合成报告边界：缺失曲线、无事件、空簇、median风险适配、可估计Cox及CRC共享簇统计。
+PYTHONPATH=. MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/edge_checks.py
+
+# 2026-10-11 检查印刷预览后修订主图布局，保存新目录；输入仍是同一合成run03，K2/seed20260517。
+MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python -m scripts.mimic.09_figure inputs.run_dir=outputs/validation/mimic-migration-20261011/run03/mimic_run n_clusters=2 model_seed=20260517 selection_basis=test_exploratory 'baseline_dirs=[outputs/validation/mimic-migration-20261011/run03/baseline]' +baseline_seeds.cluster_only=20260517 +baseline_seeds.survival_only=20260517 interventions_csv=outputs/validation/mimic-migration-20261011/run03/interventions.csv min_cell_patients=5 paths.dir=outputs/validation/mimic-migration-20261011/run03/figure-v2
+
+# 2026-10-11 CRC后处理输入补齐其既有confidence/entropy列，完成相同冻结预测的簇统计和KM数值对照。
+PYTHONPATH=. MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/edge_checks.py
+
+# 2026-10-11 最终本地检查：Ruff format/check、Pyright及完整现有公开API测试。
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff format
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check --fix
+UV_CACHE_DIR=/tmp/uv-cache uv run pyright
+MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run pytest
+
+# 2026-10-11 最终主图合成预览：消除轨迹标签重叠、缩短治疗名称，仍使用同一冻结K2/seed20260517。
+MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python -m scripts.mimic.09_figure inputs.run_dir=outputs/validation/mimic-migration-20261011/run03/mimic_run n_clusters=2 model_seed=20260517 selection_basis=test_exploratory 'baseline_dirs=[outputs/validation/mimic-migration-20261011/run03/baseline]' +baseline_seeds.cluster_only=20260517 +baseline_seeds.survival_only=20260517 interventions_csv=outputs/validation/mimic-migration-20261011/run03/interventions.csv min_cell_patients=5 paths.dir=outputs/validation/mimic-migration-20261011/run03/figure-v3
+
+# 2026-10-11 12方法/K3版式压力检查：仅复制合成统计用于排版，绝非基线训练或性能结果。
+PYTHONPATH=. MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/layout_check.py
+
+# 2026-10-11 检查多簇全删失时log-rank的显式缺失原因，并复查12方法占簇面板的分栏布局。
+PYTHONPATH=. MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/edge_checks.py
+PYTHONPATH=. MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/layout_check.py
+
+# 2026-10-11 最终代码验证，包含跨数据集ARI标签限制及全删失log-rank处理。
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff format
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check --fix
+UV_CACHE_DIR=/tmp/uv-cache uv run pyright
+MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run pytest
+
+# 2026-10-11 最终09 CLI合成验证与印刷预览，保存figure-final；K=2、seed=20260517。
+MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python -m scripts.mimic.09_figure inputs.run_dir=outputs/validation/mimic-migration-20261011/run03/mimic_run n_clusters=2 model_seed=20260517 selection_basis=test_exploratory 'baseline_dirs=[outputs/validation/mimic-migration-20261011/run03/baseline]' +baseline_seeds.cluster_only=20260517 +baseline_seeds.survival_only=20260517 interventions_csv=outputs/validation/mimic-migration-20261011/run03/interventions.csv min_cell_patients=5 paths.dir=outputs/validation/mimic-migration-20261011/run03/figure-final
+
+# 2026-10-11 对最终主图版本核验09/10共有数值、同划分限制、AUC口径及240x330mm/600dpi尺寸。
+PYTHONPATH=. MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run python outputs/validation/mimic-migration-20261011/validate.py --stage checks --figure-name figure-final --output outputs/validation/mimic-migration-20261011/run03
+
+# 2026-10-11 最终样式收尾后的完整公开API检查；未执行任何真实队列任务。
+MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run pytest
+
+# 2026-10-11 同步清除CRC描述性指标摘要中的历史自动排名措辞，完成最终检查。
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff format
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check --fix
+UV_CACHE_DIR=/tmp/uv-cache uv run pyright
+MPLCONFIGDIR=/tmp/trails-mpl UV_CACHE_DIR=/tmp/uv-cache uv run pytest
+
+# 2026-10-11 MIMIC真实重跑：99服务器 /home/rongzw/projects/TRAILS；复用冻结seed-20260517，不覆盖旧结果。
+# 串行完成TRAILS K2–5/seed20260517（10预热、100–300轮、batch1024）后运行原配置11项基线；validation汇总交用户定K。
+# R依赖使用既有项目.r-library；只取回聚合产物，09/10待用户明确K后执行。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id mimic-full-20261011-01 --apply -- env R_LIBS_USER=/home/rongzw/projects/TRAILS/.r-library OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 MPLBACKEND=Agg bash -c 'python -m scripts.mimic.07_run split.dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517 split.seed=20260517 "n_clusters=[2,3,4,5]" "seeds=[20260517]" trainer.device=cuda:0 trainer.warmup_epochs=10 trainer.min_epochs=100 trainer.max_epochs=300 trainer.batch_size=1024 paths.dir=outputs/mimic_case/mimic-full-20261011-01/modeling && python -m scripts.mimic.08_baselines split_dir=data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517 trainer.device=cuda:0 trainer.seed=20260517 paths.dir=outputs/mimic_case/mimic-full-20261011-01/baselines'
+
+# 2026-10-12 本地重载99服务器真实MIMIC聚合产物，导出seed20260517/K2–5 validation汇总及诊断图供人工定K。
+# 远端输入 /home/rongzw/projects/TRAILS/outputs/mimic_case/mimic-full-20261011-01/modeling；未取回患者级文件。
+MPLCONFIGDIR=/tmp/trails-mpl MPLBACKEND=Agg .venv/bin/python -c 'from pathlib import Path; from trails import ClusterNumberEvaluator; p=Path("remote-results/default/mimic-full-20261011-01/outputs/mimic_case/mimic-full-20261011-01/modeling"); e=ClusterNumberEvaluator.load(p); v=e.run_metrics.query("dataset == \"validation\"").sort_values("n_clusters"); v.to_csv(p / "validation_summary.csv", index=False); e.plot_metrics(dataset="validation", path=p / "validation_metrics.png"); print(v.to_string(index=False)); print(e.k_summary.query("dataset == \"validation\"").to_string(index=False))'
+
+# 2026-10-12 用户要求跳过MPJLCMM；99服务器 /home/rongzw/projects/TRAILS，保留已完成7项基线产物。
+# 已核实R PID3280195属于本次08进程3252843；只停止该R子进程，让父流程记录非零退出。
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'kill -TERM 3280195'
+
+# 2026-10-12 用户授权新增K6–8立即用GPU，后续慢基线连续2小时无阶段/迭代/批次进度则跳过。
+# 99服务器 /home/rongzw/projects/TRAILS；首批冻结配置不变，7项已完成基线不重跑；CPU基线独立并行，VaDeSC接续GPU候选。
+# 原始运行已因用户停止MPJLCMM退出；本次三个独立运行只写新目录，患者级产物仍留远端。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id mimic-k678-20261012-01 --apply -- env R_LIBS_USER=/home/rongzw/projects/TRAILS/.r-library OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 MPLBACKEND=Agg bash -c 'python -m scripts.mimic.07_run --config-path /home/rongzw/projects/TRAILS/outputs/mimic_case/mimic-full-20261011-01/modeling --config-name resolved_config '\''n_clusters=[6,7,8]'\'' '\''seeds=[20260517]'\'' paths.dir=outputs/mimic_case/mimic-k678-20261012-01/modeling && python -m scripts.mimic.08_baselines --config-path /home/rongzw/projects/TRAILS/outputs/mimic_case/mimic-full-20261011-01/baselines/.hydra --config-name config '\''methods=[{kind:vadesc,name:vadesc,seeds:[20260517],n_clusters:3,n_components:3,grid_size:16,hidden_dims:[50,100],latent_dim:16,weibull_shape:2.0,max_epochs:300,patience:30,learning_rate:0.001,batch_size:256,device:cuda}]'\'' paths.dir=outputs/mimic_case/mimic-vadesc-20261012-01/baselines'
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id mimic-jmbayes2-20261012-01 --apply -- env R_LIBS_USER=/home/rongzw/projects/TRAILS/.r-library OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 MPLBACKEND=Agg bash -c 'python -m scripts.mimic.08_baselines --config-path /home/rongzw/projects/TRAILS/outputs/mimic_case/mimic-full-20261011-01/baselines/.hydra --config-name config '\''methods=[{kind:jmbayes2,name:jmbayes2,seeds:[20260517],landmark_time:48.0,observation_time_factor:0.041666666666666664,survival_time_factor:1.0,rscript_executable:Rscript,timeout_seconds:null,lme_max_iterations:100,n_burnin:500,n_chains:3,n_cores:1,n_iter:3500,n_mcmc:100,n_samples:200,n_thin:5,parallel:snow,patient_batch_size:32}]'\'' paths.dir=outputs/mimic_case/mimic-jmbayes2-20261012-01/baselines'
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id mimic-dcm-20261012-01 --apply -- env R_LIBS_USER=/home/rongzw/projects/TRAILS/.r-library OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 MPLBACKEND=Agg bash -c 'python -m scripts.mimic.08_baselines --config-path /home/rongzw/projects/TRAILS/outputs/mimic_case/mimic-full-20261011-01/baselines/.hydra --config-name config '\''methods=[{kind:deep_cox_mixtures,name:deep_cox_mixtures,seeds:[20260517],n_clusters:3,n_components:3,grid_size:16,hidden_dims:[50,100],gamma:10.0,smoothing_factor:0.0001,use_activation:false,max_epochs:300,learning_rate:0.001,batch_size:256}]'\'' paths.dir=outputs/mimic_case/mimic-dcm-20261012-01/baselines'
+
+# 2026-10-12 本地合并 MIMIC K2–8 冻结聚合结果；seed=20260517，统一归一化BIC和描述性综合分。
+# 仅汇总已取回的指标，使用公共 summarize_completed；不重训、不读取患者数据，仅展示validation。
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/trails-mpl PYTHONPATH=src .venv/bin/python remote-results/default/mimic-k2-8-comparison-20261012/summarize_validation.py --source-dir remote-results/default/mimic-full-20261011-01/outputs/mimic_case/mimic-full-20261011-01/modeling --source-dir remote-results/default/mimic-k678-20261012-01/outputs/mimic_case/mimic-k678-20261012-01/modeling --output-dir remote-results/default/mimic-k2-8-comparison-20261012 --seed 20260517 --candidates 2 3 4 5 6 7 8
+
+# 2026-10-12 用户指定K6，seed20260517，selection_basis=validation；在tmu-99-rzw-xtcp准备派生输入。
+# 远程cwd=/home/rongzw/projects/TRAILS；核验9成功基线指纹，保留原件，汇总K2–8供补充诊断。
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'cd /home/rongzw/projects/TRAILS && .venv/bin/python -' < outputs/mimic_case/mimic-report-k6-20261012-01/prepare_inputs.py
+
+# 2026-10-12 tmu-99-rzw-xtcp，cwd=/home/rongzw/projects/TRAILS；独立运行09主图和10补充材料。
+# 主模型来自mimic-k678-20261012-01，K6/seed20260517，validation人工选择；9项成功基线固定顺序。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id mimic-figure-k6-20261012-01 --apply -- env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 MPLBACKEND=Agg python -m scripts.mimic.09_figure inputs.run_dir=outputs/mimic_case/mimic-k678-20261012-01/modeling n_clusters=6 model_seed=20260517 selection_basis=validation 'baseline_dirs=[outputs/mimic_case/mimic-report-k6-20261012-01/inputs/successful_original_baselines,outputs/mimic_case/mimic-dcm-20261012-01/baselines,outputs/mimic_case/mimic-vadesc-20261012-01/baselines]' '+baseline_seeds={summary_kmeans:20260517,ufpca_kmeans:20260517,mfpca_kmeans:20260517,cox_risk_kmeans:20260517,trails_no_survival:20260517,cox_ph:20260517,random_survival_forest:20260517,deep_cox_mixtures:20260517,vadesc:20260517}' paths.dir=outputs/mimic_case/mimic-report-k6-20261012-01/figure
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id mimic-supplementary-k6-20261012-01 --apply -- env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 MPLBACKEND=Agg python -m scripts.mimic.10_supplementary inputs.run_dir=outputs/mimic_case/mimic-k678-20261012-01/modeling n_clusters=6 model_seed=20260517 selection_basis=validation 'baseline_dirs=[outputs/mimic_case/mimic-report-k6-20261012-01/inputs/successful_original_baselines,outputs/mimic_case/mimic-dcm-20261012-01/baselines,outputs/mimic_case/mimic-vadesc-20261012-01/baselines]' paths.dir=outputs/mimic_case/mimic-report-k6-20261012-01/supplementary
+
+# 2026-10-12 tmu-99-rzw-xtcp，cwd=/home/rongzw/projects/TRAILS；09/10均exit0后补全聚合候选诊断。
+# 保持K6/seed20260517为主模型，复用candidate_diagnostics纳入K2–8，并在图表摘要中注明排除的方法。
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'cd /home/rongzw/projects/TRAILS && OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 MPLBACKEND=Agg .venv/bin/python -' < outputs/mimic_case/mimic-report-k6-20261012-01/complete_supplementary.py
+
+# 2026-10-12 本地主图排版修复验证：K6风险人数表、轨迹图例与临床表文字；不改统计定义。
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff format scripts/mimic/figure_plots.py
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check scripts/mimic/figure_plots.py
+UV_CACHE_DIR=/tmp/uv-cache uv run pyright
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest
+
+# 2026-10-12 tmu-99-rzw-xtcp，cwd=/home/rongzw/projects/TRAILS；主图排版修正版，保留首版。
+# 原K6/seed20260517/validation选择及9基线不变，仍为240×330mm、600dpi。
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id mimic-figure-k6-20261012-02 --apply -- env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 MPLBACKEND=Agg python -m scripts.mimic.09_figure inputs.run_dir=outputs/mimic_case/mimic-k678-20261012-01/modeling n_clusters=6 model_seed=20260517 selection_basis=validation 'baseline_dirs=[outputs/mimic_case/mimic-report-k6-20261012-01/inputs/successful_original_baselines,outputs/mimic_case/mimic-dcm-20261012-01/baselines,outputs/mimic_case/mimic-vadesc-20261012-01/baselines]' '+baseline_seeds={summary_kmeans:20260517,ufpca_kmeans:20260517,mfpca_kmeans:20260517,cox_risk_kmeans:20260517,trails_no_survival:20260517,cox_ph:20260517,random_survival_forest:20260517,deep_cox_mixtures:20260517,vadesc:20260517}' paths.dir=outputs/mimic_case/mimic-report-k6-20261012-01/figure-v2
+
+# 2026-10-12 本地核验K6主图与全部聚合补充材料，检查两版统计一致、SourceData、尺寸和方法能力。
+# 使用打包运行时组装带书签的补充PDF与完整ZIP；只处理已获准取回的聚合文件。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 outputs/mimic_case/mimic-report-k6-20261012-01/verify_delivery.py
+
+# 2026-10-12 主图最终排版：拉开AUC图例与横轴标题，统计及240×330mm/600dpi不变。
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff format scripts/mimic/figure_plots.py
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check scripts/mimic/figure_plots.py
+UV_CACHE_DIR=/tmp/uv-cache uv run pyright
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest
+.venv/bin/python /Users/rong/.codex/skills/remote-run/scripts/remote_run.py --target default submit --run-id mimic-figure-k6-20261012-03 --apply -- env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 MPLBACKEND=Agg python -m scripts.mimic.09_figure inputs.run_dir=outputs/mimic_case/mimic-k678-20261012-01/modeling n_clusters=6 model_seed=20260517 selection_basis=validation 'baseline_dirs=[outputs/mimic_case/mimic-report-k6-20261012-01/inputs/successful_original_baselines,outputs/mimic_case/mimic-dcm-20261012-01/baselines,outputs/mimic_case/mimic-vadesc-20261012-01/baselines]' '+baseline_seeds={summary_kmeans:20260517,ufpca_kmeans:20260517,mfpca_kmeans:20260517,cox_risk_kmeans:20260517,trails_no_survival:20260517,cox_ph:20260517,random_survival_forest:20260517,deep_cox_mixtures:20260517,vadesc:20260517}' paths.dir=outputs/mimic_case/mimic-report-k6-20261012-01/figure-v3
+
+# 2026-10-12 本地最终交付核验；K6/seed20260517，figure-v3与原版及supplementary统计一致性。
+# 重建嵌入字体的38页补充图册与完整ZIP；输入均为已取回聚合文件。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 outputs/mimic_case/mimic-report-k6-20261012-01/verify_delivery.py
+
+# 2026-10-12 最终聚合文件取回完成后重新核验（前次在传输结束前读取，未改动结果）。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 outputs/mimic_case/mimic-report-k6-20261012-01/verify_delivery.py
+
+# 2026-10-13 本地K6主图重新设计样稿；只重绘冻结聚合数据，不训练、不重算患者级指标。
+# 输入mimic-report-k6-20261012-01，K6/seed20260517；无表格、无NA；UMAP为已保存潜在表征聚合密度。
+MPLCONFIGDIR=/tmp/trails-mpl .venv/bin/python outputs/mimic_case/mimic-design-k6-20261013/design_preview.py
+
+# 2026-10-13 样稿视觉复核：复用已保存PDF中的测试集UMAP原图层，修正面板注释间距。
+# 只提取已授权图件，不加载患者坐标，不改变UMAP布局或统计结果。
+/Users/rong/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 outputs/mimic_case/mimic-design-k6-20261013/extract_umap_asset.py
+MPLCONFIGDIR=/tmp/trails-mpl .venv/bin/python outputs/mimic_case/mimic-design-k6-20261013/design_preview.py
+
+# 2026-10-13 本地验证生存头latent来源参数；sample保持默认，mean仅切换生存输入，不启动真实训练。
+# 检查公开API的两种训练配置、确定性预测及新旧检查点重载；合成数据seed=13/17。
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff format src/trails/config.py src/trails/model.py tests/test_estimator.py
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check
+UV_CACHE_DIR=/tmp/uv-cache uv run pyright
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest
+
+# 2026-10-13 本地验证可选one_hot双参数Weibull头；默认multi_output保持兼容，不运行真实队列。
+# 公开API覆盖两种头及mean/sample、warmup后重置、混合曲线与检查点；合成数据seed=13/17。
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff format src/trails/config.py src/trails/model.py src/trails/estimator.py src/trails/trainer.py tests/test_estimator.py
+UV_CACHE_DIR=/tmp/uv-cache uv run ruff check
+UV_CACHE_DIR=/tmp/uv-cache uv run pyright
+UV_CACHE_DIR=/tmp/uv-cache uv run pytest
+
+# 2026-10-13 MIMIC K4四组合：multi_output/one_hot × sample/mean；seed=20260517，复用原冻结配置及划分。
+# 执行主机tmu-99-rzw-xtcp，工作目录/home/rongzw/projects/TRAILS；每组最多300轮、batch1024，其余参数不变。
+# 顺序训练后用现有10统一评价；本轮仅比较validation，患者级产物留远端，旧main只作历史参照。
+'.venv/bin/python' '/Users/rong/.codex/skills/remote-run/scripts/remote_run.py' '--target' 'default' 'submit' '--run-id' 'mimic-k4-head-latent-20261013-01' '--apply' '--' 'env' 'OMP_NUM_THREADS=4' 'MKL_NUM_THREADS=4' 'MPLBACKEND=Agg' 'bash' '-c' ''\''python'\'' '\''-m'\'' '\''scripts.mimic.07_run'\'' '\''--config-path'\'' '\''/home/rongzw/projects/TRAILS/outputs/mimic_case/mimic-full-20261011-01/modeling'\'' '\''--config-name'\'' '\''resolved_config'\'' '\''n_clusters=4'\'' '\''seeds=[20260517]'\'' '\''++model.survival_head_architecture=multi_output'\'' '\''++model.survival_latent_source=sample'\'' '\''paths.dir=outputs/mimic_case/mimic-k4-head-latent-20261013-01/multi_output_sample/modeling'\'' && '\''python'\'' '\''-m'\'' '\''scripts.mimic.07_run'\'' '\''--config-path'\'' '\''/home/rongzw/projects/TRAILS/outputs/mimic_case/mimic-full-20261011-01/modeling'\'' '\''--config-name'\'' '\''resolved_config'\'' '\''n_clusters=4'\'' '\''seeds=[20260517]'\'' '\''++model.survival_head_architecture=multi_output'\'' '\''++model.survival_latent_source=mean'\'' '\''paths.dir=outputs/mimic_case/mimic-k4-head-latent-20261013-01/multi_output_mean/modeling'\'' && '\''python'\'' '\''-m'\'' '\''scripts.mimic.07_run'\'' '\''--config-path'\'' '\''/home/rongzw/projects/TRAILS/outputs/mimic_case/mimic-full-20261011-01/modeling'\'' '\''--config-name'\'' '\''resolved_config'\'' '\''n_clusters=4'\'' '\''seeds=[20260517]'\'' '\''++model.survival_head_architecture=one_hot'\'' '\''++model.survival_latent_source=sample'\'' '\''paths.dir=outputs/mimic_case/mimic-k4-head-latent-20261013-01/one_hot_sample/modeling'\'' && '\''python'\'' '\''-m'\'' '\''scripts.mimic.07_run'\'' '\''--config-path'\'' '\''/home/rongzw/projects/TRAILS/outputs/mimic_case/mimic-full-20261011-01/modeling'\'' '\''--config-name'\'' '\''resolved_config'\'' '\''n_clusters=4'\'' '\''seeds=[20260517]'\'' '\''++model.survival_head_architecture=one_hot'\'' '\''++model.survival_latent_source=mean'\'' '\''paths.dir=outputs/mimic_case/mimic-k4-head-latent-20261013-01/one_hot_mean/modeling'\'' && '\''python'\'' '\''-m'\'' '\''scripts.mimic.10_supplementary'\'' '\''inputs.run_dir=outputs/mimic_case/mimic-k4-head-latent-20261013-01/multi_output_sample/modeling'\'' '\''n_clusters=4'\'' '\''model_seed=20260517'\'' '\''selection_basis=prespecified'\'' '\''comparison_runs=[{run_dir:outputs/mimic_case/mimic-k4-head-latent-20261013-01/multi_output_mean/modeling,n_clusters:4,model_seed:20260517,label:multi_output_mean},{run_dir:outputs/mimic_case/mimic-k4-head-latent-20261013-01/one_hot_sample/modeling,n_clusters:4,model_seed:20260517,label:one_hot_sample},{run_dir:outputs/mimic_case/mimic-k4-head-latent-20261013-01/one_hot_mean/modeling,n_clusters:4,model_seed:20260517,label:one_hot_mean}]'\'' '\''baseline_dirs=[]'\'' '\''paths.dir=outputs/mimic_case/mimic-k4-head-latent-20261013-01/comparison'\'''
+
+# 2026-10-13 四组合后处理exit1；只读诊断one_hot保存预测的概率边界，仅输出train/validation聚合极值及计数。
+# 主机tmu-99-rzw-xtcp，/home/rongzw/projects/TRAILS；K4/seed20260517，不改参数、不重训、不读取test指标。
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes tmu-99-rzw-xtcp 'cd /home/rongzw/projects/TRAILS && uv run --locked python -c '\''from pathlib import Path
+import torch
+from trails import TrailsPrediction
+root=Path('\''\'\'''\''outputs/mimic_case/mimic-k4-head-latent-20261013-01'\''\'\'''\'')
+for name in ['\''\'\'''\''one_hot_sample'\''\'\'''\'','\''\'\'''\''one_hot_mean'\''\'\'''\'']:
+ for split in ['\''\'\'''\''train'\''\'\'''\'','\''\'\'''\''validation'\''\'\'''\'']:
+  p=TrailsPrediction.load(root/name/'\''\'\'''\''modeling/models/seed-20260517/k4'\''\'\'''\''/split/'\''\'\'''\''model_prediction.pt'\''\'\'''\''); s=p.survival(list(range(1,29))); print(name,split,{'\''\'\'''\''finite'\''\'\'''\'':bool(torch.isfinite(s).all()),'\''\'\'''\''min'\''\'\'''\'':s.min().item(),'\''\'\'''\''max'\''\'\'''\'':s.max().item(),'\''\'\'''\''above_one'\''\'\'''\'':int((s>1).sum()),'\''\'\'''\''below_zero'\''\'\'''\'':int((s<0).sum()),'\''\'\'''\''nonfinite'\''\'\'''\'':int((~torch.isfinite(s)).sum()),'\''\'\'''\''max_weight_sum_error'\''\'\'''\'':(p.predict_proba().sum(-1)-1).abs().max().item()})'\'''
+
+# 2026-10-13 四组合训练完成、后处理概率边界失败；本地仅汇总已取回的validation指标，不重算预测。
+# 输入mimic-k4-head-latent-20261013-01，K4/seed20260517；核对其余配置/冻结划分一致并对照原multi_output_sample。
+.venv/bin/python -c 'import json
+from pathlib import Path
+import pandas as pd
+r=Path('\''remote-results/default/mimic-k4-head-latent-20261013-01/outputs/mimic_case/mimic-k4-head-latent-20261013-01'\''); names=['\''multi_output_sample'\'','\''multi_output_mean'\'','\''one_hot_sample'\'','\''one_hot_mean'\'']; configs=[]; refs=[]; rows=[]
+for name in names:
+ p=r/name/'\''modeling'\''; c=json.loads((p/'\''models/seed-20260517/k4/config.json'\'').read_text()); c['\''model'\''].pop('\''survival_head_architecture'\''); c['\''model'\''].pop('\''survival_latent_source'\''); configs.append(c); refs.append(json.loads((p/'\''run_manifest.json'\'').read_text())['\''data'\'']); rows.append(pd.read_csv(p/'\''run_metrics.csv'\'').query("dataset == '\''validation'\''").assign(combination=name)); h=pd.read_csv(p/'\''models/seed-20260517/k4/training_history.csv'\''); print(name,'\''history_rows'\'',len(h),'\''last_epoch'\'',h['\''epoch'\''].iloc[-1])
+assert all(c==configs[0] for c in configs); assert all(d==refs[0] for d in refs); print('\''same_remaining_estimator_config_and_frozen_split'\'',True)
+v=pd.concat(rows,ignore_index=True); v.to_csv(r/'\''validation_partial_comparison.csv'\'',index=False); print(v.drop(columns=['\''latent_mixture_bic_normalized'\'','\''selection_score'\'']).to_string(index=False))
+old=pd.read_csv('\''remote-results/default/mimic-full-20261011-01/outputs/mimic_case/mimic-full-20261011-01/modeling/run_metrics.csv'\'').query("dataset == '\''validation'\'' and n_clusters == 4").iloc[0]; print('\''control_deltas'\'',{k:float(v.iloc[0][k]-old[k]) for k in ['\''cindex'\'','\''latent_mixture_bic'\'','\''cluster_min_fraction'\'','\''cluster_max_fraction'\'','\''cluster_entropy'\'']})'

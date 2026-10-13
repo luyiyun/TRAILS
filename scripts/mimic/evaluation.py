@@ -1,4 +1,4 @@
-"""统一09评价共享的输入读取、校准、调整Cox、临床描述与轨迹图表。"""
+"""09/10后处理共享的输入读取、校准、调整Cox、临床描述与轨迹图表。"""
 
 from __future__ import annotations
 
@@ -15,12 +15,18 @@ from lifelines import CoxPHFitter
 from scipy import stats
 from sksurv.nonparametric import kaplan_meier_estimator
 
-from trails import TrailsPrediction
+from trails import ClusterNumberEvaluator, TrailsPrediction
 from trails.data import ClinicalTimeSeriesDataset
 
 from ..baselines.base import BaselinePrediction
 from ..baselines.features import dataset_patient_ids, dataset_survival_arrays
-from .config import BASELINE_COVARIATE_COLUMNS, MimicEvaluationConfig
+from .config import (
+    BASELINE_COVARIATE_COLUMNS,
+    MimicFigureConfig,
+    MimicModelRequest,
+    MimicPostprocessConfig,
+    MimicSupplementaryConfig,
+)
 from .frozen import sha256_file
 from .paths import resolve_input_path
 
@@ -42,38 +48,74 @@ def _data_reference(manifest: dict[str, Any], root: Path) -> tuple[Path, dict[st
 
 
 def evaluation_methods(
-    config: MimicEvaluationConfig,
+    config: MimicPostprocessConfig,
 ) -> tuple[Path, list[dict[str, Any]]]:
     """读取TRAILS和基线manifest，并返回它们共同的06冻结划分。"""
-    trails_roots = [resolve_input_path(path) for path in config.trails_dirs]
-    if len(set(trails_roots)) != len(trails_roots):
-        raise ValueError("TRAILS评价目录重复")
-    trails_runs = [
-        (root, root.name, json.loads((root / "run_manifest.json").read_text()))
-        for root in trails_roots
+    requests = [
+        MimicModelRequest(
+            run_dir=config.inputs.run_dir,
+            n_clusters=config.n_clusters,
+            model_seed=config.model_seed,
+            label="trails",
+        ),
+        *config.comparison_runs,
     ]
-    labels = [label for _, label, _ in trails_runs]
-    if len(set(labels)) != len(labels):
-        raise ValueError("TRAILS评价目录末级名称重复，无法生成唯一输出目录")
-    reference_root, reference_signature = _data_reference(trails_runs[0][2], trails_runs[0][0])
-    multiple_trails = len(trails_runs) > 1
+    if isinstance(config, MimicSupplementaryConfig):
+        repeated = []
+        for request in requests:
+            evaluator = ClusterNumberEvaluator.load(resolve_input_path(request.run_dir))
+            for seed in evaluator.config.seeds:
+                if seed != request.model_seed:
+                    repeated.append(
+                        request.model_copy(
+                            update={"model_seed": seed, "label": f"{request.label}_seed{seed}"}
+                        )
+                    )
+        requests.extend(repeated)
     methods: list[dict[str, Any]] = []
-    for root, label, manifest in trails_runs:
+    reference_root: Path | None = None
+    reference_signature: dict[str, Any] = {}
+    for request in requests:
+        root = resolve_input_path(request.run_dir)
+        manifest = json.loads((root / "run_manifest.json").read_text())
+        if manifest.get("schema_version") != 2:
+            raise ValueError(f"旧MIMIC运行需要原版本代码，不自动转换：{root}")
         split_root, signature = _data_reference(manifest, root)
+        if reference_root is None:
+            reference_root, reference_signature = split_root, signature
         if split_root != reference_root or signature != reference_signature:
             raise ValueError(f"TRAILS运行未使用同一冻结划分：{root}")
-        name = f"trails:{label}" if multiple_trails else "trails"
+        evaluator = ClusterNumberEvaluator.load(root)
+        candidate = next(
+            (
+                item
+                for item in evaluator.candidates
+                if item["seed"] == request.model_seed and item["n_clusters"] == request.n_clusters
+            ),
+            None,
+        )
+        if candidate is None:
+            raise ValueError(f"候选不存在：{request}")
+        if evaluator.config.estimator.trainer.risk_horizon != config.tau:
+            raise ValueError("TRAILS与后处理的风险时间窗不一致")
         methods.append(
             {
-                "name": name,
-                "seed": manifest["training"]["seed"],
-                "directory": root,
-                "key": f"trails/{label}" if multiple_trails else "trails",
-                "source_run": label,
+                "name": request.label,
+                "seed": request.model_seed,
+                "n_clusters": request.n_clusters,
+                "directory": root / candidate["prediction_dir"],
+                "key": request.label,
+                "source_run": str(root),
                 "capabilities": ["cluster", "survival"],
                 "prediction_format": "trails",
+                "risk_method": (
+                    "event_probability"
+                    if evaluator.config.estimator.trainer.cindex_risk_score == "auto"
+                    else evaluator.config.estimator.trainer.cindex_risk_score
+                ),
             }
         )
+    assert reference_root is not None
     for root in config.baseline_dirs:
         root = resolve_input_path(root)
         manifest = json.loads((root / "baselines_manifest.json").read_text())
@@ -84,7 +126,20 @@ def evaluation_methods(
         split_root, signature = _data_reference(manifest, root)
         if split_root != reference_root or signature != reference_signature:
             raise ValueError(f"08未使用同一冻结划分：{root}")
-        for record in manifest["methods"]:
+        records = manifest["methods"]
+        if isinstance(config, MimicFigureConfig):
+            names = list(dict.fromkeys(record["name"] for record in records))
+            missing = set(names) - config.baseline_seeds.keys()
+            if missing:
+                raise ValueError(f"主图必须明确baseline_seeds：{sorted(missing)}")
+            records = [
+                record
+                for record in records
+                if record["seed"] == config.baseline_seeds[record["name"]]
+            ]
+            if len(records) != len(names):
+                raise ValueError("主图指定的基线seed不存在或重复")
+        for record in records:
             method = dict(record)
             if method["status"] != "completed":
                 raise ValueError("08方法尚未完成")
@@ -118,24 +173,28 @@ def load_prediction(
     method: dict[str, Any],
     split: str,
     dataset: ClinicalTimeSeriesDataset,
-    config: MimicEvaluationConfig,
+    config: MimicPostprocessConfig,
 ) -> BaselinePrediction:
     """按产物类型分支读取，再提取评价真正需要的标签和曲线。"""
     directory = Path(method["directory"]) / split
     if method["prediction_format"] == "trails":
         saved = TrailsPrediction.load(directory / "model_prediction.pt")
         survival = "survival" in method["capabilities"]
-        curve_times = np.asarray(config.probability_times)
+        curve_times = np.unique([*config.probability_times, *config.auc_times, config.tau])
         prediction = BaselinePrediction(
             method_name=method["name"],
             patient_ids=dataset_patient_ids(dataset),
             cluster_labels=saved.predict().numpy().astype(np.int64),
             n_clusters=saved.predict_proba().shape[1],
-            risk_score=saved.risk_score(config.tau).numpy().astype(np.float64)
+            risk_score=saved.risk_score(
+                config.tau, method=method.get("risk_method", "event_probability")
+            )
+            .numpy()
+            .astype(np.float64)
             if survival
             else None,
             risk_horizon=config.tau if survival else None,
-            risk_method="event_probability",
+            risk_method=method.get("risk_method", "event_probability"),
             survival_times=curve_times if survival else None,
             survival_probabilities=saved.survival(curve_times.tolist()).numpy().astype(np.float64)
             if survival
@@ -218,6 +277,7 @@ class SurvivalCalibration:
             if (
                 calibration_time > self.prediction_support_max
                 or calibration_time > self.followup.max()
+                or not np.isfinite(self.predicted_survival[:, time_index]).all()
             ):
                 rows.append(
                     {
@@ -406,7 +466,7 @@ class AdjustedCoxAnalysis:
         self._table = table
         self._summary = {
             "reference_cluster": self.reference_cluster,
-            "reference_rule": "lowest mean risk_score in train",
+            "reference_rule": "lowest train KM mortality at tau",
             "adjustment_covariates": ["age_per_10_years", "gender", "race_group", "sofa_score"],
             "race_groups": list(RACE_GROUPS),
             "n_input": len(self.frame),
@@ -724,25 +784,18 @@ class ClusterTrajectoryAnalysis:
         preprocessing: pd.DataFrame,
         n_clusters: int,
         bin_hours: float,
+        min_patients: int = 1,
     ) -> None:
         self.dataset = dataset.with_return_kind("aligned")
         self.clusters = clusters
         self.preprocessing = preprocessing
         self.n_clusters = n_clusters
         self.bin_hours = bin_hours
+        self.min_patients = min_patients
         self._table: pd.DataFrame | None = None
 
-    def calculate(self) -> pd.DataFrame:
-        """按患者分箱后返回簇级 median、IQR 和样本量。"""
-        if self._table is not None:
-            return self._table.copy()
-        if not np.isclose(48.0 / self.bin_hours, round(48.0 / self.bin_hours)):
-            raise ValueError("trajectory_bin_hours 必须整除48小时")
-        if len(self.dataset) != len(self.clusters):
-            raise ValueError("轨迹数据集与预测簇长度不一致")
-        required = {"feature", "center", "scale"}
-        if missing := sorted(required - set(self.preprocessing.columns)):
-            raise ValueError(f"预处理参数缺少字段：{missing}")
+    def observations(self) -> pd.DataFrame:
+        """临床单位下的截尾后数值；患者行仅供进程内聚合。"""
         parameters = self.preprocessing.loc[:, ["feature", "center", "scale"]].copy()
         if set(parameters["feature"]) != set(self.dataset.feature_names):
             raise ValueError("预处理参数与轨迹变量不一致")
@@ -776,6 +829,37 @@ class ClusterTrajectoryAnalysis:
         observations["value"] = (
             observations["standardized_value"] * observations["scale"] + observations["center"]
         )
+        return observations
+
+    def phase_profile(self) -> pd.DataFrame:
+        """固定四阶段，先算每位患者的中位数，再汇总簇的标准化画像。"""
+        observations = self.observations()
+        edges = np.asarray([0.0, 6.0, 12.0, 24.0, 48.0])
+        observations["phase"] = np.minimum(
+            np.searchsorted(edges, observations["time"], side="right") - 1, 3
+        )
+        patients = observations.groupby(
+            ["patient_id", "pred_cluster", "feature", "phase"], observed=True
+        )["standardized_value"].median()
+        summary = patients.groupby(["feature", "phase", "pred_cluster"], observed=True).agg(
+            median="median", n_patients="count"
+        )
+        index = pd.MultiIndex.from_product(
+            [self.dataset.feature_names, range(4), range(self.n_clusters)],
+            names=["feature", "phase", "pred_cluster"],
+        )
+        summary = summary.reindex(index).reset_index()
+        summary["n_patients"] = summary["n_patients"].fillna(0).astype(int)
+        summary["low_support"] = summary["n_patients"].lt(self.min_patients)
+        summary["phase_start"] = edges[summary["phase"].to_numpy()]
+        summary["phase_end"] = edges[summary["phase"].to_numpy() + 1]
+        return summary
+
+    def calculate(self) -> pd.DataFrame:
+        """患者等权中位数及IQR；低支持单元保留统计并单独标记。"""
+        if self._table is not None:
+            return self._table.copy()
+        observations = self.observations()
         observations["time_bin_start"] = np.minimum(
             np.floor(observations["time"] / self.bin_hours) * self.bin_hours,
             48.0 - self.bin_hours,
@@ -812,6 +896,7 @@ class ClusterTrajectoryAnalysis:
         summary[["n_patients", "n_observations"]] = (
             summary[["n_patients", "n_observations"]].fillna(0).astype(int)
         )
+        summary["low_support"] = summary["n_patients"].lt(self.min_patients)
         self._table = summary
         return summary.copy()
 
@@ -840,7 +925,11 @@ class ClusterTrajectoryAnalysis:
                 q25 = cluster_table["q25"].to_numpy(dtype=np.float64)
                 q75 = cluster_table["q75"].to_numpy(dtype=np.float64)
                 color = color_map(cluster % 10)
-                axis.plot(time, median, color=color, label=f"Cluster {cluster}")
+                enough = ~cluster_table["low_support"].to_numpy(dtype=bool)
+                axis.plot(
+                    time, np.where(enough, median, np.nan), color=color, label=f"Cluster {cluster}"
+                )
+                axis.scatter(time[~enough], median[~enough], color=color, marker="x", s=14)
                 axis.fill_between(time, q25, q75, color=color, alpha=0.15)
             axis.set(title=feature, xlabel="Hours after ICU admission", xlim=(0.0, 48.0))
             axis.grid(alpha=0.2)
@@ -848,7 +937,7 @@ class ClusterTrajectoryAnalysis:
             axis.set_visible(False)
         handles, labels = axes[0].get_legend_handles_labels()
         figure.legend(handles, labels, loc="outside upper center", ncols=self.n_clusters)
-        figure.supylabel("Median observed value (IQR)")
+        figure.supylabel("Clipped clinical values: median (IQR)")
         png_path = output_stem.with_suffix(".png")
         pdf_path = output_stem.with_suffix(".pdf")
         figure.savefig(png_path, dpi=220)

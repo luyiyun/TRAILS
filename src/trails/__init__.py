@@ -5,7 +5,7 @@
 """
 
 from .config import (
-    ClusterNumberSelectorConfig,
+    ClusterNumberEvaluatorConfig,
     DataConfig,
     DecoderConfig,
     EncoderConfig,
@@ -25,15 +25,15 @@ from .data import (
 )
 from .estimator import TrailsEstimator
 from .prediction import TrailsPrediction
-from .selection import ClusterNumberSelectionResult, ClusterNumberSelector
+from .selection import ClusterNumberEvaluationResult, ClusterNumberEvaluator
 
 __all__ = [
     "AlignedClinicalSample",
     "CompactClinicalSample",
     "ClinicalTimeSeriesDataset",
-    "ClusterNumberSelectionResult",
-    "ClusterNumberSelector",
-    "ClusterNumberSelectorConfig",
+    "ClusterNumberEvaluationResult",
+    "ClusterNumberEvaluator",
+    "ClusterNumberEvaluatorConfig",
     "DataConfig",
     "DecoderConfig",
     "DatasetSample",

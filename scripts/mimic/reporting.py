@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from collections.abc import Collection
+from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Literal, cast
 
-import hydra
 import numpy as np
 import pandas as pd
 import torch
 from lifelines.exceptions import ConvergenceError
-from omegaconf import DictConfig
+from omegaconf import OmegaConf
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from sksurv.compare import compare_survival
 from sksurv.nonparametric import kaplan_meier_estimator
@@ -23,10 +22,9 @@ from sksurv.util import Surv
 from trails import ClinicalTimeSeriesDataset
 from trails.artifacts import save_json
 from trails.metrics import SurvivalMetrics, concordance_index
-from trails_simulate.config import resolved_payload
 
 from ..baselines.base import BaselinePrediction
-from .config import MimicEvaluationConfig
+from .config import MimicPostprocessConfig
 from .evaluation import (
     AdjustedCoxAnalysis,
     ClusterClinicalCharacteristics,
@@ -129,7 +127,7 @@ def evaluate_split(
     n_clusters: int | None,
     preprocessing: pd.DataFrame,
     interventions: pd.DataFrame,
-    config: MimicEvaluationConfig,
+    config: MimicPostprocessConfig,
     output: Path,
     reference: int | None,
     *,
@@ -174,9 +172,9 @@ def evaluate_split(
     if not selected_metrics and not selected_plots:
         return {}
 
-    # ==================================================================================
+    ##################################################
     # 一、准备聚类评价共用的标签、结局和簇占用信息。
-    # ==================================================================================
+    ##################################################
     output.mkdir(parents=True, exist_ok=True)
     event = target["event"].to_numpy(dtype=bool)
     time = target["survival_time"].to_numpy(dtype=np.float64)
@@ -189,13 +187,27 @@ def evaluate_split(
     counts = np.bincount(labels, minlength=cluster_count)
     occupied = np.flatnonzero(counts)
     fractions = counts / len(target) if cluster_available else np.empty(0)
-    summary: dict[str, Any] = {"n_evaluated": len(target)}
+    summary: dict[str, Any] = {
+        "n_evaluated": len(target),
+        "capabilities": [
+            name
+            for name, available in (
+                ("cluster", cluster_available),
+                ("survival", survival_available),
+            )
+            if available
+        ],
+        "not_applicable_metrics": {
+            name: "Method has no corresponding prediction capability"
+            for name in sorted(ALL_METRICS - applicable_metrics)
+        },
+    }
     if cluster_available:
         summary["n_clusters"] = n_clusters
 
-    # ==================================================================================
+    ##################################################
     # 二、计算评价指标。
-    # ==================================================================================
+    ##################################################
     # 1. 簇分布：检查空簇、最小簇和整体分配均衡程度。
     if "cluster_distribution" in selected_metrics:
         summary.update(
@@ -215,7 +227,11 @@ def evaluate_split(
             "p_value": None,
             "occupied_clusters": len(occupied),
         }
-        if len(occupied) > 1:
+        if not event.any():
+            logrank["unavailable_reason"] = "No observed events"
+        elif len(occupied) < 2:
+            logrank["unavailable_reason"] = "Fewer than two occupied clusters"
+        else:
             try:
                 statistic, p_value = cast(
                     tuple[float, float],
@@ -275,7 +291,12 @@ def evaluate_split(
     # 5. 纵向轨迹：恢复临床单位后保存各时间箱的簇中位数与IQR。
     if "cluster_trajectories" in selected_metrics:
         trajectories = ClusterTrajectoryAnalysis(
-            dataset, labels, preprocessing, cluster_count, config.trajectory_bin_hours
+            dataset,
+            labels,
+            preprocessing,
+            cluster_count,
+            config.trajectory_bin_hours,
+            config.min_cell_patients,
         )
         trajectories.calculate().to_csv(output / "cluster_trajectories.csv", index=False)
         if "cluster_trajectories" in selected_plots:
@@ -314,9 +335,11 @@ def evaluate_split(
             censoring_reference_set="train",
             n_train=len(train),
             risk_definition=(
-                "Cox log-risk; also used for dynamic AUC"
-                if prediction.risk_method == "log_hazard"
-                else "1-S(tau); fixed-horizon score also used for dynamic AUC"
+                {
+                    "log_hazard": "Cox log-risk",
+                    "median_survival": "negative log mixture median",
+                    "event_probability": "1-S(tau)",
+                }[prediction.risk_method]
             ),
         )
         unavailable: dict[str, Any] = {}
@@ -365,12 +388,20 @@ def evaluate_split(
                 unavailable["ipcw_cindex"] = "No comparable events or training IPCW support"
             summary["ipcw_tau"] = config.tau
 
-        # 8. 累积/动态AUC。
+        # 从冻结曲线精确匹配时间点，缺失保留NaN及原因，禁止外推。
+        assert prediction.survival_times is not None
+        assert prediction.survival_probabilities is not None
+        frozen_curves = pd.DataFrame(
+            prediction.survival_probabilities, columns=prediction.survival_times
+        )
+
+        # 8. 累积/动态AUC：每个时间点分别使用1-S(t)。
         auc_times = np.asarray(config.auc_times, dtype=np.float64)
         if "dynamic_auc" in selected_metrics:
             if len(auc_times) == 0 or np.any(np.diff(auc_times) <= 0):
                 raise ValueError("auc_times 必须为非空严格递增序列")
-            auc_supported = (
+            auc_probabilities = frozen_curves.reindex(columns=auc_times).to_numpy()
+            auc_supported = np.isfinite(auc_probabilities).all(axis=0) & (
                 (auc_times > time.min())
                 & (auc_times < time.max())
                 & (np.sum(event[:, None] & (time[:, None] <= auc_times), axis=0) > 0)
@@ -382,7 +413,10 @@ def evaluate_split(
             mean_auc = None
             if auc_supported.any():
                 auc_values, auc_integral = survival_metrics.auc(
-                    risk_tensor, event_tensor, time_tensor, torch.tensor(auc_times[auc_supported])
+                    torch.tensor(1.0 - auc_probabilities[:, auc_supported]),
+                    event_tensor,
+                    time_tensor,
+                    torch.tensor(auc_times[auc_supported]),
                 )
                 dynamic_auc_values[auc_supported] = auc_values.numpy()
                 mean_auc = float(auc_integral)
@@ -392,10 +426,22 @@ def evaluate_split(
                     auc_times, dynamic_auc_values, auc_supported, strict=True
                 )
             }
+            pd.DataFrame(
+                {
+                    "time": auc_times,
+                    "dynamic_auc": dynamic_auc_values,
+                    "unavailable_reason": np.where(
+                        auc_supported,
+                        "",
+                        "Missing frozen curve, cases/controls or training IPCW support",
+                    ),
+                }
+            ).to_csv(output / "dynamic_auc.csv", index=False)
+            summary["dynamic_auc_risk_definition"] = "1-S(t) at each requested t"
             summary["mean_dynamic_auc"] = mean_auc if auc_supported.all() else None
             if not auc_supported.all():
                 unavailable["dynamic_auc"] = {
-                    str(t): "No cases/controls or training IPCW support"
+                    str(t): "Missing frozen curve, cases/controls or training IPCW support"
                     for t in auc_times[~auc_supported]
                 }
                 unavailable["mean_dynamic_auc"] = "Full configured integration grid unsupported"
@@ -412,13 +458,8 @@ def evaluate_split(
                 raise ValueError("probability_times 必须包含至少两个严格递增时间点")
             assert prediction.survival_times is not None
             assert prediction.survival_probabilities is not None
-            indices = np.searchsorted(prediction.survival_times, probability_times)
-            if np.any(indices >= len(prediction.survival_times)) or not np.allclose(
-                prediction.survival_times[indices], probability_times, rtol=0.0, atol=1e-8
-            ):
-                raise ValueError("冻结曲线缺少09需要的时间点，不能外插或重拟合")
-            probabilities = prediction.survival_probabilities[:, indices]
-            brier_supported = (
+            probabilities = frozen_curves.reindex(columns=probability_times).to_numpy()
+            brier_supported = np.isfinite(probabilities).all(axis=0) & (
                 (probability_times > time.min())
                 & (probability_times < time.max())
                 & (time.max() <= train_max)
@@ -444,7 +485,7 @@ def evaluate_split(
                 integrated_brier = float(brier_integral)
             if not brier_supported.all():
                 unavailable["brier_score"] = {
-                    str(t): "Evaluation follow-up or training IPCW support unavailable"
+                    str(t): "Frozen curve, follow-up or train IPCW support unavailable"
                     for t in probability_times[~brier_supported]
                 }
                 unavailable["integrated_brier_score"] = (
@@ -466,7 +507,7 @@ def evaluate_split(
                         "unavailable_reason": np.where(
                             brier_supported,
                             "",
-                            "Evaluation follow-up or training IPCW support unavailable",
+                            "Frozen curve, follow-up or train IPCW support unavailable",
                         ),
                     }
                 ).to_csv(output / "brier_scores.csv", index=False)
@@ -505,28 +546,22 @@ def evaluate_split(
         if "survival_at_tau" in selected_metrics:
             km_time, km_survival = kaplan_meier_estimator(event, time)[:2]
             index = int(np.searchsorted(km_time, config.tau, side="right") - 1)
-            if prediction.risk_method == "log_hazard":
-                assert (
-                    prediction.survival_times is not None
-                    and prediction.survival_probabilities is not None
+            if config.tau in frozen_curves and (
+                prediction.risk_method != "log_hazard" or config.tau <= train_max
+            ):
+                summary["mean_predicted_survival_tau"] = float(
+                    frozen_curves[config.tau].to_numpy(dtype=float).mean()
                 )
-                tau_index = int(np.searchsorted(prediction.survival_times, config.tau))
-                if (
-                    tau_index >= len(prediction.survival_times)
-                    or prediction.survival_times[tau_index] != config.tau
-                ):
-                    raise ValueError("Cox预测曲线缺少tau，不能将log-risk当作事件概率")
-                summary["mean_predicted_survival_tau"] = (
-                    float(prediction.survival_probabilities[:, tau_index].mean())
-                    if config.tau <= train_max
-                    else None
-                )
-                if config.tau > train_max:
-                    summary["survival_at_tau_unavailable_reason"] = (
-                        "Cox tau exceeds training support"
-                    )
-            else:
+            elif (
+                prediction.risk_method == "event_probability"
+                and prediction.risk_horizon == config.tau
+            ):
                 summary["mean_predicted_survival_tau"] = float((1.0 - risk).mean())
+            else:
+                summary["mean_predicted_survival_tau"] = None
+                unavailable["mean_predicted_survival_tau"] = (
+                    "Missing frozen tau curve or training support"
+                )
             summary["observed_km_survival_tau"] = (
                 (1.0 if index < 0 else float(km_survival[index]))
                 if config.tau <= time.max()
@@ -535,9 +570,9 @@ def evaluate_split(
             if config.tau > time.max():
                 unavailable["observed_km_survival_tau"] = "Beyond observed follow-up support"
 
-    # ==================================================================================
+    ##################################################
     # 三、绘图；绘图只消费已选择并完成计算的指标。
-    # ==================================================================================
+    ##################################################
     # 1. 簇生存：仅为选中内容创建子图，避免空白面板。
     if "cluster_survival" in selected_plots:
         figure, axis = plt.subplots(figsize=(6.4, 4.8), layout="constrained")
@@ -637,38 +672,57 @@ def evaluate_split(
     return summary
 
 
-def run(config: MimicEvaluationConfig) -> dict[str, Any]:
-    """按方法实际能力统一评价聚类与患者级生存预测。"""
-    primary_root = resolve_input_path(config.trails_dirs[0])
+@dataclass
+class EvaluationReport:
+    """共享统计结果及本进程中的患者数据；导出仅包含聚合表。"""
+
+    datasets: dict[str, ClinicalTimeSeriesDataset]
+    methods: list[dict[str, Any]]
+    primary_frames: dict[str, pd.DataFrame]
+    preprocessing: pd.DataFrame
+    comparison: pd.DataFrame
+    agreement: pd.DataFrame
+    summary: dict[str, Any]
+    output: Path
+
+
+def evaluate_runs(config: MimicPostprocessConfig, *, supplementary: bool) -> EvaluationReport:
+    """独立读取相同冻结划分并按方法能力评价，不依赖另一个后处理入口。"""
+    ##################################################
+    # 一、核对冻结划分及显式候选，准备只读输入。
+    ##################################################
     split_root, methods = evaluation_methods(config)
     datasets = load_frozen_datasets(split_root)
     preprocessing = pd.read_csv(split_root / "preprocessing_parameters.csv")
     interventions_path = resolve_input_path(config.interventions_csv)
-    if not interventions_path.is_file():
-        raise FileNotFoundError(f"缺少治疗评价输入：{interventions_path}")
     interventions = pd.read_csv(interventions_path, dtype={"patient_id": str})
     output = config.paths.dir.resolve()
-    if (output / "evaluation_summary.json").exists():
+    if (
+        output == split_root
+        or output.is_relative_to(split_root)
+        or split_root.is_relative_to(output)
+    ):
+        raise ValueError("后处理输出不得覆盖冻结划分")
+    if (output / "evaluation_summary.json").exists() or (output / "comparison.csv").exists():
         raise FileExistsError(f"拒绝覆盖既有评价：{output}")
+    output.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(config.model_dump(mode="json"), output / "resolved_config.yaml")
     summaries: dict[str, Any] = {}
     rows: list[dict[str, Any]] = []
-    assignments: dict[str, dict[str, np.ndarray]] = {"validation": {}, "test": {}}
+    assignments: dict[str, dict[str, np.ndarray]] = {name: {} for name in datasets}
+    primary_frames: dict[str, pd.DataFrame] = {}
+
+    ##################################################
+    # 二、逐方法输出各集统计；Cox参考簇仅由train的KM决定。
+    ##################################################
     for method in methods:
         capabilities = frozenset(method["capabilities"])
-        for capability in sorted({"cluster", "survival"} - capabilities):
-            LOGGER.info(
-                "Skipping %s evaluation for %s: method has no %s capability",
-                capability,
-                method["key"],
-                capability,
-            )
         LOGGER.info("Evaluating %s with capabilities=%s", method["key"], sorted(capabilities))
         train_prediction = load_prediction(method, "train", datasets["train"], config)
         train = prediction_frame(datasets["train"], train_prediction)
         reference: int | None = None
         if "cluster" in capabilities:
             train_risks: dict[int, float] = {}
-            # 只选择描述性Cox参考簇，不从簇KM构造患者级生存预测。
             for label, group in train.groupby("pred_cluster", observed=True):
                 km_t, km_s = kaplan_meier_estimator(
                     group["event"].to_numpy(dtype=bool),
@@ -680,14 +734,26 @@ def run(config: MimicEvaluationConfig) -> dict[str, Any]:
                 )
             reference = min(train_risks, key=lambda label: (train_risks[label], label))
         per_split = {}
-        for split in ("validation", "test"):
-            prediction = load_prediction(method, split, datasets[split], config)
+        for split, dataset in datasets.items():
+            prediction = (
+                train_prediction
+                if split == "train"
+                else load_prediction(method, split, dataset, config)
+            )
             if "cluster" in capabilities and prediction.n_clusters != train_prediction.n_clusters:
                 raise ValueError("各划分预测簇数不一致")
-            frame = prediction_frame(datasets[split], prediction)
+            frame = train if split == "train" else prediction_frame(dataset, prediction)
+            if method["key"] == "trails":
+                primary_frames[split] = frame
+            # 主图仅对主TRAILS计算完整临床描述，比较方法保留性能与占簇诊断。
+            selected: Any = (
+                "ALL"
+                if supplementary or method["key"] == "trails"
+                else SURVIVAL_METRICS | {"cluster_distribution", "cluster_survival"}
+            )
             summary = evaluate_split(
                 frame,
-                datasets[split],
+                dataset,
                 prediction.n_clusters,
                 preprocessing,
                 interventions,
@@ -697,15 +763,19 @@ def run(config: MimicEvaluationConfig) -> dict[str, Any]:
                 train=train if "survival" in capabilities else None,
                 prediction=prediction if "survival" in capabilities else None,
                 evaluation_set=split if "survival" in capabilities else None,
+                metrics=selected,
+                plots="ALL" if supplementary else None,
             )
             per_split[split] = summary
             if prediction.cluster_labels is not None:
                 assignments[split][method["key"]] = prediction.cluster_labels
             row = {
                 "method": method["name"],
+                "key": method["key"],
                 "source_run": method["source_run"],
                 "seed": method["seed"],
                 "split": split,
+                "n_clusters": prediction.n_clusters,
             }
             for key in (
                 "occupied_clusters",
@@ -722,11 +792,17 @@ def run(config: MimicEvaluationConfig) -> dict[str, Any]:
                 row[key] = summary.get(key)
             row["logrank_p"] = summary.get("global_logrank", {}).get("p_value")
             row["adjusted_cox_status"] = summary.get("adjusted_cox", {}).get("status")
-            calibration_errors = summary.get("calibration_weighted_absolute_error", {})
             for day in config.auc_times:
-                row[f"calibration_error_{day}"] = calibration_errors.get(str(float(day)))
+                row[f"auc_{day:g}"] = summary.get("dynamic_auc", {}).get(str(float(day)))
+                row[f"calibration_error_{day:g}"] = summary.get(
+                    "calibration_weighted_absolute_error", {}
+                ).get(str(float(day)))
             rows.append(row)
         summaries[method["key"]] = per_split
+
+    ##################################################
+    # 三、保存标签一致性与统计摘要；不输出患者级记录。
+    ##################################################
     pairs = [
         {
             "split": split,
@@ -738,29 +814,28 @@ def run(config: MimicEvaluationConfig) -> dict[str, Any]:
         for split, labels in assignments.items()
         for left, right in combinations(labels, 2)
     ]
-    pd.DataFrame(rows).to_csv(output / "comparison.csv", index=False)
-    pd.DataFrame(pairs, columns=["split", "left", "right", "ari", "nmi"]).to_csv(
-        output / "label_agreement.csv", index=False
-    )
+    comparison = pd.DataFrame(rows)
+    comparison.to_csv(output / "comparison.csv", index=False)
+    agreement = pd.DataFrame(pairs, columns=["split", "left", "right", "ari", "nmi"])
+    agreement.to_csv(output / "label_agreement.csv", index=False)
     summary = {
-        "primary_trails_dir": str(primary_root),
+        "primary_trails_dir": str(config.inputs.run_dir.resolve()),
+        "primary_k": config.n_clusters,
+        "primary_seed": config.model_seed,
         "split_dir": str(split_root),
         "interventions_csv": str(interventions_path),
-        "interventions_sha256": hashlib.sha256(interventions_path.read_bytes()).hexdigest(),
-        "trails_dirs": [str(resolve_input_path(path)) for path in config.trails_dirs],
-        "baseline_dirs": [str(path) for path in config.baseline_dirs],
         "censoring_reference_set": "train",
         "methods": summaries,
+        "selection_basis": config.selection_basis,
+        "interpretation": "Exploratory analysis: candidate choice used test metrics"
+        if config.selection_basis == "test_exploratory"
+        else "Frozen candidate comparison; no automated selection",
         "label_agreement_is_not_ground_truth_accuracy": True,
+        "trajectory_units": "Winsorized values in clinical units (train-only 1%/99% bounds)",
+        "dynamic_auc_risk": "1-S(t) at each t",
+        "method_order": [item["key"] for item in methods],
     }
     save_json(output / "evaluation_summary.json", summary)
-    return summary
-
-
-@hydra.main(config_path="../../configs", config_name="mimic/evaluate", version_base="1.3")
-def main(raw_config: DictConfig) -> None:
-    run(MimicEvaluationConfig.model_validate(resolved_payload(raw_config)))
-
-
-if __name__ == "__main__":
-    main()
+    return EvaluationReport(
+        datasets, methods, primary_frames, preprocessing, comparison, agreement, summary, output
+    )

@@ -208,7 +208,9 @@ class ModelConfig(BaseModel):
         latent_dim: 患者变分表示的宽度。
         n_clusters: 高斯混合分量及患者亚型的数量。
         dropout: 支持该操作的网络层所使用的 dropout 概率。
-        survival_head_hidden_layers: 多输出生存头的潜空间等宽隐藏层数量。
+        survival_head_architecture: 多输出 scale 加共享 shape，或 one-hot 条件双参数头。
+        survival_head_hidden_layers: 生存头的潜空间等宽隐藏层数量。
+        survival_latent_source: 生存头使用采样潜变量或潜均值；评价始终使用均值。
         survival_loss: 簇特异 Weibull；Cox 枚举保留但尚未实现。
         loss: 多任务损失加权配置。
         encoder: 异步输入和时序映射配置。
@@ -222,7 +224,9 @@ class ModelConfig(BaseModel):
     latent_dim: int = Field(default=8, gt=0)
     n_clusters: int = Field(default=3, gt=1)
     dropout: float = Field(default=0.0, ge=0.0, lt=1.0)
+    survival_head_architecture: Literal["multi_output", "one_hot"] = "multi_output"
     survival_head_hidden_layers: int = Field(default=0, ge=0)
+    survival_latent_source: Literal["sample", "mean"] = "sample"
     survival_loss: SurvivalKind = "weibull"
     loss: LossConfig = Field(default_factory=LossConfig)
     encoder: EncoderConfig = Field(default_factory=EncoderConfig)
@@ -314,45 +318,27 @@ class TrailsConfig(BaseModel):
         return self
 
 
-class ClusterNumberSelectorConfig(BaseModel):
-    """配置候选簇数的单 seed 或多 seed 选择过程。
-
-    属性：
-        candidates: 要比较的候选簇数，必须非空、唯一且均大于 1。
-        seeds: 每个候选簇数重复训练所用的模型随机种子；单个整数会被规范为
-            只包含一个元素的元组。
-        split_seed: 未显式提供验证集时，固定训练/验证划分使用的随机种子。
-        valid_fraction: 从训练数据内部留作验证集的比例。
-        selection_rule: 按最高平均分或 one-standard-error 规则选择 K。
-        require_non_empty: 是否排除任一重复运行产生空簇的候选 K。
-        min_cluster_fraction: 可选的最小簇占比门槛。
-        min_mean_pairwise_ari: 可选的 seed 间平均成对 ARI 门槛。
-        compute_stability: 是否计算跨 seed 验证集标签的成对 ARI。
-        estimator: 所有 K 和 seed 共享并按运行覆盖簇数与种子的估计器基础配置。
-    """
+class ClusterNumberEvaluatorConfig(BaseModel):
+    """候选K的训练和描述性评价配置；不划分数据，也不自动选择模型。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     candidates: tuple[int, ...]
     seeds: tuple[int, ...] = (2026,)
-    split_seed: int = 2026
-    valid_fraction: float = Field(default=0.2, gt=0.0, lt=1.0)
-    selection_rule: Literal["best_mean", "one_standard_error"] = "best_mean"
-    require_non_empty: bool = False
+    require_non_empty: bool = True
     min_cluster_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
-    min_mean_pairwise_ari: float | None = Field(default=None, ge=-1.0, le=1.0)
     compute_stability: bool = True
     estimator: TrailsConfig = Field(default_factory=TrailsConfig)
 
     @field_validator("seeds", mode="before")
     @classmethod
     def normalize_seeds(cls, value: object) -> object:
-        """允许用单个整数表示不重复运行的选择过程。"""
+        """允许用一个整数指定单seed。"""
         return (value,) if isinstance(value, int) and not isinstance(value, bool) else value
 
     @model_validator(mode="after")
-    def validate_selection_settings(self) -> ClusterNumberSelectorConfig:
-        """校验候选 K、随机种子以及多 seed 稳定性门槛之间的约束。"""
+    def validate_candidates(self) -> ClusterNumberEvaluatorConfig:
+        """候选和seed必须明确且唯一；保持用户给定的运行顺序。"""
         if not self.candidates:
             raise ValueError("candidates must contain at least one K value.")
         if any(value <= 1 for value in self.candidates):
@@ -363,8 +349,4 @@ class ClusterNumberSelectorConfig(BaseModel):
             raise ValueError("seeds must contain at least one value.")
         if len(set(self.seeds)) != len(self.seeds):
             raise ValueError("seeds values must be unique.")
-        if len(self.seeds) == 1 and self.min_mean_pairwise_ari is not None:
-            raise ValueError("min_mean_pairwise_ari requires at least two seeds.")
-        if not self.compute_stability and self.min_mean_pairwise_ari is not None:
-            raise ValueError("min_mean_pairwise_ari requires compute_stability=True.")
         return self

@@ -11,7 +11,7 @@ import torch
 
 from .config import TrailsConfig
 from .data import ClinicalTimeSeriesDataset, infer_data_config
-from .model import SURVIVAL_HEAD_ARCHITECTURE, TrailsModel
+from .model import TrailsModel
 from .prediction import TrailsPrediction
 from .survival import SURVIVAL_FORMAT_VERSION, component_log_likelihood, survival_log_posterior
 from .trainer import HistoryEntry, TrailsTrainer
@@ -158,7 +158,7 @@ class TrailsEstimator:
         """
         checkpoint = {
             "survival_format_version": SURVIVAL_FORMAT_VERSION,
-            "survival_head_architecture": SURVIVAL_HEAD_ARCHITECTURE,
+            "survival_head_architecture": self.config.model.survival_head_architecture,
             "config": self.config.model_dump(mode="json"),
             "history": self.history,
             "model_state": self.model.state_dict(),
@@ -186,16 +186,15 @@ class TrailsEstimator:
             raise ValueError(
                 "Unsupported survival format; load legacy checkpoints with the original code."
             )
-        # 原始版本3多输出头未保存结构标识，仍可按其原有结构加载。
-        if (
-            checkpoint.get("survival_head_architecture", SURVIVAL_HEAD_ARCHITECTURE)
-            != SURVIVAL_HEAD_ARCHITECTURE
+        config = TrailsConfig.model_validate(checkpoint["config"])
+        # 原始版本3缺少结构标识时只按 multi_output 加载，不猜测其他结构。
+        if checkpoint.get("survival_head_architecture", "multi_output") != (
+            config.model.survival_head_architecture
         ):
             raise ValueError(
-                "Unsupported survival head architecture; expected multi_output. "
-                "Load legacy checkpoints with the original code."
+                "Unsupported survival head architecture or config mismatch. "
+                "Load legacy conditioned_one_hot checkpoints with the original code."
             )
-        config = TrailsConfig.model_validate(checkpoint["config"])
         if device is not None:
             config = config.model_copy(
                 update={"trainer": config.trainer.model_copy(update={"device": device})}

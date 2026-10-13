@@ -9,7 +9,7 @@ from sksurv.metrics import concordance_index_censored
 
 from trails import (
     ClinicalTimeSeriesDataset,
-    ClusterNumberSelector,
+    ClusterNumberEvaluator,
     DataConfig,
     DecoderConfig,
     EncoderConfig,
@@ -123,7 +123,14 @@ def simulate_dataset(seed: int) -> ClinicalTimeSeriesDataset:
 
 @pytest.mark.parametrize("hidden_layers", [0, 1, 2])
 @pytest.mark.parametrize("n_clusters", [2, 3])
-def test_estimator_fit_predict_test(hidden_layers: int, n_clusters: int) -> None:
+@pytest.mark.parametrize("survival_latent_source", ["sample", "mean"])
+@pytest.mark.parametrize("survival_head_architecture", ["multi_output", "one_hot"])
+def test_estimator_fit_predict_test(
+    hidden_layers: int,
+    n_clusters: int,
+    survival_latent_source: Literal["sample", "mean"],
+    survival_head_architecture: Literal["multi_output", "one_hot"],
+) -> None:
     data = simulate_dataset(seed=13)
     config = tiny_config(data.n_features)
     config = config.model_copy(
@@ -132,8 +139,13 @@ def test_estimator_fit_predict_test(hidden_layers: int, n_clusters: int) -> None
                 update={
                     "survival_head_hidden_layers": hidden_layers,
                     "n_clusters": n_clusters,
+                    "survival_latent_source": survival_latent_source,
+                    "survival_head_architecture": survival_head_architecture,
                 }
-            )
+            ),
+            "trainer": config.trainer.model_copy(
+                update={"max_epochs": 2, "reset_survival_after_warmup": hidden_layers == 2}
+            ),
         }
     )
     estimator = TrailsEstimator(config).fit(data)
@@ -148,12 +160,29 @@ def test_estimator_fit_predict_test(hidden_layers: int, n_clusters: int) -> None
     assert prediction.survival_log_params.shape == (8, n_clusters, 2)
     assert prediction.weibull_shape.shape == (8, n_clusters)
     assert prediction.weibull_scale.shape == (8, n_clusters)
-    assert torch.all(prediction.weibull_shape == prediction.weibull_shape[0, 0])
+    if survival_head_architecture == "multi_output":
+        assert torch.all(prediction.weibull_shape == prediction.weibull_shape[0, 0])
+    else:
+        # 双参数头保留患者差异与簇条件差异，而不是退回全局 shape。
+        for parameter in (prediction.weibull_shape, prediction.weibull_scale):
+            assert torch.isfinite(parameter).all()
+            assert (parameter > 0).all()
+            assert not torch.allclose(parameter, parameter[:1].expand_as(parameter))
+            assert not torch.allclose(parameter, parameter[:, :1].expand_as(parameter))
     risk_score = prediction.risk_score(28.0)
     assert risk_score.shape == (8,)
     assert torch.allclose(risk_score, 1.0 - prediction.survival([28.0]).squeeze(1))
     assert torch.allclose(probabilities.sum(dim=-1), torch.ones(8), atol=1e-5)
     assert survival.shape == (8, 3)
+    component_survival = torch.exp(
+        -(
+            (torch.tensor([0.0, 7.0, 14.0]) / prediction.weibull_scale.unsqueeze(-1))
+            ** prediction.weibull_shape.unsqueeze(-1)
+        )
+    )
+    assert torch.allclose(
+        survival, (probabilities.unsqueeze(-1) * component_survival).sum(dim=1), atol=1e-6
+    )
     assert torch.allclose(survival[:, 0], torch.ones(8), atol=1e-6)
     assert bool(((survival[:, :-1] - survival[:, 1:]) >= 0).all())
     assert set(predictions.tolist()) <= set(range(n_clusters))
@@ -169,6 +198,25 @@ def test_estimator_fit_predict_test(hidden_layers: int, n_clusters: int) -> None
     assert "cluster_max_fraction" in metrics
     assert "cluster_entropy" in metrics
     assert 0.0 <= metrics["cluster_entropy"] <= 1.0
+
+    # 固定种子与其余配置，确认切换生存输入确实改变训练目标。
+    alternative_config = config.model_copy(
+        update={
+            "model": config.model.model_copy(
+                update={
+                    "survival_latent_source": (
+                        "mean" if survival_latent_source == "sample" else "sample"
+                    )
+                }
+            )
+        }
+    )
+    alternative = TrailsEstimator(alternative_config).fit(data)
+    assert not math.isclose(
+        estimator.history[0]["train"]["survival_loss"],
+        alternative.history[0]["train"]["survival_loss"],
+    )
+    assert torch.equal(prediction.survival_log_params, estimator.predict(data).survival_log_params)
 
 
 def test_estimator_uncertainty_weighting_can_disable_survival_loss() -> None:
@@ -272,11 +320,15 @@ def test_unlabeled_data_skips_cluster_metrics() -> None:
 
 @pytest.mark.parametrize("method", ["event_probability", "median_survival"])
 @pytest.mark.parametrize("hidden_layers,n_clusters", [(0, 2), (1, 3), (2, 2)])
+@pytest.mark.parametrize("survival_latent_source", ["sample", "mean"])
+@pytest.mark.parametrize("survival_head_architecture", ["multi_output", "one_hot"])
 def test_estimator_save_load(
     tmp_path: Path,
     method: Literal["event_probability", "median_survival"],
     hidden_layers: int,
     n_clusters: int,
+    survival_latent_source: Literal["sample", "mean"],
+    survival_head_architecture: Literal["multi_output", "one_hot"],
 ) -> None:
     data = simulate_dataset(seed=17)
     config = tiny_config(data.n_features)
@@ -287,6 +339,8 @@ def test_estimator_save_load(
                 update={
                     "survival_head_hidden_layers": hidden_layers,
                     "n_clusters": n_clusters,
+                    "survival_latent_source": survival_latent_source,
+                    "survival_head_architecture": survival_head_architecture,
                 }
             ),
         }
@@ -300,6 +354,8 @@ def test_estimator_save_load(
     loaded_prediction = TrailsPrediction.load(prediction_path)
 
     assert loaded.config.trainer.cindex_risk_score == method
+    assert loaded.config.model.survival_latent_source == survival_latent_source
+    assert loaded.config.model.survival_head_architecture == survival_head_architecture
     assert torch.equal(estimator.predict(data).predict(), loaded.predict(data).predict())
     assert torch.equal(
         estimator.predict(data).risk_score(28.0, method=method),
@@ -309,15 +365,31 @@ def test_estimator_save_load(
         estimator.predict(data).survival_log_params, loaded.predict(data).survival_log_params
     )
     checkpoint = torch.load(path, weights_only=False)
-    assert checkpoint["survival_head_architecture"] == "multi_output"
+    assert checkpoint["survival_head_architecture"] == survival_head_architecture
     legacy = checkpoint.copy()
     legacy.pop("survival_head_architecture")
+    legacy["config"]["model"].pop("survival_latent_source")
     legacy_path = tmp_path / "legacy.pt"
-    torch.save(legacy, legacy_path)
-    assert torch.equal(
-        estimator.predict(data).survival_log_params,
-        TrailsEstimator.load(legacy_path).predict(data).survival_log_params,
+    if survival_head_architecture == "multi_output":
+        legacy["config"]["model"].pop("survival_head_architecture")
+        torch.save(legacy, legacy_path)
+        legacy_estimator = TrailsEstimator.load(legacy_path)
+        assert legacy_estimator.config.model.survival_latent_source == "sample"
+        assert legacy_estimator.config.model.survival_head_architecture == "multi_output"
+        assert torch.equal(
+            estimator.predict(data).survival_log_params,
+            legacy_estimator.predict(data).survival_log_params,
+        )
+    else:
+        torch.save(legacy, legacy_path)
+        with pytest.raises(ValueError, match="Unsupported survival head architecture"):
+            TrailsEstimator.load(legacy_path)
+    legacy["survival_head_architecture"] = (
+        "one_hot" if survival_head_architecture == "multi_output" else "multi_output"
     )
+    torch.save(legacy, legacy_path)
+    with pytest.raises(ValueError, match="Unsupported survival head architecture"):
+        TrailsEstimator.load(legacy_path)
     legacy["survival_head_architecture"] = "conditioned_one_hot"
     torch.save(legacy, legacy_path)
     with pytest.raises(ValueError, match="Unsupported survival head architecture"):
@@ -345,7 +417,7 @@ def test_prediction_median_risk_preserves_time_ranking() -> None:
         prediction.risk_score()
 
 
-def test_median_cindex_agrees_in_selection_training_and_prediction() -> None:
+def test_median_cindex_agrees_in_selection_training_and_prediction(tmp_path: Path) -> None:
     data = simulate_dataset(seed=17)
     config = tiny_config(data.n_features)
     config = config.model_copy(
@@ -355,10 +427,11 @@ def test_median_cindex_agrees_in_selection_training_and_prediction() -> None:
             )
         }
     )
-    result = ClusterNumberSelector(
+    evaluator = ClusterNumberEvaluator(
         (2,), seeds=13, compute_stability=False, estimator_config=config
-    ).select(data, validation_data=data)
-    estimator = result.selected_estimators[13]
+    )
+    result = evaluator.fit(data, validation_data=data, result_dir=tmp_path / "evaluation")
+    estimator = evaluator.load_estimator(seed=13, n_clusters=2)
     prediction = estimator.predict(data)
     expected = concordance_index_censored(
         torch.stack([sample.event for sample in data.samples]).bool().numpy(),

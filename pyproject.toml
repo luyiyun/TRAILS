@@ -71,5 +71,6 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pyright]
 include = ["src", "tests", "scripts"]
+exclude = ["scripts/deprecated"]
 typeCheckingMode = "standard"
 reportPrivateImportUsage = false

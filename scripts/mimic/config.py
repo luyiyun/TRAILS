@@ -1,15 +1,85 @@
 """MIMIC 工作流专用的 Hydra 配置模型。"""
 
+import math
 from itertools import pairwise
 from pathlib import Path
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from scripts.configs import FrozenSplitConfig, TrailsApplicationConfig
+from scripts.configs import CandidateRunConfig, FrozenSplitConfig
 from trails import ModelConfig, TrainerConfig
 
 BASELINE_COVARIATE_COLUMNS = ("age", "gender", "race", "sofa_score")
+
+
+class MimicPreparationPathsConfig(BaseModel):
+    """06的固定输入与输出路径。"""
+
+    model_config = ConfigDict(extra="forbid")
+    patients_csv: Path
+    observations_csv: Path
+    dir: Path
+
+
+class MimicRandomSplitConfig(BaseModel):
+    """随机划分比例。"""
+
+    model_config = ConfigDict(extra="forbid")
+    train_fraction: float = Field(gt=0, lt=1)
+    validation_fraction: float = Field(gt=0, lt=1)
+    test_fraction: float = Field(gt=0, lt=1)
+
+    @model_validator(mode="after")
+    def validate_fractions(self) -> Self:
+        if not math.isclose(
+            self.train_fraction + self.validation_fraction + self.test_fraction, 1.0
+        ):
+            raise ValueError("train、validation和test比例之和必须为1")
+        return self
+
+
+class MimicTemporalSplitConfig(BaseModel):
+    """年代划分规则。"""
+
+    model_config = ConfigDict(extra="forbid")
+    test_start_year: int
+    validation_fraction: float = Field(gt=0, lt=1)
+
+
+class MimicPatientSplitConfig(BaseModel):
+    """冻结ID划分设置。"""
+
+    model_config = ConfigDict(extra="forbid")
+    strategy: Literal["random", "temporal"]
+    seeds: tuple[int, ...] = Field(min_length=1)
+    random: MimicRandomSplitConfig
+    temporal: MimicTemporalSplitConfig
+
+    @field_validator("seeds")
+    @classmethod
+    def unique_seeds(cls, values: tuple[int, ...]) -> tuple[int, ...]:
+        if len(set(values)) != len(values):
+            raise ValueError("split.seeds不能重复")
+        return values
+
+
+class MimicPreparationConfig(BaseModel):
+    """06在Hydra解析后统一校验；YAML提供默认值。"""
+
+    model_config = ConfigDict(extra="forbid")
+    paths: MimicPreparationPathsConfig
+    split: MimicPatientSplitConfig
+    description: str
+    feature_order: tuple[str, ...]
+
+    @field_validator("feature_order")
+    @classmethod
+    def unique_features(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values):
+            raise ValueError("feature_order不能重复")
+        return values
+
 
 ClusterCount = Annotated[int, Field(ge=2)]
 ClusterCounts = ClusterCount | tuple[ClusterCount, ...]
@@ -26,7 +96,7 @@ class MimicSplitConfig(FrozenSplitConfig):
     dir: Path = Path("data/real/mimic-iv-3.1/derived/trails_splits/seed-20260517")
 
 
-class MimicApplicationConfig(TrailsApplicationConfig):
+class MimicApplicationConfig(CandidateRunConfig):
     """引用共享建模配置，保留 MIMIC 配置入口。"""
 
     split: MimicSplitConfig = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
@@ -275,24 +345,89 @@ class MimicBaselinesConfig(BaseModel):
 
 
 class MimicEvaluationPathsConfig(BaseModel):
-    """正式评价输出目录。"""
+    """独立后处理输出目录。"""
 
     model_config = ConfigDict(extra="forbid")
-
     dir: Path
 
 
-class MimicEvaluationConfig(BaseModel):
-    """冻结预测的内部留出测试评价配置。"""
+class MimicModelRequest(BaseModel):
+    """人工指定的TRAILS候选；label同时用于输出目录。"""
 
     model_config = ConfigDict(extra="forbid")
+    run_dir: Path
+    n_clusters: int = Field(ge=2)
+    model_seed: int
+    label: str = Field(pattern=r"^[A-Za-z0-9_-]+$")
 
-    trails_dirs: tuple[Path, ...] = Field(min_length=1)
+
+class MimicPostprocessInputs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_dir: Path
+
+
+class MimicPostprocessConfig(BaseModel):
+    """09和10分别读取冻结产物；选择候选的依据显式记录。"""
+
+    model_config = ConfigDict(extra="forbid")
+    inputs: MimicPostprocessInputs
+    n_clusters: int = Field(ge=2)
+    model_seed: int
+    comparison_runs: tuple[MimicModelRequest, ...] = ()
     baseline_dirs: tuple[Path, ...] = ()
     interventions_csv: Path
+    selection_basis: Literal["prespecified", "validation", "test_exploratory"]
     auc_times: tuple[float, ...] = (7.0, 14.0, 21.0)
     probability_times: tuple[float, ...] = tuple(float(day) for day in range(1, 28))
     calibration_bins: int = Field(default=10, ge=2)
     trajectory_bin_hours: float = Field(default=4.0, gt=0.0, le=48.0)
-    tau: float = 28.0
+    min_cell_patients: int = Field(default=10, ge=1)
+    tau: float = Field(default=28.0, gt=0.0)
     paths: MimicEvaluationPathsConfig
+
+    @model_validator(mode="after")
+    def validate_report(self) -> Self:
+        labels = ["trails", *(item.label for item in self.comparison_runs)]
+        if len(set(labels)) != len(labels):
+            raise ValueError("TRAILS展示名称不可重复或占用trails")
+        for times in (self.auc_times, self.probability_times):
+            if (
+                len(times) < 2
+                or times[0] <= 0
+                or times[-1] >= self.tau
+                or any(b <= a for a, b in pairwise(times))
+            ):
+                raise ValueError("报告时间网格须严格递增并位于(0,tau)")
+        if not math.isclose(48 / self.trajectory_bin_hours, round(48 / self.trajectory_bin_hours)):
+            raise ValueError("trajectory_bin_hours必须整除48")
+        if len(set(self.baseline_dirs)) != len(self.baseline_dirs):
+            raise ValueError("baseline_dirs不可重复")
+        roots = [
+            self.inputs.run_dir,
+            *(item.run_dir for item in self.comparison_runs),
+            *self.baseline_dirs,
+        ]
+        if any(
+            self.paths.dir.resolve() == root.resolve()
+            or root.resolve().is_relative_to(self.paths.dir.resolve())
+            for root in roots
+        ):
+            raise ValueError("后处理输出不得覆盖输入运行目录")
+        return self
+
+
+class MimicFigureConfig(MimicPostprocessConfig):
+    """综合主图只显示显式选择的一次重复，不按test性能排序。"""
+
+    baseline_seeds: dict[str, int] = Field(default_factory=dict)
+    comparison_dataset: Literal["validation", "test"] = "test"
+    profile_dataset: Literal["train", "validation", "test"] = "train"
+    width_mm: float = Field(default=240, gt=0)
+    height_mm: float = Field(default=330, gt=0)
+    dpi: int = Field(default=600, ge=72)
+
+
+class MimicSupplementaryConfig(MimicPostprocessConfig):
+    """补充材料保留全部基线重复和公共候选诊断。"""
+
+    umap_seed: int = 20260517

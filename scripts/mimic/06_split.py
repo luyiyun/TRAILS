@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from datetime import UTC, datetime
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import cast
 
 import hydra
 import numpy as np
 import pandas as pd
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -19,7 +17,7 @@ from sklearn.preprocessing import StandardScaler
 from scripts.utils.preprocessing import Winsorizer
 from trails import ClinicalTimeSeriesDataset
 
-from .config import BASELINE_COVARIATE_COLUMNS
+from .config import BASELINE_COVARIATE_COLUMNS, MimicPreparationConfig
 
 
 def prepare_mimic_datasets(
@@ -89,82 +87,76 @@ def prepare_mimic_datasets(
     pipeline = Pipeline([("winsorize", winsorizer), ("scale", scaler)])
     parameters = pd.DataFrame()
     datasets: dict[str, ClinicalTimeSeriesDataset] = {}
-    with TemporaryDirectory(prefix="trails-mimic-splits-") as temporary:
-        temporary_root = Path(temporary)
-        for split_name, split_patients in patient_splits.items():
-            selected = observations.loc[
-                observations["patient_id"].isin(split_patients["patient_id"])
-            ].copy()
-            matrix = selected.pivot(
-                index=["patient_id", "time"], columns="feature", values="value"
-            ).reindex(columns=list(resolved_feature_order))
-            if split_name == "train":
-                reasons = pd.Series("", index=matrix.columns)
-                reasons.loc[matrix.count() == 0] = "no_train_observations"
-                reasons.loc[matrix.min() == matrix.max()] = "constant_in_train"
-                if (reasons != "").any():
-                    raise ValueError(f"train存在退化指标：{reasons.loc[reasons != ''].to_dict()}")
-                converted = np.asarray(pipeline.fit_transform(matrix), dtype=np.float64)
-                constant = np.asarray(scaler.var_) <= 0
-                if constant.any():
-                    raise ValueError(f"训练集截尾后没有变异：{matrix.columns[constant].tolist()}")
-                parameters = pd.DataFrame(
-                    {
-                        "feature": resolved_feature_order,
-                        "lower": winsorizer.lower_,
-                        "upper": winsorizer.upper_,
-                        "center": scaler.mean_,
-                        "scale": scaler.scale_,
-                    }
-                ).sort_values("feature", ignore_index=True)
-            else:
-                converted = np.asarray(pipeline.transform(matrix), dtype=np.float64)
-            row_positions = matrix.index.get_indexer(
-                pd.MultiIndex.from_frame(selected[["patient_id", "time"]])
-            )
-            column_positions = matrix.columns.get_indexer(selected["feature"])
-            selected["value"] = converted[row_positions, column_positions]
-            with np.errstate(over="ignore", invalid="ignore"):
-                finite = np.isfinite(selected["value"].to_numpy(dtype=np.float32))
-            if not finite.all():
+    for split_name, split_patients in patient_splits.items():
+        selected = observations.loc[
+            observations["patient_id"].isin(split_patients["patient_id"])
+        ].copy()
+        matrix = selected.pivot(
+            index=["patient_id", "time"], columns="feature", values="value"
+        ).reindex(columns=list(resolved_feature_order))
+        if split_name == "train":
+            reasons = pd.Series("", index=matrix.columns)
+            reasons.loc[matrix.count() == 0] = "no_train_observations"
+            reasons.loc[matrix.min() == matrix.max()] = "constant_in_train"
+            if (reasons != "").any():
+                raise ValueError(f"train存在退化指标：{reasons.loc[reasons != ''].to_dict()}")
+            converted = np.asarray(pipeline.fit_transform(matrix), dtype=np.float64)
+            constant = np.asarray(scaler.var_) <= 0
+            if constant.any():
+                raise ValueError(f"训练集截尾后没有变异：{matrix.columns[constant].tolist()}")
+            parameters = pd.DataFrame(
+                {
+                    "feature": resolved_feature_order,
+                    "lower": winsorizer.lower_,
+                    "upper": winsorizer.upper_,
+                    "center": scaler.mean_,
+                    "scale": scaler.scale_,
+                }
+            ).sort_values("feature", ignore_index=True)
+        else:
+            converted = np.asarray(pipeline.transform(matrix), dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):
+            observed = matrix.notna().to_numpy()
+            if not np.isfinite(converted[observed].astype(np.float32)).all():
                 raise ValueError("预处理后的实际观测无法表示为有限float32张量")
-            del matrix, converted
-            patients_path = temporary_root / f"{split_name}_patients.csv"
-            observations_path = temporary_root / f"{split_name}_observations.csv"
-            split_patients.to_csv(patients_path, index=False)
-            selected.to_csv(observations_path, index=False)
-            datasets[split_name] = ClinicalTimeSeriesDataset.load_from_csv(
-                patients_csv=patients_path,
-                observations_csv=observations_path,
-                use_features=resolved_feature_order,
-                description=f"{description} ({split_name})",
-                metadata={
-                    "split_name": split_name,
-                    "split_seed": split_seed,
-                    "split_ids_csv": str(split_dir / f"{split_name}_ids.csv"),
-                    "baseline_covariates": split_patients.loc[
-                        :, ["patient_id", *BASELINE_COVARIATE_COLUMNS]
-                    ].to_dict(orient="records"),
-                },
-            )
+        transformed = pd.DataFrame(
+            converted, index=matrix.index, columns=matrix.columns
+        ).reset_index()
+        # 沿用旧CSV入口中观测首次出现的患者顺序，不改变张量行和训练批次。
+        patient_order = pd.Index(selected["patient_id"].unique())
+        ordered_patients = split_patients.iloc[
+            np.argsort(patient_order.get_indexer(split_patients["patient_id"]), kind="stable")
+        ]
+        datasets[split_name] = ClinicalTimeSeriesDataset.from_dataframes(
+            patients=ordered_patients,
+            observations=transformed,
+            use_features=resolved_feature_order,
+            description=f"{description} ({split_name})",
+            metadata={
+                "split_name": split_name,
+                "split_seed": split_seed,
+                "split_ids_csv": str(split_dir / f"{split_name}_ids.csv"),
+                "baseline_covariates": split_patients.loc[
+                    :, ["patient_id", *BASELINE_COVARIATE_COLUMNS]
+                ].to_dict(orient="records"),
+            },
+        )
     return datasets, parameters
 
 
-def run(config: DictConfig) -> None:
-    patients_csv = Path(str(config.paths.patients_csv)).resolve()
-    observations_csv = Path(str(config.paths.observations_csv)).resolve()
-    output_root = Path(str(config.paths.dir)).resolve()
-    strategy = str(config.split.strategy)
-    split_seeds = tuple(int(seed) for seed in config.split.seeds)
-    feature_order = tuple(str(feature) for feature in config.feature_order)
-    description = str(config.description)
-    if strategy not in {"random", "temporal"}:
-        raise ValueError("split.strategy 必须是 random 或 temporal")
+def run(config: MimicPreparationConfig) -> None:
+    patients_csv = config.paths.patients_csv.resolve()
+    observations_csv = config.paths.observations_csv.resolve()
+    output_root = config.paths.dir.resolve()
+    strategy = config.split.strategy
+    split_seeds = config.split.seeds
+    feature_order = config.feature_order
+    description = config.description
     if strategy == "random":
         fractions = {
-            "train": float(config.split.random.train_fraction),
-            "validation": float(config.split.random.validation_fraction),
-            "test": float(config.split.random.test_fraction),
+            "train": config.split.random.train_fraction,
+            "validation": config.split.random.validation_fraction,
+            "test": config.split.random.test_fraction,
         }
         validation_fraction = fractions["validation"] / (
             fractions["train"] + fractions["validation"]
@@ -172,22 +164,10 @@ def run(config: DictConfig) -> None:
         test_start_year = None
     else:
         fractions = None
-        validation_fraction = float(config.split.temporal.validation_fraction)
-        test_start_year = int(config.split.temporal.test_start_year)
+        validation_fraction = config.split.temporal.validation_fraction
+        test_start_year = config.split.temporal.test_start_year
     if missing := [str(path) for path in (patients_csv, observations_csv) if not path.is_file()]:
         raise FileNotFoundError(f"缺少 MIMIC 特征输入：{missing}")
-    if not split_seeds:
-        raise ValueError("split.seeds 不能为空")
-    if len(set(split_seeds)) != len(split_seeds):
-        raise ValueError("split.seeds 不能包含重复值")
-    if not 0 < validation_fraction < 1:
-        raise ValueError("validation比例必须位于0与1之间")
-    if fractions is not None:
-        if any(fraction <= 0 or fraction >= 1 for fraction in fractions.values()):
-            raise ValueError("train、validation 和 test 比例必须位于 0 与 1 之间")
-        if not math.isclose(sum(fractions.values()), 1.0):
-            raise ValueError("train、validation 和 test 比例之和必须为 1")
-
     patients = pd.read_csv(patients_csv, dtype={"patient_id": str})
     required = {"patient_id", "event", "left_icu_before_48h"}
     if strategy == "temporal":
@@ -350,7 +330,7 @@ def run(config: DictConfig) -> None:
 
 @hydra.main(config_path="../../configs", config_name="mimic/split", version_base="1.3")
 def main(config: DictConfig) -> None:
-    run(config)
+    run(MimicPreparationConfig.model_validate(OmegaConf.to_container(config, resolve=True)))
 
 
 if __name__ == "__main__":

@@ -18,8 +18,6 @@ from .metrics import (
 )
 from .survival import component_log_likelihood, survival_log_posterior
 
-SURVIVAL_HEAD_ARCHITECTURE = "multi_output"
-
 
 @dataclass(frozen=True)
 class TrailsModelOutput:
@@ -32,7 +30,7 @@ class TrailsModelOutput:
         latent: 训练时重参数采样、评价时取均值的潜变量。
         cluster_logits: VaDE 高斯混合后验的未归一化对数分数。
         cluster_probabilities: 归一化后的后验簇概率。
-        survival_log_params: (B,K,2) 的 log(scale), log(shape)，shape 在患者和簇间共享。
+        survival_log_params: (B,K,2) 的 log(scale), log(shape)，共享范围由生存头配置决定。
     """
 
     reconstruction: Tensor
@@ -998,7 +996,7 @@ class TrailsModel(nn.Module):
     """联合纵向重建、高斯混合先验和簇特异 Weibull 生存分布的核心模型。
 
     编码器把异步纵向序列汇总为患者表示，变分层产生潜变量；高斯混合先验给出
-    不依赖结局的簇概率，解码器与生存头共用同一个潜变量。训练责任度另纳入生存似然。
+    不依赖结局的簇概率，生存头可选择采样潜变量或潜均值。训练责任度另纳入生存似然。
     损失可使用固定权重或可学习同方差不确定性权重。
     """
 
@@ -1053,7 +1051,11 @@ class TrailsModel(nn.Module):
             torch.zeros(model_config.n_clusters, model_config.latent_dim)
         )
         self.survival_head = build_survival_head(model_config)
-        self.survival_log_shape = nn.Parameter(torch.zeros(()))
+        self.survival_log_shape = (
+            nn.Parameter(torch.zeros(()))
+            if model_config.survival_head_architecture == "multi_output"
+            else None
+        )
         self.loss_log_variances = nn.ParameterDict()
         if model_config.loss.weighting == "uncertainty":
             for name, initial_weight in {
@@ -1141,7 +1143,7 @@ class TrailsModel(nn.Module):
 
         aligned 输入提供 ``delta_time`` 与 ``sequence_lengths``；compact mTAN2
         输入通过 ``feature_lengths`` 标识视图。训练模式使用重参数采样，评价
-        模式直接使用潜空间均值。
+        模式直接使用潜空间均值；生存头可配置为训练时也使用均值。
 
         返回：
             包含重建、潜变量、簇后验和生存 log 参数的
@@ -1169,11 +1171,29 @@ class TrailsModel(nn.Module):
         )
         cluster_logits = self._cluster_logits(latent)
         cluster_probabilities = torch.softmax(cluster_logits, dim=-1)
-        # 共享隐藏层直接从同一次采样的 z 输出各簇的 log(scale)。
-        log_scale = self.survival_head(latent)
-        survival_raw = torch.stack(
-            (log_scale, self.survival_log_shape.expand_as(log_scale)), dim=-1
+        # 仅切换生存头输入；sample 复用重建和聚类的同一次采样，不额外采样。
+        survival_latent = (
+            latent_mean if self.model_config.survival_latent_source == "mean" else latent
         )
+        if self.survival_log_shape is not None:
+            log_scale = self.survival_head(survival_latent)
+            survival_raw = torch.stack(
+                (log_scale, self.survival_log_shape.expand_as(log_scale)), dim=-1
+            )
+        else:
+            # 枚举所有簇条件，不使用硬分簇；每个患者在所有簇下复用同一个 z。
+            n_clusters = self.model_config.n_clusters
+            one_hot = torch.eye(
+                n_clusters, device=survival_latent.device, dtype=survival_latent.dtype
+            )
+            conditioned_latent = torch.cat(
+                [
+                    survival_latent.unsqueeze(1).expand(-1, n_clusters, -1),
+                    one_hot.unsqueeze(0).expand(survival_latent.shape[0], -1, -1),
+                ],
+                dim=-1,
+            )
+            survival_raw = self.survival_head(conditioned_latent)
         return TrailsModelOutput(
             reconstruction=reconstruction,
             latent_mean=latent_mean,
@@ -1399,16 +1419,20 @@ class TrailsModel(nn.Module):
 
 
 def build_survival_head(model_config: ModelConfig) -> nn.Sequential:
-    """构建以 z 为输入、输出 K 个 log(scale) 的簇特异生存头。
+    """构建多输出 scale 头或 one-hot 条件的双参数 Weibull 头。
 
-    隐藏层保持 ``latent_dim`` 宽度及 ReLU。零隐藏层为各簇独立的线性输出；
-    共享 log(shape) 由模型单独学习。
+    隐藏层保持 ``latent_dim`` 宽度及 ReLU。multi_output 的共享 log(shape)
+    由模型单独学习；one_hot 同时输出 log(scale) 和 log(shape)。
     """
     layers: list[nn.Module] = []
     input_dim = model_config.latent_dim
+    output_dim = model_config.n_clusters
+    if model_config.survival_head_architecture == "one_hot":
+        input_dim += model_config.n_clusters
+        output_dim = 2
     for _layer in range(model_config.survival_head_hidden_layers):
         layers.append(nn.Linear(input_dim, model_config.latent_dim))
         layers.append(nn.ReLU())
         input_dim = model_config.latent_dim
-    layers.append(nn.Linear(input_dim, model_config.n_clusters))
+    layers.append(nn.Linear(input_dim, output_dim))
     return nn.Sequential(*layers)

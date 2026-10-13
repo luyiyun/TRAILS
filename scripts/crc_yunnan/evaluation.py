@@ -20,7 +20,7 @@ from scipy.special import xlogy
 
 from trails import (
     ClinicalTimeSeriesDataset,
-    ClusterNumberSelector,
+    ClusterNumberEvaluator,
     TrailsEstimator,
     TrailsPrediction,
 )
@@ -33,7 +33,7 @@ SPLIT_LABELS = {"train": "训练集", "validation": "验证集", "test": "测试
 
 
 def k_scan_metrics(config: CRCSupplementaryConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """合并同配置的05聚合指标，复用公开选择器计算描述性综合分。"""
+    """合并同配置的05聚合指标，复用公开评价器计算描述性综合分。"""
     roots = config.k_scan.run_dirs or [config.inputs.run_dir]
     signature = None
     parts = []
@@ -77,14 +77,14 @@ def k_scan_metrics(config: CRCSupplementaryConfig) -> tuple[pd.DataFrame, dict[s
         raise ValueError("K曲线输入含有expected_ks以外的K")
     scored = []
     for name, rows in metrics.groupby("dataset", sort=False):
-        selector = ClusterNumberSelector(
+        evaluator = ClusterNumberEvaluator(
             candidates=expected,
             seeds=sorted(rows["seed"].unique().tolist()),
             require_non_empty=True,
             min_cluster_fraction=minimum,
             compute_stability=False,
         )
-        result = selector.summarize_completed(rows, pd.DataFrame(columns=["n_clusters", "ari"]))
+        result = evaluator.summarize_completed(rows, pd.DataFrame(columns=["n_clusters", "ari"]))
         scored.append(result.run_metrics.assign(dataset=name))
     return pd.concat(scored, ignore_index=True), {
         "expected_ks": expected,
@@ -95,10 +95,7 @@ def k_scan_metrics(config: CRCSupplementaryConfig) -> tuple[pd.DataFrame, dict[s
             "sqrt(C-index^2 + (1 - minmax(BIC))^2); "
             "each dataset/seed separately; all finite available K"
         ),
-        "interpretation": (
-            "Descriptive score only; does not replace the HP survival-tier "
-            "ranking or change the manually fixed K."
-        ),
+        "interpretation": ("Descriptive score only; K and seed are explicitly chosen by the user."),
         "bic_definition": (
             "Existing latent-mixture BIC, not full joint-model BIC; includes "
             "the historical K-1 mixture term even with fixed logits."

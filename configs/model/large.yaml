@@ -4,6 +4,8 @@ latent_dim: 64
 n_clusters: 4
 dropout: 0.1
 survival_head_hidden_layers: 2
+survival_head_architecture: multi_output
+survival_latent_source: sample
 loss:
   weighting: uncertainty
   reconstruction_weight: 1.0

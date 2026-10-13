@@ -28,7 +28,7 @@ class BaselinePrediction:
     risk_horizon: float | None = None
     survival_times: NDArray[np.float64] | None = None
     survival_probabilities: NDArray[np.float64] | None = None
-    risk_method: Literal["event_probability", "log_hazard"] = "event_probability"
+    risk_method: Literal["event_probability", "median_survival", "log_hazard"] = "event_probability"
 
     def __post_init__(self) -> None:
         """在写盘前固定评价脚本依赖的形状与数值语义。"""
